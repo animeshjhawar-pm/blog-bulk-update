@@ -1,0 +1,35 @@
+{
+  "name": "blog-image-regen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-client batch blog-image regenerator. Reads published clusters from gw_stormbreaker, builds prompts via Portkey, generates images via Replicate (or fal.ai), writes a CSV.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "inspect-page-info": "tsx src/cli.ts inspect-page-info",
+    "extract-token": "tsx src/cli.ts extract-token",
+    "regen": "tsx src/cli.ts regen",
+    "build": "tsc",
+    "type-check": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fal-ai/client": "^1.6.4",
+    "axios": "^1.7.7",
+    "commander": "^12.1.0",
+    "csv-stringify": "^6.5.2",
+    "dotenv": "^16.4.5",
+    "p-limit": "^6.2.0",
+    "pg": "^8.13.1",
+    "replicate": "^1.0.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
