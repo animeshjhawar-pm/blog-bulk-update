@@ -25,7 +25,8 @@ export interface ProjectRow {
   id: string;
   name: string | null;
   url: string | null;
-  slug: string | null;
+  /** Used as the client-prefix in S3 paths: `page_data/<staging_subdomain>/blog/...` */
+  staging_subdomain: string | null;
   additional_info: unknown;
   company_info: unknown;
   design_tokens: unknown;
@@ -33,51 +34,27 @@ export interface ProjectRow {
 }
 
 /**
- * Reduce a slug to a domain-ish guess: dashes/underscores stripped,
- * lowercased. "spec-gas" → "specgas" matches a url like
- * "https://specgasinc.com" via ILIKE '%specgas%'.
+ * Look up a project by its UUID. The `projects` table has no `slug`
+ * column — slugs are only in our local allow-list, which carries
+ * `projectId` directly.
  */
-function slugDomainGuess(slug: string): string {
-  return slug.replace(/[-_]/g, "").toLowerCase();
-}
-
-export async function lookupClient(slug: string): Promise<ProjectRow | null> {
+export async function lookupProjectById(projectId: string): Promise<ProjectRow | null> {
   const sql = `
-    SELECT id, name, url, slug,
+    SELECT id, name, url, staging_subdomain,
            additional_info, company_info, design_tokens, logo_urls
     FROM projects
-    WHERE slug = $1
-       OR id::text = $1
-       OR url ILIKE '%' || $2 || '%'
+    WHERE id = $1::uuid
     LIMIT 1
   `;
-  const res = await getPool().query<ProjectRow>(sql, [slug, slugDomainGuess(slug)]);
+  const res = await getPool().query<ProjectRow>(sql, [projectId]);
   return res.rows[0] ?? null;
 }
 
-export interface ClusterPageImage {
-  image_id: string;
-  description?: string;
-  image_type?: string;
-  context?: string;
-  [key: string]: unknown;
-}
-
 /**
- * `page_info` is JSONB; the actual key set varies per project. We type
- * the well-known fields and leave the rest as `unknown` so pageInfo.ts
- * can probe the shape adaptively (cover/thumbnail layouts differ).
+ * page_info is JSONB and per-project freeform — every key is optional,
+ * the only thing we actually count on is `page_info` being an object.
  */
-export interface ClusterPageInfo {
-  title?: string;
-  topic?: string;
-  images?: ClusterPageImage[];
-  cover_image_id?: string;
-  thumbnail_image_id?: string;
-  cover?: ClusterPageImage | string;
-  thumbnail?: ClusterPageImage | string;
-  [key: string]: unknown;
-}
+export type ClusterPageInfo = Record<string, unknown>;
 
 export interface ClusterRow {
   id: string;
@@ -87,13 +64,15 @@ export interface ClusterRow {
 }
 
 export async function listPublishedBlogClusters(projectId: string): Promise<ClusterRow[]> {
+  // Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
+  // (uppercase), clusters.u_at (not updated_at).
   const sql = `
-    SELECT id, topic, page_info, updated_at
+    SELECT id, topic, page_info, u_at AS updated_at
     FROM clusters
-    WHERE project_id = $1
+    WHERE p_id = $1::uuid
       AND page_type = 'blog'
-      AND status = 'published'
-    ORDER BY updated_at DESC
+      AND page_status = 'PUBLISHED'
+    ORDER BY u_at DESC
   `;
   const res = await getPool().query<ClusterRow>(sql, [projectId]);
   return res.rows;

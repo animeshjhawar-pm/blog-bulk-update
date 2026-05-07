@@ -4,7 +4,7 @@ import { loadEnv } from "./env.js";
 import {
   closePool,
   listPublishedBlogClusters,
-  lookupClient,
+  lookupProjectById,
   type ProjectRow,
 } from "./db.js";
 import { resolveGraphicToken, type TokenSource } from "./extractToken.js";
@@ -183,7 +183,8 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   loadEnv();
   const slug = options.client;
 
-  if (!findClient(slug)) {
+  const entry = findClient(slug);
+  if (!entry) {
     process.stderr.write(
       `error: '${slug}' is not in the hardcoded CLIENTS allow-list (src/clients.ts)\n`,
     );
@@ -191,9 +192,11 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     process.exit(2);
   }
 
-  const project = await lookupClient(slug);
+  const project = await lookupProjectById(entry.projectId);
   if (!project) {
-    process.stderr.write(`error: no project matched slug or url for '${slug}'\n`);
+    process.stderr.write(
+      `error: project ${entry.projectId} (slug=${slug}) not found in DB\n`,
+    );
     await closePool();
     process.exit(2);
   }
@@ -219,9 +222,10 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   const clusters = await listPublishedBlogClusters(project.id);
   process.stderr.write(`regen: ${clusters.length} published blog clusters\n`);
 
-  const records = collectImageRecords(clusters, {
+  const records = await collectImageRecords(clusters, {
     assetTypes: options.assetTypes,
     clusterIds: options.clusterIds,
+    stagingSubdomain: project.staging_subdomain,
   });
   process.stderr.write(`regen: ${records.length} image records to process\n`);
 

@@ -1,4 +1,5 @@
-import type { ClusterPageImage, ClusterPageInfo, ClusterRow } from "./db.js";
+import type { ClusterPageInfo, ClusterRow } from "./db.js";
+import { fetchBlogPlaceholders } from "./s3.js";
 
 export type AssetType =
   | "cover"
@@ -8,30 +9,30 @@ export type AssetType =
   | "external"
   | "generic";
 
+export type ImageSource =
+  | "s3-shape-A"
+  | "db-shape-A"
+  | "shape-B"
+  | "page_info.cover_image_id"
+  | "page_info.cover.image_id"
+  | "page_info.thumbnail_image_id"
+  | "page_info.thumbnail.image_id"
+  | "synthetic-cover"
+  | "synthetic-thumbnail";
+
 export interface ImageRecord {
   cluster: ClusterRow;
   asset: AssetType;
   /**
-   * The S3 key (or a synthetic stable identifier for cover/thumbnail rows
-   * when the underlying page_info doesn't store one). What the receiving
-   * PM uses to perform the S3 replace.
+   * Real S3 key when available (Shape A `id=`, Shape B `image_id`,
+   * page_info cover/thumbnail keys), or a synthesised stable identifier
+   * `blog-images/<cluster_id>-<asset>-<index>` /
+   * `cover-images/<cluster_id>` / `thumbnail-images/<cluster_id>`.
    */
   imageId: string;
-  /** The description we feed into the prompt: image.description or cluster.topic. */
   description: string;
-  /** "16:9" / "3:2" / "4:3" / "1:1" — already normalised to bare W:H. */
   aspectRatio: string;
-  /** Source for traceability — explains where the row came from. */
-  source:
-    | "page_info.images[]"
-    | "cover_image_id"
-    | "page_info.cover"
-    | "images[image_type=cover]"
-    | "thumbnail_image_id"
-    | "page_info.thumbnail"
-    | "images[image_type=thumbnail]"
-    | "synthetic-cover"
-    | "synthetic-thumbnail";
+  source: ImageSource;
 }
 
 const DEFAULT_ASPECT: Record<AssetType, string> = {
@@ -53,7 +54,7 @@ export function normalizeImageType(raw: string | undefined): AssetType {
   return "generic";
 }
 
-/** Convert "#16:9" / "16:9" / "1:1" → "16:9". Returns null on miss. */
+/** "#16:9" / "16:9" / "1:1" → "16:9". Returns null on miss. */
 export function parseAspectRatio(context: string | undefined): string | null {
   if (!context) return null;
   const m = /(\d+)\s*:\s*(\d+)/.exec(context);
@@ -61,194 +62,227 @@ export function parseAspectRatio(context: string | undefined): string | null {
   return `${m[1]}:${m[2]}`;
 }
 
-function aspectFor(asset: AssetType, contextHint?: string): string {
-  return parseAspectRatio(contextHint) ?? DEFAULT_ASPECT[asset];
+function descriptionFor(cluster: ClusterRow): string {
+  return (cluster.topic ?? "").trim();
 }
 
-function syntheticId(prefix: "cover-images" | "thumbnail-images", clusterId: string): string {
-  return `${prefix}/${clusterId}`;
+// ────────────────────────────────────────────────────────────────────────
+// Shape A — <image_requirement> tags (S3 markdown OR page_info::text)
+// ────────────────────────────────────────────────────────────────────────
+
+const REQ_TAG_GLOBAL =
+  /<image_requirement\b([^>]*)>([\s\S]*?)<\/image_requirement>/gi;
+
+interface RequirementTag {
+  attrs: Record<string, string>;
+  inner: string;
 }
 
-/**
- * Resolve the cover record for a cluster. Tries, in order:
- *   1. page_info.cover_image_id (string)
- *   2. page_info.cover (image-shaped object or string)
- *   3. images[image_type === "cover"]
- *   4. fall back to a synthetic record keyed off cluster.id
- *
- * The receiving PM will key on imageId for the S3 replace; if the cluster
- * doesn't store a cover in page_info today, the synthetic key
- * `cover-images/<cluster_id>` lets them know there's nothing to overwrite
- * — a fresh cover needs to be inserted at a new S3 key.
- */
-function resolveCover(cluster: ClusterRow): ImageRecord {
-  const pi = cluster.page_info ?? {};
-  const description = (cluster.topic ?? pi.title ?? "").trim();
-
-  if (typeof pi.cover_image_id === "string" && pi.cover_image_id.length > 0) {
-    return {
-      cluster,
-      asset: "cover",
-      imageId: pi.cover_image_id,
-      description,
-      aspectRatio: aspectFor("cover"),
-      source: "cover_image_id",
-    };
-  }
-
-  if (pi.cover && typeof pi.cover === "object") {
-    const obj = pi.cover as ClusterPageImage;
-    if (typeof obj.image_id === "string") {
-      return {
-        cluster,
-        asset: "cover",
-        imageId: obj.image_id,
-        description: (obj.description ?? description).trim(),
-        aspectRatio: aspectFor("cover", obj.context),
-        source: "page_info.cover",
-      };
+function scanRequirementTags(s: string): RequirementTag[] {
+  const out: RequirementTag[] = [];
+  for (const m of s.matchAll(REQ_TAG_GLOBAL)) {
+    const attrs: Record<string, string> = {};
+    for (const a of (m[1] ?? "").matchAll(/(\w[\w-]*)\s*=\s*"([^"]*)"/g)) {
+      if (a[1]) attrs[a[1]] = a[2] ?? "";
     }
-  }
-  if (typeof pi.cover === "string" && pi.cover.length > 0) {
-    return {
-      cluster,
-      asset: "cover",
-      imageId: pi.cover,
-      description,
-      aspectRatio: aspectFor("cover"),
-      source: "page_info.cover",
-    };
-  }
-
-  const inline = (pi.images ?? []).find((i) => normalizeImageType(i?.image_type) === "cover");
-  if (inline && typeof inline.image_id === "string") {
-    return {
-      cluster,
-      asset: "cover",
-      imageId: inline.image_id,
-      description: (inline.description ?? description).trim(),
-      aspectRatio: aspectFor("cover", inline.context),
-      source: "images[image_type=cover]",
-    };
-  }
-
-  return {
-    cluster,
-    asset: "cover",
-    imageId: syntheticId("cover-images", cluster.id),
-    description,
-    aspectRatio: aspectFor("cover"),
-    source: "synthetic-cover",
-  };
-}
-
-function resolveThumbnail(cluster: ClusterRow): ImageRecord {
-  const pi = cluster.page_info ?? {};
-  const description = (cluster.topic ?? pi.title ?? "").trim();
-
-  if (typeof pi.thumbnail_image_id === "string" && pi.thumbnail_image_id.length > 0) {
-    return {
-      cluster,
-      asset: "thumbnail",
-      imageId: pi.thumbnail_image_id,
-      description,
-      aspectRatio: aspectFor("thumbnail"),
-      source: "thumbnail_image_id",
-    };
-  }
-
-  if (pi.thumbnail && typeof pi.thumbnail === "object") {
-    const obj = pi.thumbnail as ClusterPageImage;
-    if (typeof obj.image_id === "string") {
-      return {
-        cluster,
-        asset: "thumbnail",
-        imageId: obj.image_id,
-        description: (obj.description ?? description).trim(),
-        aspectRatio: aspectFor("thumbnail", obj.context),
-        source: "page_info.thumbnail",
-      };
-    }
-  }
-  if (typeof pi.thumbnail === "string" && pi.thumbnail.length > 0) {
-    return {
-      cluster,
-      asset: "thumbnail",
-      imageId: pi.thumbnail,
-      description,
-      aspectRatio: aspectFor("thumbnail"),
-      source: "page_info.thumbnail",
-    };
-  }
-
-  const inline = (pi.images ?? []).find((i) => normalizeImageType(i?.image_type) === "thumbnail");
-  if (inline && typeof inline.image_id === "string") {
-    return {
-      cluster,
-      asset: "thumbnail",
-      imageId: inline.image_id,
-      description: (inline.description ?? description).trim(),
-      aspectRatio: aspectFor("thumbnail", inline.context),
-      source: "images[image_type=thumbnail]",
-    };
-  }
-
-  return {
-    cluster,
-    asset: "thumbnail",
-    imageId: syntheticId("thumbnail-images", cluster.id),
-    description,
-    aspectRatio: aspectFor("thumbnail"),
-    source: "synthetic-thumbnail",
-  };
-}
-
-/**
- * Walk page_info.images[] and emit a record per generated-images entry,
- * skipping anything already classified as cover/thumbnail (those rows
- * come from resolveCover / resolveThumbnail above).
- */
-function inlineImageRecords(cluster: ClusterRow): ImageRecord[] {
-  const pi = cluster.page_info;
-  const images = pi?.images ?? [];
-  const out: ImageRecord[] = [];
-  for (const img of images) {
-    if (typeof img?.image_id !== "string") continue;
-    if (!img.image_id.startsWith("generated-images/")) continue;
-    const asset = normalizeImageType(img.image_type);
-    if (asset === "cover" || asset === "thumbnail") continue;
-    out.push({
-      cluster,
-      asset,
-      imageId: img.image_id,
-      description: (img.description ?? "").trim(),
-      aspectRatio: aspectFor(asset, img.context),
-      source: "page_info.images[]",
-    });
+    out.push({ attrs, inner: (m[2] ?? "").trim() });
   }
   return out;
 }
 
-export interface CollectOptions {
-  /** When set, only clusters whose id is in this set are walked. */
-  clusterIds?: Set<string>;
-  /** When set, only records whose asset matches are emitted. */
-  assetTypes?: Set<AssetType>;
+function shapeAToRecords(
+  cluster: ClusterRow,
+  hits: RequirementTag[],
+  source: "s3-shape-A" | "db-shape-A",
+): ImageRecord[] {
+  return hits.map((h, i) => {
+    const asset = normalizeImageType(h.attrs.type);
+    const realId = h.attrs.id || h.attrs.image_id;
+    const imageId = realId || `blog-images/${cluster.id}-${asset}-${i}`;
+    const aspect = parseAspectRatio(h.attrs.context) ?? DEFAULT_ASPECT[asset];
+    return {
+      cluster,
+      asset,
+      imageId,
+      description: h.inner.replace(/\s+/g, " ").trim(),
+      aspectRatio: aspect,
+      source,
+    };
+  });
 }
 
-export function collectImageRecords(
+// ────────────────────────────────────────────────────────────────────────
+// Shape B — JSON tree walk for { description, image_id|image_type|context }
+// ────────────────────────────────────────────────────────────────────────
+
+interface ShapeBHit {
+  image_id: string | null;
+  image_type: string | null;
+  context: string | null;
+  description: string | null;
+}
+
+function walkShapeB(node: unknown): ShapeBHit[] {
+  if (node == null) return [];
+  if (Array.isArray(node)) {
+    const out: ShapeBHit[] = [];
+    for (const v of node) out.push(...walkShapeB(v));
+    return out;
+  }
+  if (typeof node === "object") {
+    const obj = node as Record<string, unknown>;
+    const looksLikeImage =
+      typeof obj.description === "string" &&
+      (typeof obj.image_id === "string" ||
+        typeof obj.image_type === "string" ||
+        typeof obj.context === "string");
+    const out: ShapeBHit[] = [];
+    if (looksLikeImage) {
+      out.push({
+        image_id: typeof obj.image_id === "string" ? obj.image_id : null,
+        image_type: typeof obj.image_type === "string" ? obj.image_type : null,
+        context: typeof obj.context === "string" ? obj.context : null,
+        description: typeof obj.description === "string" ? obj.description : null,
+      });
+    }
+    for (const v of Object.values(obj)) out.push(...walkShapeB(v));
+    return out;
+  }
+  return [];
+}
+
+function shapeBToRecords(cluster: ClusterRow, hits: ShapeBHit[]): ImageRecord[] {
+  const out: ImageRecord[] = [];
+  hits.forEach((h, i) => {
+    const asset = normalizeImageType(h.image_type ?? h.context?.replace(/^#/, ""));
+    if (asset === "cover" || asset === "thumbnail") return; // handled separately
+    const aspect = parseAspectRatio(h.context ?? undefined) ?? DEFAULT_ASPECT[asset];
+    const id = h.image_id || `blog-images/${cluster.id}-${asset}-${i}`;
+    out.push({
+      cluster,
+      asset,
+      imageId: id,
+      description: (h.description ?? "").trim(),
+      aspectRatio: aspect,
+      source: "shape-B",
+    });
+  });
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Cover / thumbnail — synthesised from cluster.topic with real-key
+// preference if page_info exposes one.
+// ────────────────────────────────────────────────────────────────────────
+
+function coverRecord(cluster: ClusterRow): ImageRecord {
+  const pi = cluster.page_info ?? {};
+  const description = descriptionFor(cluster);
+  const aspect = DEFAULT_ASPECT.cover;
+
+  if (typeof pi.cover_image_id === "string" && (pi.cover_image_id as string).length > 0) {
+    return { cluster, asset: "cover", imageId: pi.cover_image_id as string, description, aspectRatio: aspect, source: "page_info.cover_image_id" };
+  }
+  const coverObj = pi.cover;
+  if (coverObj && typeof coverObj === "object") {
+    const inner = (coverObj as { image_id?: unknown }).image_id;
+    if (typeof inner === "string" && inner.length > 0) {
+      return { cluster, asset: "cover", imageId: inner, description, aspectRatio: aspect, source: "page_info.cover.image_id" };
+    }
+  }
+  return { cluster, asset: "cover", imageId: `cover-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-cover" };
+}
+
+function thumbnailRecord(cluster: ClusterRow): ImageRecord {
+  const pi = cluster.page_info ?? {};
+  const description = descriptionFor(cluster);
+  const aspect = DEFAULT_ASPECT.thumbnail;
+
+  if (typeof pi.thumbnail_image_id === "string" && (pi.thumbnail_image_id as string).length > 0) {
+    return { cluster, asset: "thumbnail", imageId: pi.thumbnail_image_id as string, description, aspectRatio: aspect, source: "page_info.thumbnail_image_id" };
+  }
+  const t = pi.thumbnail;
+  if (t && typeof t === "object") {
+    const inner = (t as { image_id?: unknown }).image_id;
+    if (typeof inner === "string" && inner.length > 0) {
+      return { cluster, asset: "thumbnail", imageId: inner, description, aspectRatio: aspect, source: "page_info.thumbnail.image_id" };
+    }
+  }
+  return { cluster, asset: "thumbnail", imageId: `thumbnail-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-thumbnail" };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Inline-image resolution: S3 → DB Shape A → Shape B
+// ────────────────────────────────────────────────────────────────────────
+
+async function inlineRecordsForCluster(
+  cluster: ClusterRow,
+  stagingSubdomain: string | null,
+  cache: Map<string, string | null>,
+): Promise<ImageRecord[]> {
+  // 1. S3 markdown (canonical source for blog clusters).
+  if (stagingSubdomain) {
+    let body: string | null;
+    if (cache.has(cluster.id)) {
+      body = cache.get(cluster.id)!;
+    } else {
+      try {
+        const r = await fetchBlogPlaceholders(stagingSubdomain, cluster.id);
+        body = r.body;
+        cache.set(cluster.id, body);
+      } catch (err) {
+        process.stderr.write(
+          `pageInfo: S3 fetch failed for cluster=${cluster.id}: ${(err as Error).message}\n`,
+        );
+        body = null;
+        cache.set(cluster.id, null);
+      }
+    }
+    if (body) {
+      const tags = scanRequirementTags(body);
+      if (tags.length > 0) return shapeAToRecords(cluster, tags, "s3-shape-A");
+    }
+  }
+
+  // 2. DB Shape A: <image_requirement> tags inside page_info::text
+  const piText = JSON.stringify(cluster.page_info ?? {});
+  const dbTags = scanRequirementTags(piText);
+  if (dbTags.length > 0) return shapeAToRecords(cluster, dbTags, "db-shape-A");
+
+  // 3. Shape B: tree walk for image-shaped objects
+  const bHits = walkShapeB(cluster.page_info);
+  if (bHits.length > 0) return shapeBToRecords(cluster, bHits);
+
+  return [];
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Top-level collector
+// ────────────────────────────────────────────────────────────────────────
+
+export interface CollectOptions {
+  clusterIds?: Set<string>;
+  assetTypes?: Set<AssetType>;
+  /** Required to enable S3 fetching for inline images. */
+  stagingSubdomain?: string | null;
+  /** Optional cross-call cache to avoid duplicate S3 GETs. */
+  s3Cache?: Map<string, string | null>;
+}
+
+export async function collectImageRecords(
   clusters: ClusterRow[],
   options: CollectOptions = {},
-): ImageRecord[] {
+): Promise<ImageRecord[]> {
+  const cache = options.s3Cache ?? new Map<string, string | null>();
+  const stagingSubdomain = options.stagingSubdomain ?? null;
+
   const records: ImageRecord[] = [];
   for (const cluster of clusters) {
     if (options.clusterIds && !options.clusterIds.has(cluster.id)) continue;
 
-    const cover = resolveCover(cluster);
-    const thumb = resolveThumbnail(cluster);
-    const inline = inlineImageRecords(cluster);
-
-    for (const r of [cover, thumb, ...inline]) {
+    const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
+    const rows: ImageRecord[] = [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
+    for (const r of rows) {
       if (options.assetTypes && !options.assetTypes.has(r.asset)) continue;
       records.push(r);
     }

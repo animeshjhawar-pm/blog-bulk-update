@@ -67,6 +67,41 @@ For each `regen` run:
 `status` is `completed` / `failed` / `dry-run`. On failure the row is
 still emitted with `error` populated; the run never aborts mid-flight.
 
+## Data-source map (where each input field comes from)
+
+The CLI never reads from S3. Descriptions, asset types, and `image_id`
+S3 keys all live as JSONB on the `clusters` table. S3 is the
+**write-target** for the downstream PM, not a read source for this CLI.
+
+| field                  | source                                            |
+|------------------------|---------------------------------------------------|
+| inline image desc      | `clusters.page_info.images[i].description`        |
+| inline asset_type      | `clusters.page_info.images[i].image_type`         |
+| inline image S3 key    | `clusters.page_info.images[i].image_id`           |
+| inline aspect hint     | `clusters.page_info.images[i].context`            |
+| cover description      | `clusters.topic` (the blog post title)            |
+| thumbnail description  | `clusters.topic` (same as cover)                  |
+| business_context       | `projects.additional_info`                        |
+| company_info           | `projects.company_info`                           |
+| primary logo URL       | `projects.logo_urls.primary_logo` (parse JSONB)   |
+| graphic_token          | derived live: Firecrawl(homepage_url) → Claude    |
+|                        | extract_graphic_token (markdown+branding); OR     |
+|                        | `./graphic-tokens/<slug>.json` with `--use-saved-token` |
+
+**Cover and thumbnail rows are NOT in `cluster.page_info.images[]`** —
+they're synthesised from `cluster.topic`, one of each per cluster. The
+CSV's `image_id` for those rows uses the synthetic stable identifier
+`cover-images/<cluster_id>` / `thumbnail-images/<cluster_id>` unless
+`page_info` itself stores a real S3 key (`cover_image_id`,
+`thumbnail_image_id`, `page_info.cover.image_id`, etc.) — in which case
+the parser prefers the real key. Run `inspect-page-info` to confirm
+which path applied for any cluster.
+
+**Firecrawl markdown is never cached.** `extract-token` re-scrapes the
+client homepage on every call — clients update their websites and we
+want the current branding. `graphic-tokens/<slug>.json` is the only
+deliberate caching layer.
+
 ## What it does not do
 
 - Does not write back to `clusters.page_info` or push to S3 — the PM

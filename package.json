@@ -11,11 +11,13 @@
     "inspect-page-info": "tsx src/cli.ts inspect-page-info",
     "extract-token": "tsx src/cli.ts extract-token",
     "regen": "tsx src/cli.ts regen",
+    "web": "tsx src/cli.ts web",
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1044.0",
     "@fal-ai/client": "^1.6.4",
     "axios": "^1.7.7",
     "commander": "^12.1.0",

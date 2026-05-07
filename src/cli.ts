@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
-import { loadEnv } from "./env.js";
-import { closePool, lookupClient } from "./db.js";
+import { loadEnvOrExit } from "./env.js";
+import { closePool, lookupProjectById } from "./db.js";
 import { runExtractTokenCli } from "./extractToken.js";
 import { runRegen } from "./regen.js";
 import { inspectForSlug } from "./inspectPageInfo.js";
 import { findClient, clientSlugList } from "./clients.js";
+import { startWebServer } from "./web.js";
 import type { Provider } from "./generate.js";
 import type { AssetType } from "./pageInfo.js";
 
@@ -64,7 +65,7 @@ program
   .action(async (opts: { client: string; limit: string }) => {
     requireKnownClient(opts.client);
     try {
-      loadEnv();
+      loadEnvOrExit();
       const limit = Math.max(1, Number.parseInt(opts.limit, 10) || 1);
       await inspectForSlug(opts.client, limit);
     } catch (err) {
@@ -84,10 +85,15 @@ program
   .action(async (opts: { client: string }) => {
     requireKnownClient(opts.client);
     try {
-      loadEnv();
-      const project = await lookupClient(opts.client);
+      loadEnvOrExit();
+      const entry = findClient(opts.client);
+      if (!entry) {
+        process.stderr.write(`error: '${opts.client}' not in allow-list\n`);
+        process.exit(2);
+      }
+      const project = await lookupProjectById(entry.projectId);
       if (!project) {
-        process.stderr.write(`error: no project matched '${opts.client}'\n`);
+        process.stderr.write(`error: project ${entry.projectId} not found in DB\n`);
         process.exit(2);
       }
       if (!project.url) {
@@ -154,6 +160,15 @@ program
       }
     },
   );
+
+program
+  .command("web")
+  .description("Start a local web UI on http://localhost:<port> for picking clusters + triggering regen runs.")
+  .option("--port <n>", "port to bind", "3000")
+  .action((opts: { port: string }) => {
+    const port = Math.max(1, Number.parseInt(opts.port, 10) || 3000);
+    startWebServer(port);
+  });
 
 program.parseAsync(process.argv).catch(async (err) => {
   process.stderr.write(`fatal: ${err instanceof Error ? err.message : String(err)}\n`);
