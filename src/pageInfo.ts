@@ -43,13 +43,17 @@ export interface ImageRecord {
   previewUrl?: string;
 }
 
+// Aspect ratios are fixed per asset type (per product spec, 2026-05-07).
+// To change them, edit this map — the prompts/templates are background
+// concerns, but the aspect ratio is what's actually sent to the image
+// generator and surfaced in the UI.
 const DEFAULT_ASPECT: Record<AssetType, string> = {
-  cover: "16:9",
-  thumbnail: "3:2",
+  cover: "1:1",
+  thumbnail: "16:9",
   infographic: "16:9",
-  internal: "4:3",
-  external: "4:3",
-  generic: "4:3",
+  internal: "16:9",
+  external: "16:9",
+  generic: "16:9",
 };
 
 export function normalizeImageType(raw: string | undefined): AssetType {

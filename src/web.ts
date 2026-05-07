@@ -17,7 +17,9 @@ import {
 } from "./db.js";
 import { collectImageRecords, type ImageRecord } from "./pageInfo.js";
 import { loadEnv } from "./env.js";
-import { loadBrandGuidelines, saveBrandGuidelines } from "./tokens.js";
+import { loadBrandGuidelines, saveBrandGuidelines, loadToken } from "./tokens.js";
+import { promises as fs } from "node:fs";
+import { parse as csvParse } from "csv-parse/sync";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Blog Image Update";
@@ -96,8 +98,10 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     padding: 12px 24px; display: flex; align-items: center; gap: 14px;
     position: sticky; top: 0; z-index: 30;
   }
+  header.app .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; }
+  header.app .brand:hover { text-decoration: none; opacity: .85; }
   header.app img.logo { height: 22px; display: block; }
-  header.app .title { font-size: 14px; font-weight: 600; letter-spacing: -.005em; }
+  header.app .title { font-size: 14px; font-weight: 600; letter-spacing: -.005em; color: var(--ink); }
   header.app .crumb { color: var(--ink-faint); font-weight: 400; margin-left: 4px; font-size: 13px; }
   header.app nav { margin-left: auto; display: flex; gap: 18px; font-size: 13px; }
   header.app nav a { color: var(--ink-muted); }
@@ -221,6 +225,59 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   details[open] > summary::before { transform: rotate(90deg); }
   details > summary h2 { display: inline; }
 
+  /* Client info card — nested details for graphic_token / company_info / etc. */
+  .info-grid { display: grid; grid-template-columns: 200px 1fr; gap: 8px 16px; align-items: start; font-size: 13px; }
+  .info-grid .k { color: var(--ink-muted); font-size: 12px; }
+  .info-grid .v { word-break: break-word; }
+  .json-dump { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font: 11.5px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; max-height: 320px; overflow: auto; color: #334155; }
+
+  /* Whole-row clickable cluster table */
+  table.cluster-list tr.cluster-row { cursor: pointer; }
+  table.cluster-list tr.cluster-row td { user-select: none; }
+  table.cluster-list tr.cluster-row td.topic { user-select: text; }
+  table.cluster-list td.topic { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
+  table.cluster-list td.topic .t { font-weight: 500; line-height: 1.4; word-break: break-word; }
+
+  /* Toggle pill (used for test-run mode) */
+  .toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-muted); padding: 6px 10px; border: 1px solid var(--border); border-radius: 999px; background: #fff; }
+  .toggle input { margin: 0; }
+  .toggle.on { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
+
+  /* Lightbox (image viewer) */
+  .lightbox-overlay {
+    position: fixed; inset: 0; background: rgba(15,23,42,.85);
+    display: none; align-items: center; justify-content: center;
+    z-index: 60; padding: 24px;
+  }
+  .lightbox-overlay.open { display: flex; }
+  .lightbox-overlay img { max-width: min(1100px, 92vw); max-height: 86vh; border-radius: 8px; box-shadow: var(--shadow-lg); }
+  .lightbox-overlay .close-x { position: fixed; top: 16px; right: 20px; background: rgba(255,255,255,.92); border: none; width: 36px; height: 36px; border-radius: 50%; font-size: 18px; cursor: pointer; box-shadow: var(--shadow); }
+  .lightbox-overlay .caption { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,.92); padding: 8px 14px; border-radius: 6px; font-size: 12px; color: var(--ink); }
+
+  /* Drawer warning block */
+  .warn-block { background: #fef9c3; color: #713f12; border: 1px solid #fde68a; border-radius: 6px; padding: 10px 12px; font-size: 12.5px; margin: 10px 0; }
+  .warn-block strong { color: #78350f; }
+
+  /* Image card preview is now clickable */
+  .img-card .pre { cursor: zoom-in; transition: outline-color .15s; outline: 2px solid transparent; }
+  .img-card .pre:hover { outline-color: var(--brand); }
+
+  /* Run page result gallery */
+  .rc-cluster-head { display: flex; align-items: start; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .result-card { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #fff; }
+  .result-card .rc-img { background: #f1f5f9; aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+  .result-card .rc-img img { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
+  .result-card .rc-img .ph { color: var(--ink-faint); font-size: 12px; }
+  .result-card .rc-body { padding: 10px 12px 12px; }
+  .result-card .rc-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .result-card .rc-id code { font-size: 10.5px; word-break: break-all; }
+  .result-card .rc-desc { font-size: 12px; color: var(--ink-muted); margin-top: 6px; line-height: 1.45; }
+  .result-card .err-line { background: var(--err-bg); color: var(--err); border-radius: 4px; padding: 4px 8px; margin-top: 6px; font-size: 11px; word-break: break-word; }
+  .result-card .rc-actions { margin-top: 10px; display: flex; gap: 6px; }
+  .result-card.applied { border-color: var(--ok); }
+  .result-card.applied .rc-actions button.primary { background: var(--ok); border-color: var(--ok); }
+
   /* Combobox */
   .combobox { position: relative; }
   .combobox input { padding-right: 36px; }
@@ -248,8 +305,10 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 </head>
 <body>
 <header class="app">
-  <img class="logo" src="${esc(LOGO_URL)}" alt="Gushwork">
-  <span class="title">${esc(APP_TITLE)}</span>${crumb ? `<span class="crumb">/ ${crumb}</span>` : ""}
+  <a href="/" class="brand" title="Home">
+    <img class="logo" src="${esc(LOGO_URL)}" alt="Gushwork">
+    <span class="title">${esc(APP_TITLE)}</span>
+  </a>${crumb ? `<span class="crumb">/ ${crumb}</span>` : ""}
   <nav>
     <a href="/">Home</a>
     <a href="/runs">Runs</a>
@@ -278,23 +337,53 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 // Home — searchable client picker → Import → workspace
 // ────────────────────────────────────────────────────────────────────────
 
-function homePage(res: ServerResponse) {
-  const optsJson = JSON.stringify(CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId })));
+interface ClientPickerEntry {
+  slug: string;
+  projectId: string;
+  name: string;
+}
+
+async function loadClientPickerEntries(): Promise<ClientPickerEntry[]> {
+  // Fetch the project name for every allow-listed entry so the combobox
+  // can search by name as well as slug / project_id. Done in parallel;
+  // fast for any reasonable allow-list size.
+  const out = await Promise.all(
+    CLIENTS.map(async (c) => {
+      try {
+        const p = await lookupProjectById(c.projectId);
+        return { slug: c.slug, projectId: c.projectId, name: p?.name ?? c.slug };
+      } catch {
+        return { slug: c.slug, projectId: c.projectId, name: c.slug };
+      }
+    }),
+  );
+  return out;
+}
+
+async function homePage(res: ServerResponse) {
+  let envOk = true;
+  try {
+    loadEnv();
+  } catch {
+    envOk = false;
+  }
+  const entries = envOk ? await loadClientPickerEntries() : CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }));
+  const optsJson = JSON.stringify(entries);
 
   sendHtml(res, 200, shell("Home", `
 <section class="card">
   <h1>Blog Image Update</h1>
-  <div class="sub">Bulk-regenerate cover, thumbnail, and inline images for published blog pages in <code>gw_stormbreaker</code>. Pick a client to enter its workspace.</div>
+  <div class="sub">Pick a client to open its workspace, review every published blog page, and regenerate images by cluster or by individual image.</div>
 </section>
 
 <section class="card">
-  <h2>Import a client</h2>
+  <h2>Choose a client</h2>
   <form id="import-form" onsubmit="goToWorkspace(event)" autocomplete="off">
     <div class="row">
       <div style="flex:2">
         <label for="client-input">Client</label>
         <div class="combobox" id="combo">
-          <input type="text" id="client-input" placeholder="Search by slug or project_id…" autocomplete="off">
+          <input type="text" id="client-input" placeholder="Search by project name or project ID" autocomplete="off">
           <span class="arrow">▾</span>
           <div class="menu" id="combo-menu"></div>
         </div>
@@ -310,11 +399,11 @@ function homePage(res: ServerResponse) {
 <section class="card">
   <h2>How the workflow runs</h2>
   <ol class="sub" style="font-size:13px;color:var(--ink);line-height:1.7;padding-left:18px;margin:0">
-    <li>Pick the client → land in its workspace with every published blog cluster listed.</li>
-    <li>Use search to narrow by topic or cluster_id; tick whole clusters or open one to pick individual images.</li>
-    <li>(Optional) Drop brand guidelines into the workspace panel — they get injected into every prompt's <code>business_context.client_brand_guidelines</code>.</li>
-    <li>Click <strong>Generate selected</strong> → the regen kicks off, log streams live, CSV + HTML report appear when done.</li>
-    <li>Phase 2 (not yet wired): apply approved images back to S3 directly. For now, the receiving PM uses the CSV / HTML.</li>
+    <li>Choose a client → land in its workspace with every published blog cluster listed.</li>
+    <li>Search by topic or cluster_id; tick whole clusters or open a row to pick individual images.</li>
+    <li>(Optional) Add brand guidelines for that client — text gets injected into every prompt under <code>business_context.client_brand_guidelines</code>.</li>
+    <li>Click <strong>Generate selected</strong> → live log streams on a dedicated run page; new images render once they're ready.</li>
+    <li>Phase 2 (not yet wired): apply approved images back to S3 directly from the run page. Prompts and aspect ratios are managed in the background.</li>
   </ol>
 </section>
 `, `<script>
@@ -329,19 +418,25 @@ let visible = [];
 
 function render(filter) {
   const f = filter.toLowerCase().trim();
-  visible = CLIENTS.filter(c => !f || c.slug.toLowerCase().includes(f) || c.projectId.toLowerCase().includes(f));
+  visible = CLIENTS.filter(c => !f
+    || c.name.toLowerCase().includes(f)
+    || c.slug.toLowerCase().includes(f)
+    || c.projectId.toLowerCase().includes(f));
   if (visible.length === 0) {
     menu.innerHTML = '<div class="opt" style="color:var(--ink-faint);cursor:default">no matches</div>';
   } else {
     menu.innerHTML = visible.map((c, i) =>
-      '<div class="opt' + (i === activeIdx ? ' active' : '') + '" data-i="' + i + '"><div>' + c.slug + '</div><div class="pid">' + c.projectId + '</div></div>'
+      '<div class="opt' + (i === activeIdx ? ' active' : '') + '" data-i="' + i + '">' +
+        '<div><strong>' + c.name + '</strong></div>' +
+        '<div class="pid">' + c.slug + ' · ' + c.projectId + '</div>' +
+      '</div>'
     ).join('');
   }
 }
 function pick(i) {
   if (i < 0 || i >= visible.length) return;
   const c = visible[i];
-  inp.value = c.slug;
+  inp.value = c.name;
   hidden.value = c.slug;
   combo.classList.remove('open');
   btn.disabled = false;
@@ -420,6 +515,7 @@ async function workspacePage(res: ServerResponse, slug: string) {
   }
 
   const brand = (await loadBrandGuidelines(slug)) ?? "";
+  const savedToken = await loadToken(slug);
 
   // Parallel S3 fetches for inline-image counts.
   const s3Cache = new Map<string, string | null>();
@@ -470,9 +566,11 @@ async function workspacePage(res: ServerResponse, slug: string) {
     .map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`)
     .join(" ");
 
-  // Render cluster rows
+  // Render cluster rows. Whole row is clickable; the master checkbox
+  // sits inside but stops event propagation so its click doesn't open
+  // the drawer (and vice versa).
   const tbody = payload
-    .map((c, i) => {
+    .map((c) => {
       const cover = c.cover_url
         ? `<img src="${esc(c.cover_url)}" alt="" loading="lazy">`
         : `<div class="placeholder"></div>`;
@@ -480,37 +578,95 @@ async function workspacePage(res: ServerResponse, slug: string) {
         .map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`)
         .join(" ");
       return `
-<tr data-cluster-id="${esc(c.id)}" data-topic="${esc(c.topic.toLowerCase())}">
-  <td><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onchange="onClusterCheck('${esc(c.id)}', this.checked)"></td>
+<tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
+  <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onchange="onClusterCheck('${esc(c.id)}', this.checked)"></td>
   <td class="topic">
     <div class="t">${esc(c.topic)}</div>
     <div class="cid"><code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
   </td>
   <td class="preview">${cover}</td>
   <td class="types"><div class="pills-wrap">${pills}</div></td>
-  <td style="text-align:right">
-    <button class="ghost" onclick="openDrawer('${esc(c.id)}')">Open ↗</button>
-  </td>
+  <td style="text-align:right;color:var(--ink-faint);font-size:11px">click to open ↗</td>
 </tr>`;
     })
     .join("");
 
+  // Pre-render Client info card
+  function fmtJson(v: unknown): string {
+    if (v == null) return "(empty)";
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+  }
+  const logoUrls = (project.logo_urls ?? null) as Record<string, unknown> | null;
+  const primaryLogo =
+    (logoUrls && typeof logoUrls === "object"
+      ? (logoUrls.primary_logo ??
+         logoUrls.logo ??
+         logoUrls.primaryLogo ??
+         Object.values(logoUrls).find((v) => typeof v === "string" && (v as string).startsWith("http")))
+      : null) as string | null | undefined;
+
   const body = `
 <section class="card">
-  <h1>${esc(project.name ?? slug)} <span style="color:var(--ink-faint);font-weight:400;font-size:14px">/ ${esc(slug)}</span></h1>
-  <div class="sub">
-    project_id <code>${esc(project.id)}</code> · ${clusters.length} published blog clusters · ${totalImages} images (${totalsBadges})
+  <div style="display:flex;align-items:start;gap:16px">
+    ${primaryLogo ? `<img src="${esc(primaryLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
+    <div style="flex:1">
+      <h1>${esc(project.name ?? slug)} <span style="color:var(--ink-faint);font-weight:400;font-size:14px">/ ${esc(slug)}</span></h1>
+      <div class="sub">
+        project_id <code>${esc(project.id)}</code> · ${clusters.length} published blog clusters · ${totalImages} images (${totalsBadges})
+      </div>
+    </div>
+    <label class="toggle" id="test-run-toggle" style="flex:0 0 auto">
+      <input type="checkbox" id="test-run-mode" onchange="toggleTestRun(this.checked)">
+      Test run mode (3 clusters)
+    </label>
   </div>
 </section>
 
 <section class="card">
-  <details${brand ? " open" : ""}>
+  <details>
+    <summary><h2 style="display:inline">Client information</h2></summary>
+    <div class="sub" style="margin:8px 0 14px">Live values pulled from the <code>projects</code> row plus the saved <code>graphic-tokens/${esc(slug)}.json</code> if present. Read-only here — edit via the relevant CLI command.</div>
+
+    <div class="info-grid">
+      <div class="k">name</div>           <div class="v">${esc(project.name ?? "—")}</div>
+      <div class="k">project_id</div>     <div class="v"><code>${esc(project.id)}</code></div>
+      <div class="k">staging_subdomain</div><div class="v"><code>${esc(project.staging_subdomain ?? "—")}</code></div>
+      <div class="k">homepage url</div>   <div class="v">${project.url ? `<a href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url)}</a>` : "—"}</div>
+      <div class="k">primary logo</div>   <div class="v">${primaryLogo ? `<a href="${esc(primaryLogo)}" target="_blank">${esc(primaryLogo)}</a>` : "—"}</div>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary><strong style="font-size:13px">company_info</strong></summary>
+      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.company_info))}</pre>
+    </details>
+    <details style="margin-top:8px">
+      <summary><strong style="font-size:13px">business_context (additional_info)</strong></summary>
+      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.additional_info))}</pre>
+    </details>
+    <details style="margin-top:8px">
+      <summary><strong style="font-size:13px">graphic_token (saved)</strong></summary>
+      ${savedToken
+        ? `<pre class="json-dump" style="margin-top:8px">${esc(fmtJson(savedToken))}</pre>`
+        : `<div class="sub" style="margin-top:8px">No saved graphic_token. Run <code>npm run extract-token -- --client ${esc(slug)}</code> to generate one (Firecrawl + Portkey call) and edit the JSON.</div>`}
+    </details>
+    <details style="margin-top:8px">
+      <summary><strong style="font-size:13px">logo_urls (raw)</strong></summary>
+      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.logo_urls))}</pre>
+    </details>
+    <details style="margin-top:8px">
+      <summary><strong style="font-size:13px">design_tokens (raw)</strong></summary>
+      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.design_tokens))}</pre>
+    </details>
+  </details>
+</section>
+
+<section class="card">
+  <details open>
     <summary><h2 style="display:inline">Brand guidelines (optional)</h2></summary>
     <div class="sub" style="margin:8px 0 10px">
       Freeform text injected into every prompt under <code>business_context.client_brand_guidelines</code>.
-      Saved to <code>graphic-tokens/${esc(slug)}-brand.txt</code> (gitignored). Useful for color preferences,
-      tone, things to avoid, mandatory taglines, etc. Other prompt inputs (graphic_token, asset prompts,
-      aspect ratios) are managed in the background and don't change here.
+      Saved to <code>graphic-tokens/${esc(slug)}-brand.txt</code> (gitignored). Use for color preferences,
+      tone, things to avoid, mandatory taglines, etc. Prompts and aspect ratios are managed in the background.
     </div>
     <form id="brand-form" onsubmit="saveBrand(event)">
       <textarea id="brand-text" placeholder="e.g. Use deep navy and gold accents only. Avoid stock-photo human subjects. Always include a small Sentinel mark in the footer.">${esc(brand)}</textarea>
@@ -538,7 +694,7 @@ async function workspacePage(res: ServerResponse, slug: string) {
         <th>Topic / cluster_id</th>
         <th style="width:84px">cover</th>
         <th>asset breakdown</th>
-        <th style="width:90px;text-align:right"></th>
+        <th style="width:120px;text-align:right"></th>
       </tr>
     </thead>
     <tbody id="cluster-tbody">${tbody}</tbody>
@@ -557,29 +713,26 @@ async function workspacePage(res: ServerResponse, slug: string) {
     <div class="meta" id="drawer-meta">— images selected</div>
     <button onclick="selectAllInDrawer(true)">Select all</button>
     <button onclick="selectAllInDrawer(false)">Clear</button>
+    <button class="primary" onclick="closeDrawer()">Done</button>
   </footer>
 </aside>
 
-<!-- Sticky bottom action bar -->
+<!-- Lightbox -->
+<div class="lightbox-overlay" id="lightbox" onclick="closeLightboxOnBackdrop(event)">
+  <button class="close-x" onclick="closeLightbox()" aria-label="Close">×</button>
+  <img id="lightbox-img" src="" alt="">
+  <div class="caption" id="lightbox-cap"></div>
+</div>
+
+<!-- Sticky bottom action bar (simplified — provider + dry-run + saved-token live in CLI) -->
 <div class="action-bar">
   <div class="stats">
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
+    <span id="bar-test-mode" style="display:none;color:var(--brand);margin-left:10px;font-size:12px">· test-run mode active (3 clusters)</span>
   </div>
   <div class="right">
-    <div class="check-row">
-      <input type="checkbox" id="bar-dry-run" checked>
-      <label for="bar-dry-run">Dry-run (prompts only)</label>
-    </div>
-    <div class="check-row">
-      <input type="checkbox" id="bar-saved-token">
-      <label for="bar-saved-token">Use saved token</label>
-    </div>
-    <select id="bar-provider" style="width:auto">
-      <option value="">provider: default</option>
-      <option value="replicate">replicate</option>
-      <option value="fal">fal</option>
-    </select>
-    <button class="primary" id="bar-run" onclick="runRegen()" disabled>Generate selected →</button>
+    <button class="" id="bar-dry-run-btn" onclick="runRegen(true)" disabled title="Build prompts only — no image generation">Dry run</button>
+    <button class="primary" id="bar-run-btn" onclick="runRegen(false)" disabled>Generate selected →</button>
   </div>
 </div>
 `;
@@ -587,9 +740,9 @@ async function workspacePage(res: ServerResponse, slug: string) {
   const scripts = `<script>
 const SLUG = ${JSON.stringify(slug)};
 const CLUSTERS = ${JSON.stringify(payload)};
+const TEST_RUN_LIMIT = 3;
 // Per-cluster set of selected image IDs. Empty set = nothing selected.
-// Selecting a cluster row pre-selects every image in that cluster.
-const selection = new Map(); // cluster_id -> Set(image_id)
+const selection = new Map();
 
 function imageIdsOf(clusterId) {
   const c = CLUSTERS.find(x => x.id === clusterId);
@@ -597,7 +750,6 @@ function imageIdsOf(clusterId) {
 }
 function clusterById(id) { return CLUSTERS.find(c => c.id === id); }
 
-// Cluster-level checkbox toggles all images in that cluster.
 function onClusterCheck(clusterId, on) {
   if (on) selection.set(clusterId, new Set(imageIdsOf(clusterId)));
   else selection.delete(clusterId);
@@ -607,9 +759,7 @@ function onClusterCheck(clusterId, on) {
 function toggleAllClusters(on) {
   for (const tr of visibleRows()) {
     const cid = tr.dataset.clusterId;
-    const cb = tr.querySelector('input.cluster-select');
-    if (!cb || !cid) continue;
-    cb.checked = on;
+    if (!cid) continue;
     if (on) selection.set(cid, new Set(imageIdsOf(cid)));
     else selection.delete(cid);
   }
@@ -621,19 +771,36 @@ function visibleRows() {
 function allRows() {
   return Array.from(document.querySelectorAll('#cluster-tbody tr'));
 }
-function filterClusters(q) {
-  q = q.toLowerCase().trim();
+
+// ── Test run mode (limit to first 3 clusters) ──
+let testRunMode = false;
+function toggleTestRun(on) {
+  testRunMode = on;
+  document.getElementById('test-run-toggle').classList.toggle('on', on);
+  document.getElementById('bar-test-mode').style.display = on ? 'inline' : 'none';
+  applyFilters();
+}
+function applyFilters() {
+  const q = (document.getElementById('topic-filter').value || '').toLowerCase().trim();
   let n = 0;
+  let matchedSoFar = 0;
   for (const tr of allRows()) {
     const topic = tr.dataset.topic ?? '';
     const cid = tr.dataset.clusterId ?? '';
-    const match = !q || topic.includes(q) || cid.includes(q);
-    tr.classList.toggle('row-hidden', !match);
-    if (match) n++;
+    const matchSearch = !q || topic.includes(q) || cid.includes(q);
+    let visible = matchSearch;
+    if (visible && testRunMode) {
+      if (matchedSoFar >= TEST_RUN_LIMIT) visible = false;
+      else matchedSoFar++;
+    }
+    tr.classList.toggle('row-hidden', !visible);
+    if (visible) n++;
   }
   document.getElementById('visible-count').textContent = n;
   document.getElementById('all-clusters').checked = false;
 }
+function filterClusters() { applyFilters(); }
+
 function refreshTotals() {
   let imgs = 0, cls = 0;
   for (const [cid, set] of selection.entries()) {
@@ -641,8 +808,8 @@ function refreshTotals() {
   }
   document.getElementById('bar-img-count').textContent = imgs;
   document.getElementById('bar-cluster-count').textContent = cls;
-  document.getElementById('bar-run').disabled = imgs === 0;
-  // Sync row checkboxes with selection state.
+  document.getElementById('bar-run-btn').disabled = imgs === 0;
+  document.getElementById('bar-dry-run-btn').disabled = imgs === 0;
   for (const tr of allRows()) {
     const cid = tr.dataset.clusterId;
     if (!cid) continue;
@@ -650,14 +817,18 @@ function refreshTotals() {
     if (!cb) continue;
     const set = selection.get(cid);
     const total = imageIdsOf(cid).length;
-    if (!set || set.size === 0) {
-      cb.checked = false; cb.indeterminate = false;
-    } else if (set.size === total) {
-      cb.checked = true; cb.indeterminate = false;
-    } else {
-      cb.checked = false; cb.indeterminate = true;
-    }
+    if (!set || set.size === 0) { cb.checked = false; cb.indeterminate = false; }
+    else if (set.size === total) { cb.checked = true; cb.indeterminate = false; }
+    else { cb.checked = false; cb.indeterminate = true; }
   }
+}
+
+// ── Whole-row click → open drawer ──
+function rowClick(ev, cid) {
+  // ignore clicks that originated on a checkbox / interactive element
+  const t = ev.target;
+  if (t.closest('input,button,a,label,code')) return;
+  openDrawer(cid);
 }
 
 // ── Drawer ──
@@ -668,27 +839,41 @@ function openDrawer(cid) {
   drawerClusterId = cid;
   const set = selection.get(cid) ?? new Set();
   document.getElementById('drawer-title').textContent = c.topic;
-  const cards = c.images.map((img) => {
+
+  const cardsHtml = [];
+  let warnedComplexFlow = false;
+  for (const img of c.images) {
+    const isComplex = (img.asset === 'internal' || img.asset === 'external');
+    if (isComplex && !warnedComplexFlow) {
+      cardsHtml.push(
+        '<div class="warn-block"><strong>Heads-up:</strong> the <code>internal</code> / <code>external</code> image flow is complicated — only choose these if particularly necessary. Cover, thumbnail and infographic flows are the well-trodden paths.</div>'
+      );
+      warnedComplexFlow = true;
+    }
     const checked = set.has(img.id);
-    const previewHtml = img.preview_url
-      ? '<img src="' + img.preview_url + '" alt="" loading="lazy">'
-      : '<div class="ph">no preview<br>available</div>';
-    return '<label class="img-card' + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
-      '<input type="checkbox" class="img-toggle" ' + (checked ? 'checked' : '') + ' onchange="onImgToggle(this)">' +
-      '<div class="pre">' + previewHtml + '</div>' +
-      '<div>' +
-        '<div class="meta-row">' +
-          '<span class="pill ' + img.asset + '">' + img.asset + ' · ' + img.aspect + '</span>' +
-          '<code>' + img.id + '</code>' +
+    const previewSrc = img.preview_url || c.cover_url || '';
+    const previewHtml = previewSrc
+      ? '<img src="' + previewSrc + '" alt="" loading="lazy" onclick="openLightbox(event, this.src, ' + JSON.stringify(img.asset + ' · ' + img.id) + ')">'
+      : '<div class="ph">no preview<br>(post-regen)</div>';
+    cardsHtml.push(
+      '<label class="img-card' + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
+        '<input type="checkbox" class="img-toggle" ' + (checked ? 'checked' : '') + ' onchange="onImgToggle(this)">' +
+        '<div class="pre">' + previewHtml + '</div>' +
+        '<div>' +
+          '<div class="meta-row">' +
+            '<span class="pill ' + img.asset + '">' + img.asset + ' · ' + img.aspect + '</span>' +
+            '<code>' + img.id + '</code>' +
+          '</div>' +
+          '<div class="desc">' + (img.description || '<em style="color:var(--ink-faint)">(no description)</em>') + '</div>' +
+          '<div class="sub" style="margin-top:4px;font-size:11px;color:var(--ink-faint)">source: ' + img.source + '</div>' +
         '</div>' +
-        '<div class="desc">' + (img.description || '<em style="color:var(--ink-faint)">(no description)</em>') + '</div>' +
-        '<div class="sub" style="margin-top:4px;font-size:11px;color:var(--ink-faint)">source: ' + img.source + '</div>' +
-      '</div>' +
-    '</label>';
-  }).join('');
+      '</label>'
+    );
+  }
+
   document.getElementById('drawer-body').innerHTML =
     '<div class="desc-cluster">cluster <code>' + c.id + '</code> · ' + c.total + ' images · last updated ' + (c.updated_at ?? '') + '</div>' +
-    cards;
+    cardsHtml.join('');
   refreshDrawerMeta();
   document.getElementById('drawer').classList.add('open');
   document.getElementById('overlay').classList.add('open');
@@ -733,6 +918,29 @@ function refreshDrawerIfOpen(clusterId) {
   if (drawerClusterId === clusterId) openDrawer(clusterId);
 }
 
+// ── Lightbox ──
+function openLightbox(ev, src, caption) {
+  if (ev) ev.stopPropagation();
+  const lb = document.getElementById('lightbox');
+  document.getElementById('lightbox-img').src = src;
+  document.getElementById('lightbox-cap').textContent = caption || '';
+  lb.classList.add('open');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightbox-img').src = '';
+}
+function closeLightboxOnBackdrop(ev) {
+  // Close only if user clicked backdrop, not the image itself.
+  if (ev.target === ev.currentTarget) closeLightbox();
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('lightbox').classList.contains('open')) { closeLightbox(); return; }
+    if (document.getElementById('drawer').classList.contains('open')) closeDrawer();
+  }
+});
+
 // ── Brand guidelines ──
 async function saveBrand(e) {
   e.preventDefault();
@@ -753,27 +961,22 @@ async function saveBrand(e) {
 }
 
 // ── Run regen ──
-async function runRegen() {
+async function runRegen(dryRun) {
   const items = [];
   for (const [cid, set] of selection.entries()) {
     if (set.size === 0) continue;
     items.push({ cluster_id: cid, image_ids: [...set] });
   }
   if (items.length === 0) return;
-  // For v1 the CLI's --cluster-ids flag includes ALL images in the matched
-  // clusters; per-image scoping requires a future flag. We pass cluster_ids
-  // and document the gap inline for the user.
   const allFullySelected = items.every(it => it.image_ids.length === imageIdsOf(it.cluster_id).length);
   if (!allFullySelected) {
-    if (!confirm('Some clusters have a partial image selection. The current regen runs on whole clusters — your unselected images in those clusters will also be regenerated. Proceed?')) return;
+    if (!confirm('Partial image selection detected. The current backend regenerates whole clusters — unselected images in those clusters will also be regenerated. Proceed?')) return;
   }
   const fd = new FormData();
   fd.set('client', SLUG);
   for (const it of items) fd.append('cluster_id', it.cluster_id);
-  fd.set('dry_run', document.getElementById('bar-dry-run').checked ? 'on' : '');
-  fd.set('use_saved_token', document.getElementById('bar-saved-token').checked ? 'on' : '');
-  const provider = document.getElementById('bar-provider').value;
-  if (provider) fd.set('provider', provider);
+  if (dryRun) fd.set('dry_run', 'on');
+  fd.set('provider', 'replicate');
   const r = await fetch('/regen', { method: 'POST', body: fd });
   if (r.redirected) { window.location.href = r.url; return; }
   const t = await r.text();
@@ -943,7 +1146,34 @@ ${RUNS.size === 0
 </section>`));
 }
 
-function runPage(res: ServerResponse, id: string) {
+interface CsvRowParsed {
+  image_id: string;
+  asset_type: string;
+  cluster_id: string;
+  page_topic: string;
+  image_url_new: string;
+  image_local_path: string;
+  description_used: string;
+  prompt_used: string;
+  aspect_ratio: string;
+  generated_at_utc: string;
+  status: string;
+  error: string;
+  client_slug: string;
+  project_id: string;
+}
+
+async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
+  try {
+    const raw = await fs.readFile(csvPath, "utf8");
+    const rows = csvParse(raw, { columns: true, skip_empty_lines: true }) as CsvRowParsed[];
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+async function runPage(res: ServerResponse, id: string) {
   const state = RUNS.get(id);
   if (!state) {
     sendHtml(res, 404, shell("Not found", `<div class="banner err">run ${esc(id)} not found</div>`));
@@ -951,6 +1181,74 @@ function runPage(res: ServerResponse, id: string) {
   }
   const initial = esc(state.log.join(""));
   const cmd = esc(`npx ${state.args.join(" ")}`);
+
+  // If the run is done and a CSV exists, build the after-image gallery.
+  let resultsHtml = "";
+  if (state.done && state.csvPath) {
+    const rows = await readRunCsv(state.csvPath);
+    if (rows.length > 0) {
+      const grouped = new Map<string, { topic: string; rows: CsvRowParsed[] }>();
+      for (const r of rows) {
+        const g = grouped.get(r.cluster_id) ?? { topic: r.page_topic, rows: [] };
+        g.rows.push(r);
+        grouped.set(r.cluster_id, g);
+      }
+      const totalCompleted = rows.filter((r) => r.status === "completed").length;
+
+      const groups = [...grouped.entries()].map(([clusterId, g]) => {
+        const cards = g.rows
+          .map((r) => {
+            const newImg = r.image_url_new
+              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(`${r.asset_type} · ${r.image_id}`))})">`
+              : `<div class="ph">${esc(r.status)}</div>`;
+            const errCell = r.error
+              ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
+              : "";
+            return `
+<div class="result-card" data-image-id="${esc(r.image_id)}">
+  <div class="rc-img">${newImg}</div>
+  <div class="rc-body">
+    <div class="rc-row"><span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span><span class="pill ${r.status === "completed" ? "internal" : r.status === "failed" ? "external" : "generic"}">${esc(r.status)}</span></div>
+    <div class="rc-id"><code>${esc(r.image_id)}</code></div>
+    <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
+    ${errCell}
+    <div class="rc-actions">
+      <button class="primary" onclick="applyOne(this, '${esc(r.image_id)}', '${esc(r.image_local_path)}')">Apply to S3</button>
+    </div>
+  </div>
+</div>`;
+          })
+          .join("");
+        return `
+<section class="card">
+  <div class="rc-cluster-head">
+    <div>
+      <div style="font-weight:600;font-size:14px">${esc(g.topic || "(no topic)")}</div>
+      <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} images</div>
+    </div>
+  </div>
+  <div class="result-grid">${cards}</div>
+</section>`;
+      }).join("");
+
+      resultsHtml = `
+<section class="card" id="results-summary">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <h2 style="margin:0">Results</h2>
+    <span class="sub">${rows.length} total · <strong style="color:var(--ok)">${totalCompleted} completed</strong></span>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button onclick="applyAll()">Apply all to S3</button>
+    </div>
+  </div>
+  <div class="banner warn" style="margin-top:10px">
+    <strong>Phase 2 — apply-to-S3 is not yet wired.</strong>
+    The button above logs intent + downloads a JSON manifest. Actual S3 PutObject lands in the next iteration.
+  </div>
+</section>
+${groups}
+`;
+    }
+  }
 
   sendHtml(res, 200, shell(`run ${id}`, `
 <section class="card">
@@ -974,14 +1272,62 @@ function runPage(res: ServerResponse, id: string) {
   </div>
 </section>
 
-<section class="card">
-  <h2>Log</h2>
-  <div id="log" class="log">${initial}</div>
-</section>
+<details class="card" ${state.done ? "" : "open"}>
+  <summary><h2 style="display:inline">Log</h2></summary>
+  <div id="log" class="log" style="margin-top:10px">${initial}</div>
+</details>
+
+${resultsHtml}
+
+<!-- Lightbox -->
+<div class="lightbox-overlay" id="rp-lightbox" onclick="lbBackdrop(event)">
+  <button class="close-x" onclick="lbClose()" aria-label="Close">×</button>
+  <img id="rp-lb-img" src="" alt="">
+  <div class="caption" id="rp-lb-cap"></div>
+</div>
 `, `<script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
+
+function lbOpen(ev, src, caption) {
+  if (ev) ev.stopPropagation();
+  document.getElementById('rp-lb-img').src = src;
+  document.getElementById('rp-lb-cap').textContent = caption || '';
+  document.getElementById('rp-lightbox').classList.add('open');
+}
+function lbClose() {
+  document.getElementById('rp-lightbox').classList.remove('open');
+  document.getElementById('rp-lb-img').src = '';
+}
+function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') lbClose(); });
+
+// ── Apply-to-S3 stubs (Phase 2) ──
+const applied = new Set();
+function applyOne(btn, imageId, localPath) {
+  const card = btn.closest('.result-card');
+  if (applied.has(imageId)) return;
+  applied.add(imageId);
+  card.classList.add('applied');
+  btn.textContent = 'Marked for apply';
+  btn.disabled = true;
+}
+function applyAll() {
+  for (const card of document.querySelectorAll('.result-card')) {
+    const id = card.dataset.imageId;
+    const btn = card.querySelector('button.primary');
+    if (id && btn && !applied.has(id)) applyOne(btn, id, '');
+  }
+  // Download a JSON manifest the receiving operator can feed into the
+  // (forthcoming) push-to-S3 script.
+  const items = [...applied];
+  const blob = new Blob([JSON.stringify({ run_id: window.location.pathname.split('/').pop(), apply: items }, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'apply-manifest.json'; a.click();
+  URL.revokeObjectURL(url);
+}
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
 es.onmessage = (ev) => {
