@@ -24,6 +24,9 @@ const Schema = z.object({
   AWS_SECRET_ACCESS_KEY: z.preprocess(emptyToUndef, z.string().min(1).optional()),
   AWS_REGION: z.preprocess(emptyToUndef, z.string().min(1).default("us-east-1")),
   S3_BUCKET: z.preprocess(emptyToUndef, z.string().min(1).default("gw-stormbreaker")),
+  /** Bucket where rendered blog images live (cover/thumbnail/inline). Apply
+   * step writes here at `website/<staging>/assets/blog-images/<cluster>/<image_id>/{size}.webp`. */
+  S3_CONTENT_BUCKET: z.preprocess(emptyToUndef, z.string().min(1).default("gw-content-store")),
 });
 
 export type Env = z.infer<typeof Schema>;

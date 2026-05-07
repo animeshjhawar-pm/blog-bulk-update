@@ -20,6 +20,7 @@ import { loadEnv } from "./env.js";
 import { loadBrandGuidelines, saveBrandGuidelines, loadToken } from "./tokens.js";
 import { promises as fs } from "node:fs";
 import { parse as csvParse } from "csv-parse/sync";
+import { uploadBlogImage } from "./s3.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Blog Image Update";
@@ -275,30 +276,28 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .rc-desc { font-size: 12px; color: var(--ink-muted); margin-top: 6px; line-height: 1.45; }
   .result-card .err-line { background: var(--err-bg); color: var(--err); border-radius: 4px; padding: 4px 8px; margin-top: 6px; font-size: 11px; word-break: break-word; }
   .result-card .rc-actions { margin-top: 10px; display: flex; gap: 6px; }
-  /* Run page result cards — per-image state machine */
-  .result-card[data-state="approved"] { border-color: var(--ok); background: #f0fdf4; }
-  .result-card[data-state="rejected"] { border-color: #fda4af; background: #fef2f2; opacity: .75; }
-  .result-card[data-state="rejected"] .rc-img img { filter: grayscale(.7) opacity(.6); }
-  .result-card[data-state="applied"] { border-color: var(--ok); background: #d1fae5; }
-  .result-card[data-state="applied"] .rc-actions button.btn-apply { background: var(--ok); border-color: var(--ok); color: #fff; }
+  /* Run page result cards — only states we paint:
+       pending  (default, no extra class)
+       applying (in flight, blue tint)
+       applied  (terminal success, green)
+       failed   (apply or regen errored, red) */
+  .result-card[data-state="applying"] { border-color: var(--brand); background: #eef2ff; }
+  .result-card[data-state="applied"]  { border-color: var(--ok); background: #d1fae5; }
+  .result-card[data-state="applied"] .btn-apply { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .result-card[data-state="failed"]   { border-color: #fca5a5; background: #fef2f2; }
   .result-card .rc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .result-card .rc-actions button { font-size: 12px; padding: 5px 10px; }
-  .result-card .rc-actions .btn-approve[data-on], .result-card[data-state="approved"] .btn-approve { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
-  .result-card[data-state="rejected"] .btn-reject { background: var(--err-bg); border-color: #fca5a5; color: var(--err); }
-  .result-card .btn-regen { width: 32px; padding: 5px; text-align: center; }
+  .result-card .rc-status-line { font-size: 11px; color: var(--err); margin-top: 6px; display: none; }
+  .result-card[data-synthetic="1"] .btn-apply { opacity: .5; }
   .result-card .state-pill { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; font-weight: 500; }
-  .result-card .state-pill.state-approved { background: var(--ok-bg); color: var(--ok); }
-  .result-card .state-pill.state-rejected { background: var(--err-bg); color: var(--err); }
-  .result-card .state-pill.state-applied { background: var(--ok); color: #fff; }
-  .result-card .state-pill.state-pending { display: none; }
+  .result-card .state-pill.state-applying { background: var(--accent-bg); color: var(--brand); }
+  .result-card .state-pill.state-applied  { background: var(--ok); color: #fff; }
+  .result-card .state-pill.state-failed   { background: var(--err-bg); color: var(--err); }
+  .result-card .state-pill.state-pending  { display: none; }
 
   /* Cluster section header on run page */
   .cluster-section .cs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
   .cluster-section .cs-actions { margin-left: auto; display: flex; gap: 6px; }
-
-  /* Phase-2 inline note */
-  .action-bar .phase2-note { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; padding: 4px 10px; border-radius: 6px; font-size: 11.5px; }
-  .action-bar .phase2-note code { font-size: 11px; background: rgba(255,255,255,.7); }
 
   /* Combobox */
   .combobox { position: relative; }
@@ -424,8 +423,8 @@ async function homePage(res: ServerResponse) {
     <li>Choose a client → land in its workspace with every published blog cluster listed.</li>
     <li>Search by topic or cluster_id; tick whole clusters or open a row to pick individual images.</li>
     <li>(Optional) Add brand guidelines for that client — text gets injected into every prompt under <code>business_context.client_brand_guidelines</code>.</li>
-    <li>Click <strong>Generate selected</strong> → live log streams on a dedicated run page; new images render once they're ready.</li>
-    <li>Phase 2 (not yet wired): apply approved images back to S3 directly from the run page. Prompts and aspect ratios are managed in the background.</li>
+    <li>Click <strong>Dry run</strong> → live log streams on a dedicated run page; new images render once they're ready.</li>
+    <li>On the run page, each new image card has just two controls — <strong>↻ Regenerate</strong> (re-roll the image in place) and <strong>Apply to S3</strong> (push to <code>gw-content-store</code> at the canonical key). Prompts and aspect ratios stay in the background.</li>
   </ol>
 </section>
 `, `<script>
@@ -1020,6 +1019,77 @@ refreshTotals();
 // POST /workspace/:slug/brand — save brand guidelines
 // ────────────────────────────────────────────────────────────────────────
 
+async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let runId = "", imageId = "", imageUrl: string | null = null;
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+      run_id?: string;
+      image_id?: string;
+      image_url?: string;
+    };
+    runId = body.run_id ?? "";
+    imageId = body.image_id ?? "";
+    imageUrl = body.image_url ?? null;
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON body" });
+  }
+  if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
+
+  const state = RUNS.get(runId);
+  if (!state) return sendJson(res, 404, { error: `run ${runId} not found` });
+  if (!state.csvPath) return sendJson(res, 400, { error: "run has no CSV yet" });
+
+  // Load the CSV row for this image to recover image_url_new + cluster_id
+  // (when the client didn't pass image_url explicitly, e.g. after regen-one
+  // updated the in-page src but not the CSV).
+  let clusterId = "";
+  if (!imageUrl) {
+    const rows = await readRunCsv(state.csvPath);
+    const row = rows.find((r) => r.image_id === imageId);
+    if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
+    if (!row.image_url_new) return sendJson(res, 400, { error: `no new image URL for ${imageId}` });
+    imageUrl = row.image_url_new;
+    clusterId = row.cluster_id;
+  } else {
+    // We still need cluster_id; find via CSV.
+    const rows = await readRunCsv(state.csvPath);
+    const row = rows.find((r) => r.image_id === imageId);
+    if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
+    clusterId = row.cluster_id;
+  }
+
+  // Synthetic cover/thumbnail IDs aren't real S3 paths — refuse for now.
+  if (imageId.includes("/")) {
+    return sendJson(res, 400, {
+      error:
+        `Apply not yet supported for synthetic image_ids (e.g. cover-images/, thumbnail-images/). ` +
+        `These don't map 1:1 to existing S3 keys; cover/thumbnail wiring is the next iteration.`,
+    });
+  }
+
+  // Look up the project to get staging_subdomain.
+  const entry = findClient(state.client);
+  if (!entry) return sendJson(res, 400, { error: `client ${state.client} not in allow-list` });
+  const project = await lookupProjectById(entry.projectId);
+  if (!project?.staging_subdomain) {
+    return sendJson(res, 500, { error: "project missing staging_subdomain" });
+  }
+
+  try {
+    const result = await uploadBlogImage({
+      stagingSubdomain: project.staging_subdomain,
+      clusterId,
+      imageId,
+      imageUrl: imageUrl!,
+    });
+    sendJson(res, 200, { ok: true, ...result, image_id: imageId, cluster_id: clusterId });
+  } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
+}
+
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -1239,7 +1309,7 @@ async function runPage(res: ServerResponse, id: string) {
   // If the run is done and a CSV exists, build the publish view —
   // workspace-mirrored: one cluster card per affected cluster, with
   // a click-anywhere row that opens a drawer of new-image cards
-  // (Approve toggle + per-image Apply). Bulk "Apply approved" lives
+  // (per-image Apply + Regenerate). Bulk "Apply all pending" lives
   // in the sticky publish action bar at the bottom of the page.
   let resultsHtml = "";
   if (state.done && state.csvPath) {
@@ -1254,19 +1324,21 @@ async function runPage(res: ServerResponse, id: string) {
       const totalCompleted = rows.filter((r) => r.status === "completed").length;
       const totalFailed = rows.filter((r) => r.status === "failed").length;
 
-      // Render inline cluster sections — each section is a grid of
-      // per-image cards with full controls visible at first glance.
+      // Inline cluster sections. Each card has just two controls:
+      // Apply (S3 PutObject) and Regenerate (re-runs that single
+      // image through the pipeline).
       const clusterSections = [...grouped.entries()].map(([clusterId, g]) => {
         const cards = g.rows
           .map((r) => {
             const previewHtml = r.image_url_new
-              ? `<img src="${esc(r.image_url_new)}" alt="" data-base-url="${esc(r.image_url_new)}" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(r.asset_type + " · " + r.image_id))})">`
+              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(r.asset_type + " · " + r.image_id))})">`
               : `<div class="ph">${esc(r.status)}</div>`;
             const errCell = r.error
               ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
               : "";
+            const synthetic = r.image_id.includes("/");
             return `
-<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending">
+<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}>
   <div class="rc-img">${previewHtml}</div>
   <div class="rc-body">
     <div class="rc-row">
@@ -1276,11 +1348,10 @@ async function runPage(res: ServerResponse, id: string) {
     <div class="rc-id"><code>${esc(r.image_id)}</code></div>
     <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
     ${errCell}
+    <div class="rc-status-line"></div>
     <div class="rc-actions">
-      <button class="btn-approve" onclick="setState('${esc(r.image_id)}', 'approved')" title="Approve for apply">✓ Approve</button>
-      <button class="btn-reject"  onclick="setState('${esc(r.image_id)}', 'rejected')" title="Reject this image">✗ Reject</button>
-      <button class="btn-regen"   onclick="regenOne('${esc(r.image_id)}')" title="Regenerate this image">↻</button>
-      <button class="btn-apply primary" onclick="applyOne('${esc(r.image_id)}')" title="Apply this image to S3 (Phase 2)">Apply</button>
+      <button class="btn-regen" onclick="regenOne('${esc(r.image_id)}')" title="Regenerate this image">↻ Regenerate</button>
+      <button class="btn-apply primary" onclick="applyOne('${esc(r.image_id)}')" ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
     </div>
   </div>
 </div>`;
@@ -1294,8 +1365,7 @@ async function runPage(res: ServerResponse, id: string) {
       <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
     </div>
     <div class="cs-actions">
-      <button onclick="approveCluster('${esc(clusterId)}', 'approved')">Approve all in cluster</button>
-      <button onclick="approveCluster('${esc(clusterId)}', 'pending')">Clear cluster</button>
+      <button onclick="applyCluster('${esc(clusterId)}')">Apply all in this cluster</button>
     </div>
   </header>
   <div class="result-grid">${cards}</div>
@@ -1305,22 +1375,21 @@ async function runPage(res: ServerResponse, id: string) {
       resultsHtml = `
 <section class="card" id="results-summary">
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-    <h2 style="margin:0">Publish — verify new images before applying</h2>
+    <h2 style="margin:0">Publish — verify and push to S3</h2>
     <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
   </div>
-  <div class="sub" style="margin-top:6px">Click any image to enlarge. Use the per-card buttons to approve, reject, or regenerate that specific image — or use the cluster-level buttons in each section header. The sticky bar at the bottom applies every approved image at once.</div>
+  <div class="sub" style="margin-top:6px">Click any image to enlarge. <strong>Regenerate</strong> swaps the image in-place (so you can keep clicking until you like the result). <strong>Apply to S3</strong> downloads the new image and PUTs it to <code>gw-content-store</code> at the canonical key the rendering pipeline reads from. Cover / thumbnail rows are disabled for now (synthetic IDs need cover/thumbnail wiring next iteration).</div>
 </section>
 
 ${clusterSections}
 
-<!-- Sticky publish action bar -->
+<!-- Sticky bottom action bar -->
 <div class="action-bar">
   <div class="stats">
-    <strong id="approved-count">0</strong> approved · <strong id="rejected-count">0</strong> rejected · <strong id="applied-count">0</strong> applied
+    <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending
   </div>
   <div class="right">
-    <span class="phase2-note">Phase 2: <code>aws s3 cp</code> wires up next; clicking Apply downloads a manifest for now.</span>
-    <button class="primary" id="apply-approved-btn" onclick="applyApproved()" disabled>Apply approved (0) →</button>
+    <button class="primary" id="apply-all-btn" onclick="applyAll()">Apply all pending →</button>
   </div>
 </div>
 `;
@@ -1367,23 +1436,15 @@ const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
 const RUN_ID = window.location.pathname.split('/').pop();
 
-// Per-image state machine. Mutually exclusive: a single image is at
-// most one of {pending, approved, rejected, applied}. Switching from
-// approved → rejected just flips the state; applied is terminal until
-// the page reloads.
-const stateOf = new Map(); // image_id → 'pending' | 'approved' | 'rejected' | 'applied'
+// Per-image state machine. Two user actions: Apply (push to S3) and
+// Regenerate (re-roll the image). State is purely about Apply progress:
+//   pending  → not yet applied
+//   applying → in flight (network + S3 PUT)
+//   applied  → terminal success
+//   failed   → terminal failure (operator can Regenerate to try again)
+const stateOf = new Map(); // image_id → 'pending' | 'applying' | 'applied' | 'failed'
 
-function setState(imageId, newState) {
-  // Toggle off if you click the same state twice (e.g. click Approve
-  // again to un-approve, leaving the card in pending).
-  const cur = stateOf.get(imageId) ?? 'pending';
-  if (cur === 'applied') return; // can't un-apply once marked
-  if (cur === newState) stateOf.set(imageId, 'pending');
-  else stateOf.set(imageId, newState);
-  paintCard(imageId);
-  refreshTotals();
-}
-function paintCard(imageId) {
+function paintCard(imageId, opts) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
   const s = stateOf.get(imageId) ?? 'pending';
@@ -1393,39 +1454,72 @@ function paintCard(imageId) {
     pill.textContent = s === 'pending' ? '' : s;
     pill.className = 'state-pill state-' + s;
   }
+  const applyBtn = card.querySelector('.btn-apply');
+  if (applyBtn) {
+    if (s === 'applied') { applyBtn.textContent = 'Applied ✓'; applyBtn.disabled = true; }
+    else if (s === 'applying') { applyBtn.textContent = 'Applying…'; applyBtn.disabled = true; }
+    else if (s === 'failed') { applyBtn.textContent = 'Retry apply'; applyBtn.disabled = false; }
+    else { applyBtn.textContent = 'Apply to S3'; applyBtn.disabled = card.dataset.synthetic === '1'; }
+  }
+  const errLine = card.querySelector('.rc-status-line');
+  if (errLine) {
+    errLine.textContent = (s === 'failed' && opts && opts.error) ? opts.error : '';
+    errLine.style.display = (s === 'failed' && opts && opts.error) ? 'block' : 'none';
+  }
 }
-function approveCluster(clusterId, target) {
+
+async function applyOne(imageId) {
+  const cur = stateOf.get(imageId) ?? 'pending';
+  if (cur === 'applied' || cur === 'applying') return;
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  if (card.dataset.synthetic === '1') {
+    paintCard(imageId, { error: 'Apply not yet supported for cover/thumbnail synthetic IDs.' });
+    stateOf.set(imageId, 'failed');
+    paintCard(imageId, { error: 'Apply not yet supported for cover/thumbnail synthetic IDs.' });
+    refreshTotals();
+    return;
+  }
+  stateOf.set(imageId, 'applying'); paintCard(imageId);
+  try {
+    const r = await fetch('/api/apply-one', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_id: card.dataset.clusterId })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    stateOf.set(imageId, 'applied'); paintCard(imageId);
+  } catch (err) {
+    stateOf.set(imageId, 'failed');
+    paintCard(imageId, { error: 'apply failed: ' + err.message });
+  }
+  refreshTotals();
+}
+
+async function applyCluster(clusterId) {
   const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
-    if (stateOf.get(id) === 'applied') continue;
-    if (target === 'pending') stateOf.set(id, 'pending');
-    else stateOf.set(id, target); // 'approved'
-    paintCard(id);
+    const s = stateOf.get(id) ?? 'pending';
+    if (s === 'applied' || s === 'applying') continue;
+    if (card.dataset.synthetic === '1') continue;
+    await applyOne(id); // sequential to avoid hammering S3
   }
-  refreshTotals();
 }
-function applyOne(imageId) {
-  if (stateOf.get(imageId) === 'applied') return;
-  stateOf.set(imageId, 'applied');
-  paintCard(imageId);
-  refreshTotals();
-  // (Phase 2) — actual S3 PutObject would fire here.
+
+async function applyAll() {
+  const allCards = document.querySelectorAll('.result-card[data-image-id]');
+  for (const card of allCards) {
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    const s = stateOf.get(id) ?? 'pending';
+    if (s === 'applied' || s === 'applying') continue;
+    if (card.dataset.synthetic === '1') continue;
+    await applyOne(id);
+  }
 }
-function applyApproved() {
-  const ids = [...stateOf.entries()].filter(([, s]) => s === 'approved').map(([id]) => id);
-  if (ids.length === 0) return;
-  for (const id of ids) { stateOf.set(id, 'applied'); paintCard(id); }
-  // Download a manifest the forthcoming S3-push script consumes.
-  const payload = { run_id: RUN_ID, apply: ids, count: ids.length, generated_at: new Date().toISOString() };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'apply-manifest-' + RUN_ID + '.json'; a.click();
-  URL.revokeObjectURL(url);
-  refreshTotals();
-}
+
 async function regenOne(imageId) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
@@ -1440,30 +1534,36 @@ async function regenOne(imageId) {
     const j = await r.json();
     const img = card.querySelector('.rc-img img');
     if (img && j.image_url_new) img.src = j.image_url_new;
-    // A regenerated image goes back to pending so the operator
-    // re-reviews it before approving / applying.
+    // A regenerated image returns to pending so the operator decides
+    // whether to Apply this one.
     stateOf.set(imageId, 'pending');
     paintCard(imageId);
   } catch (err) {
-    alert('regenerate failed: ' + err.message);
+    stateOf.set(imageId, 'failed');
+    paintCard(imageId, { error: 'regenerate failed: ' + err.message });
   } finally {
-    if (btn) { btn.textContent = '↻'; btn.disabled = false; }
+    if (btn) { btn.textContent = '↻ Regenerate'; btn.disabled = false; }
   }
   refreshTotals();
 }
+
 function refreshTotals() {
-  let approved = 0, rejected = 0, applied = 0;
-  for (const s of stateOf.values()) {
-    if (s === 'approved') approved++;
-    else if (s === 'rejected') rejected++;
-    else if (s === 'applied') applied++;
+  const allCards = document.querySelectorAll('.result-card[data-image-id]');
+  let pending = 0, applied = 0, failed = 0;
+  for (const card of allCards) {
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    const s = stateOf.get(id) ?? 'pending';
+    if (s === 'applied') applied++;
+    else if (s === 'failed') failed++;
+    else pending++;
   }
-  document.getElementById('approved-count').textContent = approved;
-  document.getElementById('rejected-count').textContent = rejected;
-  document.getElementById('applied-count').textContent = applied;
-  const btn = document.getElementById('apply-approved-btn');
-  btn.disabled = approved === 0;
-  btn.textContent = 'Apply approved (' + approved + ') →';
+  const setText = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
+  setText('applied-count', applied);
+  setText('failed-count', failed);
+  setText('pending-count', pending);
+  const btn = document.getElementById('apply-all-btn');
+  if (btn) btn.disabled = pending === 0;
 }
 
 // Lightbox (full-screen image viewer)
@@ -1482,7 +1582,7 @@ function lbClose() {
 function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') lbClose(); });
 
-if (document.getElementById('approved-count')) refreshTotals();
+if (document.getElementById('apply-all-btn')) refreshTotals();
 
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
@@ -1492,7 +1592,7 @@ es.onmessage = (ev) => {
 es.addEventListener('end', (ev) => {
   const { code } = JSON.parse(ev.data);
   statusEl.innerHTML = code === 0 ? '<div class="banner ok">finished, exit 0 — reloading to render the publish view…</div>' : '<div class="banner err">exited with code ' + code + '</div>';
-  // The publish view (Approve/Reject/Regenerate per card) is rendered
+  // The publish view (per-card Apply + Regenerate) is rendered
   // server-side from the freshly-written CSV. Reload once the run
   // finishes so it appears inline without an extra click.
   if (code === 0) setTimeout(() => window.location.reload(), 800);
@@ -1568,6 +1668,7 @@ export function startWebServer(port: number): void {
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
+      if (method === "POST" && p === "/api/apply-one") return await applyOneHandler(req, res);
       if (method === "GET" && p === "/runs") return runListPage(res);
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {

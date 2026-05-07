@@ -1,4 +1,5 @@
-import { S3Client, GetObjectCommand, NoSuchKey } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, NoSuchKey, PutObjectCommand } from "@aws-sdk/client-s3";
+import axios from "axios";
 import { loadEnv } from "./env.js";
 
 let _client: S3Client | null = null;
@@ -58,4 +59,59 @@ export async function fetchBlogPlaceholders(
     }
     throw err;
   }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Apply step — push a rendered image to S3 at the canonical key the
+// stormbreaker rendering pipeline reads from. Same bytes are written to
+// 1080.webp / 720.webp / 360.webp for v1 (a proper resize step is a
+// follow-up — the renderer typically resizes itself, but pre-populating
+// all three slots keeps the existing layout consistent).
+// ────────────────────────────────────────────────────────────────────────
+
+const APPLY_SIZES = ["1080", "720", "360"] as const;
+
+export interface ApplyResult {
+  bucket: string;
+  keys: string[];
+  bytes: number;
+}
+
+export async function uploadBlogImage(args: {
+  stagingSubdomain: string;
+  clusterId: string;
+  imageId: string;
+  imageUrl: string;
+}): Promise<ApplyResult> {
+  const env = loadEnv();
+  const bucket = env.S3_CONTENT_BUCKET;
+
+  // Download once
+  const resp = await axios.get<ArrayBuffer>(args.imageUrl, {
+    responseType: "arraybuffer",
+    timeout: 60_000,
+    validateStatus: () => true,
+  });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(`download ${args.imageUrl} → HTTP ${resp.status}`);
+  }
+  const body = Buffer.from(resp.data);
+  const contentType =
+    typeof resp.headers["content-type"] === "string" ? (resp.headers["content-type"] as string) : "image/webp";
+
+  // Upload to each canonical size slot.
+  const keys: string[] = [];
+  for (const size of APPLY_SIZES) {
+    const key = `website/${args.stagingSubdomain}/assets/blog-images/${args.clusterId}/${args.imageId}/${size}.webp`;
+    await client().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      }),
+    );
+    keys.push(key);
+  }
+  return { bucket, keys, bytes: body.length };
 }

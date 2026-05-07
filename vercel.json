@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "echo 'static landing page only — see README'",
+  "outputDirectory": "public",
+  "framework": null,
+  "trailingSlash": false
+}
