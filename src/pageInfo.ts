@@ -33,6 +33,14 @@ export interface ImageRecord {
   description: string;
   aspectRatio: string;
   source: ImageSource;
+  /**
+   * URL of the *existing* image, when we can derive it cheaply.
+   * Cover/thumbnail rows fill this from `page_info.thumbnail`. Inline
+   * Shape-A rows leave it undefined — the markdown's placeholder ID
+   * doesn't map 1:1 to S3 hashes (verified empirically), so we'd just
+   * be 404'ing in the UI. v2 can plumb the real mapping in.
+   */
+  previewUrl?: string;
 }
 
 const DEFAULT_ASPECT: Record<AssetType, string> = {
@@ -175,40 +183,52 @@ function shapeBToRecords(cluster: ClusterRow, hits: ShapeBHit[]): ImageRecord[] 
 // preference if page_info exposes one.
 // ────────────────────────────────────────────────────────────────────────
 
+function thumbnailUrlOf(pi: ClusterPageInfo): string | undefined {
+  const t = pi.thumbnail;
+  if (typeof t === "string" && t.length > 0) return t;
+  if (t && typeof t === "object") {
+    const inner = (t as { url?: unknown }).url;
+    if (typeof inner === "string" && inner.length > 0) return inner;
+  }
+  return undefined;
+}
+
 function coverRecord(cluster: ClusterRow): ImageRecord {
   const pi = cluster.page_info ?? {};
   const description = descriptionFor(cluster);
   const aspect = DEFAULT_ASPECT.cover;
+  const previewUrl = thumbnailUrlOf(pi);
 
   if (typeof pi.cover_image_id === "string" && (pi.cover_image_id as string).length > 0) {
-    return { cluster, asset: "cover", imageId: pi.cover_image_id as string, description, aspectRatio: aspect, source: "page_info.cover_image_id" };
+    return { cluster, asset: "cover", imageId: pi.cover_image_id as string, description, aspectRatio: aspect, source: "page_info.cover_image_id", previewUrl };
   }
   const coverObj = pi.cover;
   if (coverObj && typeof coverObj === "object") {
     const inner = (coverObj as { image_id?: unknown }).image_id;
     if (typeof inner === "string" && inner.length > 0) {
-      return { cluster, asset: "cover", imageId: inner, description, aspectRatio: aspect, source: "page_info.cover.image_id" };
+      return { cluster, asset: "cover", imageId: inner, description, aspectRatio: aspect, source: "page_info.cover.image_id", previewUrl };
     }
   }
-  return { cluster, asset: "cover", imageId: `cover-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-cover" };
+  return { cluster, asset: "cover", imageId: `cover-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-cover", previewUrl };
 }
 
 function thumbnailRecord(cluster: ClusterRow): ImageRecord {
   const pi = cluster.page_info ?? {};
   const description = descriptionFor(cluster);
   const aspect = DEFAULT_ASPECT.thumbnail;
+  const previewUrl = thumbnailUrlOf(pi);
 
   if (typeof pi.thumbnail_image_id === "string" && (pi.thumbnail_image_id as string).length > 0) {
-    return { cluster, asset: "thumbnail", imageId: pi.thumbnail_image_id as string, description, aspectRatio: aspect, source: "page_info.thumbnail_image_id" };
+    return { cluster, asset: "thumbnail", imageId: pi.thumbnail_image_id as string, description, aspectRatio: aspect, source: "page_info.thumbnail_image_id", previewUrl };
   }
   const t = pi.thumbnail;
   if (t && typeof t === "object") {
     const inner = (t as { image_id?: unknown }).image_id;
     if (typeof inner === "string" && inner.length > 0) {
-      return { cluster, asset: "thumbnail", imageId: inner, description, aspectRatio: aspect, source: "page_info.thumbnail.image_id" };
+      return { cluster, asset: "thumbnail", imageId: inner, description, aspectRatio: aspect, source: "page_info.thumbnail.image_id", previewUrl };
     }
   }
-  return { cluster, asset: "thumbnail", imageId: `thumbnail-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-thumbnail" };
+  return { cluster, asset: "thumbnail", imageId: `thumbnail-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-thumbnail", previewUrl };
 }
 
 // ────────────────────────────────────────────────────────────────────────

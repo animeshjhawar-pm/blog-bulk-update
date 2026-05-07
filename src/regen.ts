@@ -8,6 +8,7 @@ import {
   type ProjectRow,
 } from "./db.js";
 import { resolveGraphicToken, type TokenSource } from "./extractToken.js";
+import { loadBrandGuidelines } from "./tokens.js";
 import { buildImagePrompt } from "./buildPrompt.js";
 import { generate, type Provider } from "./generate.js";
 import { downloadImage } from "./rehost.js";
@@ -87,17 +88,27 @@ interface RowResult {
   status: "completed" | "failed" | "dry-run";
 }
 
+function mergeBusinessContext(raw: unknown, brandGuidelines: string | null): unknown {
+  if (!brandGuidelines) return raw;
+  const base =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : { source: raw };
+  return { ...base, client_brand_guidelines: brandGuidelines };
+}
+
 async function processOne(args: {
   record: ImageRecord;
   project: ProjectRow;
   graphicToken: unknown;
+  brandGuidelines: string | null;
   logoUrl: string | null;
   options: RegenOptions;
   rowNum: number;
   totalRows: number;
   slug: string;
 }): Promise<RowResult> {
-  const { record, project, graphicToken, logoUrl, options, rowNum, totalRows, slug } = args;
+  const { record, project, graphicToken, brandGuidelines, logoUrl, options, rowNum, totalRows, slug } = args;
   const generatedAt = new Date().toISOString();
   const base = buildBaseRow({ record, project, slug, generatedAt });
 
@@ -106,7 +117,7 @@ async function processOne(args: {
     const built = await buildImagePrompt({
       asset: record.asset,
       imageDescription: record.description,
-      businessContext: project.additional_info,
+      businessContext: mergeBusinessContext(project.additional_info, brandGuidelines),
       companyInfo: project.company_info,
       graphicToken,
       clientHomepageUrl: project.url ?? "",
@@ -202,6 +213,13 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   }
   process.stderr.write(`regen: client='${project.name ?? slug}' project_id=${project.id}\n`);
 
+  const brandGuidelines = await loadBrandGuidelines(slug);
+  if (brandGuidelines) {
+    process.stderr.write(
+      `regen: brand_guidelines=loaded (${brandGuidelines.length} chars; injected into business_context.client_brand_guidelines for every prompt)\n`,
+    );
+  }
+
   let graphicToken: unknown;
   let tokenSource: TokenSource;
   try {
@@ -281,6 +299,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
         record,
         project,
         graphicToken,
+        brandGuidelines,
         logoUrl,
         options,
         rowNum: i + 1,
