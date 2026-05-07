@@ -32,6 +32,14 @@ export interface RegenOptions {
   imageIds?: Set<string>;
   provider?: Provider;
   concurrency: number;
+  /**
+   * Mock mode: skip Firecrawl + Portkey + image generation entirely.
+   * Each row gets a synthetic prompt and a picsum.photos URL keyed by
+   * image_id so the run page populates in <5s with realistic-looking
+   * images for the publish-flow UX. Used to validate the platform
+   * without spending API budget.
+   */
+  mock?: boolean;
 }
 
 function pickLogoUrl(project: ProjectRow): string | null {
@@ -99,6 +107,20 @@ function mergeBusinessContext(raw: unknown, brandGuidelines: string | null): unk
   return { ...base, client_brand_guidelines: brandGuidelines };
 }
 
+/**
+ * Build a deterministic picsum.photos URL keyed by image_id so the same
+ * record always renders the same fake new image. Aspect ratio is read
+ * from the record so cover (1:1) renders square and infographic (16:9)
+ * renders widescreen.
+ */
+function mockImageUrl(record: ImageRecord): string {
+  const [w = 16, h = 9] = (record.aspectRatio.split(":").map(Number) as [number, number?]);
+  const W = 800;
+  const H = Math.max(1, Math.round((W * (h ?? 9)) / (w || 16)));
+  const seed = record.imageId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 40) || "regen";
+  return `https://picsum.photos/seed/${seed}/${W}/${H}`;
+}
+
 async function processOne(args: {
   record: ImageRecord;
   project: ProjectRow;
@@ -113,6 +135,26 @@ async function processOne(args: {
   const { record, project, graphicToken, brandGuidelines, logoUrl, options, rowNum, totalRows, slug } = args;
   const generatedAt = new Date().toISOString();
   const base = buildBaseRow({ record, project, slug, generatedAt });
+
+  // Mock mode: skip every external call. Used to validate the publish
+  // flow UX without burning Portkey / Replicate budget.
+  if (options.mock) {
+    const mockUrl = mockImageUrl(record);
+    process.stderr.write(
+      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=mock url=${mockUrl}\n`,
+    );
+    return {
+      status: "completed",
+      row: {
+        ...base,
+        prompt_used: `[mock] synthetic ${record.asset} prompt for ${record.imageId}\n\nDescription: ${record.description.slice(0, 200)}`,
+        image_url_new: mockUrl,
+        image_local_path: "",
+        status: "completed",
+        error: "",
+      },
+    };
+  }
 
   let promptUsed = "";
   try {
@@ -222,21 +264,27 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     );
   }
 
-  let graphicToken: unknown;
-  let tokenSource: TokenSource;
-  try {
-    const resolved = await resolveGraphicToken({
-      slug,
-      url: project.url ?? "",
-      projectId: project.id,
-      useSavedToken: options.useSavedToken,
-    });
-    graphicToken = resolved.token;
-    tokenSource = resolved.source;
-  } catch (err) {
-    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
-    await closePool();
-    process.exit(3);
+  let graphicToken: unknown = null;
+  let tokenSource: TokenSource = "live";
+  if (options.mock) {
+    process.stderr.write(`regen: mock mode — skipping graphic_token resolution\n`);
+    graphicToken = { mock: true };
+    tokenSource = "live";
+  } else {
+    try {
+      const resolved = await resolveGraphicToken({
+        slug,
+        url: project.url ?? "",
+        projectId: project.id,
+        useSavedToken: options.useSavedToken,
+      });
+      graphicToken = resolved.token;
+      tokenSource = resolved.source;
+    } catch (err) {
+      process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+      await closePool();
+      process.exit(3);
+    }
   }
 
   const clusters = await listPublishedBlogClusters(project.id);

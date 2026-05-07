@@ -123,6 +123,7 @@ program
   )
   .option("--cluster-ids <list>", "comma-separated cluster UUIDs to restrict to")
   .option("--image-ids <list>", "comma-separated image_id values to restrict to (per-image scoping; the web UI uses this)")
+  .option("--mock", "skip Portkey + image generation; emit synthetic prompts and picsum.photos URLs (UX validation, no API spend)", false)
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
   )
@@ -135,6 +136,7 @@ program
       assetTypes?: string;
       clusterIds?: string;
       imageIds?: string;
+      mock?: boolean;
       provider?: Provider;
       concurrency: string;
     }) => {
@@ -152,6 +154,7 @@ program
           assetTypes,
           clusterIds,
           imageIds,
+          mock: Boolean(opts.mock),
           provider: opts.provider,
           concurrency,
         });

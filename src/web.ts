@@ -278,6 +278,15 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card.applied { border-color: var(--ok); }
   .result-card.applied .rc-actions button.primary { background: var(--ok); border-color: var(--ok); }
 
+  /* Publish drawer cards (run page) — variant of .img-card with an
+     approve toggle in place of the multi-select checkbox. */
+  .img-card.publish-card { grid-template-columns: 110px 140px 1fr; gap: 14px; }
+  .img-card.publish-card.approved { border-color: var(--ok); background: #f0fdf4; }
+  .img-card.publish-card.applied { border-color: var(--ok); background: #d1fae5; opacity: .85; }
+  .img-card.publish-card .approve-cell { display: flex; align-items: center; justify-content: center; }
+  .img-card.publish-card .approve-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; font-size: 12px; color: var(--ink); white-space: nowrap; }
+  .img-card.publish-card .publish-pre { width: 140px; height: 90px; }
+
   /* Combobox */
   .combobox { position: relative; }
   .combobox input { padding-right: 36px; }
@@ -724,15 +733,19 @@ async function workspacePage(res: ServerResponse, slug: string) {
   <div class="caption" id="lightbox-cap"></div>
 </div>
 
-<!-- Sticky bottom action bar (simplified — provider + dry-run + saved-token live in CLI) -->
+<!-- Sticky bottom action bar.
+     Live "Generate selected" is intentionally hidden during platform
+     verification; the only available action is the Dry run, which
+     mocks the full pipeline (no Portkey / Replicate spend) and
+     produces dummy outputs so the publish flow can be validated. -->
 <div class="action-bar">
   <div class="stats">
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
     <span id="bar-test-mode" style="display:none;color:var(--brand);margin-left:10px;font-size:12px">· test-run mode active (3 clusters)</span>
+    <span style="color:var(--ink-faint);margin-left:10px;font-size:12px">· live generation disabled while platform is in verification</span>
   </div>
   <div class="right">
-    <button class="" id="bar-dry-run-btn" onclick="runRegen(true)" disabled title="Build prompts only — no image generation">Dry run</button>
-    <button class="primary" id="bar-run-btn" onclick="runRegen(false)" disabled>Generate selected →</button>
+    <button class="primary" id="bar-dry-run-btn" onclick="runRegen(true)" disabled title="Mock the whole pipeline: skips Portkey + Replicate, emits synthetic prompts and picsum.photos URLs so the publish flow can be reviewed in seconds.">Dry run →</button>
   </div>
 </div>
 `;
@@ -808,7 +821,6 @@ function refreshTotals() {
   }
   document.getElementById('bar-img-count').textContent = imgs;
   document.getElementById('bar-cluster-count').textContent = cls;
-  document.getElementById('bar-run-btn').disabled = imgs === 0;
   document.getElementById('bar-dry-run-btn').disabled = imgs === 0;
   for (const tr of allRows()) {
     const cid = tr.dataset.clusterId;
@@ -960,11 +972,10 @@ async function saveBrand(e) {
   }
 }
 
-// ── Run regen — sends every selected image_id (and the cluster_ids
-// they belong to). The server forwards both to the CLI's --image-ids
-// + --cluster-ids flags so the regen pipeline runs on exactly the
-// images that were ticked, not the rest of the cluster.
-async function runRegen(dryRun) {
+// Dry-run today is a full mock: skips Portkey + Replicate, emits
+// synthetic prompts + picsum.photos URLs. Live generation is wired in
+// the CLI but disabled in the UI until the platform is verified.
+async function runRegen(_unused) {
   const items = [];
   for (const [cid, set] of selection.entries()) {
     if (set.size === 0) continue;
@@ -978,7 +989,7 @@ async function runRegen(dryRun) {
     fd.append('cluster_id', it.cluster_id);
     for (const id of it.image_ids) fd.append('image_id', id);
   }
-  if (dryRun) fd.set('dry_run', 'on');
+  fd.set('mock', 'on');
   fd.set('provider', 'replicate');
   const r = await fetch('/regen', { method: 'POST', body: fd });
   if (r.redirected) { window.location.href = r.url; return; }
@@ -1053,12 +1064,14 @@ function startRegen(opts: {
   clusterIds: string[];
   imageIds: string[];
   dryRun: boolean;
+  mock: boolean;
   useSavedToken: boolean;
   assetTypes?: string;
   provider?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
   const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client];
+  if (opts.mock) args.push("--mock");
   if (opts.dryRun) args.push("--dry-run");
   if (opts.useSavedToken) args.push("--use-saved-token");
   if (opts.clusterIds.length) args.push("--cluster-ids", opts.clusterIds.join(","));
@@ -1115,6 +1128,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     clusterIds,
     imageIds,
     dryRun: body.get("dry_run") === "on",
+    mock: body.get("mock") === "on",
     useSavedToken: body.get("use_saved_token") === "on",
     assetTypes: body.get("asset_types") || undefined,
     provider: body.get("provider") || undefined,
@@ -1189,8 +1203,13 @@ async function runPage(res: ServerResponse, id: string) {
   const initial = esc(state.log.join(""));
   const cmd = esc(`npx ${state.args.join(" ")}`);
 
-  // If the run is done and a CSV exists, build the after-image gallery.
+  // If the run is done and a CSV exists, build the publish view —
+  // workspace-mirrored: one cluster card per affected cluster, with
+  // a click-anywhere row that opens a drawer of new-image cards
+  // (Approve toggle + per-image Apply). Bulk "Apply approved" lives
+  // in the sticky publish action bar at the bottom of the page.
   let resultsHtml = "";
+  let resultsPayload = "[]";
   if (state.done && state.csvPath) {
     const rows = await readRunCsv(state.csvPath);
     if (rows.length > 0) {
@@ -1201,58 +1220,93 @@ async function runPage(res: ServerResponse, id: string) {
         grouped.set(r.cluster_id, g);
       }
       const totalCompleted = rows.filter((r) => r.status === "completed").length;
+      const totalFailed = rows.filter((r) => r.status === "failed").length;
 
-      const groups = [...grouped.entries()].map(([clusterId, g]) => {
-        const cards = g.rows
-          .map((r) => {
-            const newImg = r.image_url_new
-              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(`${r.asset_type} · ${r.image_id}`))})">`
-              : `<div class="ph">${esc(r.status)}</div>`;
-            const errCell = r.error
-              ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
-              : "";
-            return `
-<div class="result-card" data-image-id="${esc(r.image_id)}">
-  <div class="rc-img">${newImg}</div>
-  <div class="rc-body">
-    <div class="rc-row"><span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span><span class="pill ${r.status === "completed" ? "internal" : r.status === "failed" ? "external" : "generic"}">${esc(r.status)}</span></div>
-    <div class="rc-id"><code>${esc(r.image_id)}</code></div>
-    <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
-    ${errCell}
-    <div class="rc-actions">
-      <button class="primary" onclick="applyOne(this, '${esc(r.image_id)}', '${esc(r.image_local_path)}')">Apply to S3</button>
-    </div>
-  </div>
-</div>`;
-          })
-          .join("");
+      // Server-side per-cluster summaries — the drawer is rendered
+      // client-side from the same payload.
+      const clusterCards = [...grouped.entries()].map(([clusterId, g]) => {
+        const counts: Record<string, number> = {};
+        for (const r of g.rows) counts[r.asset_type] = (counts[r.asset_type] ?? 0) + 1;
+        const pills = Object.entries(counts).map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`).join(" ");
+        const firstNew = g.rows.find((r) => r.image_url_new)?.image_url_new ?? "";
+        const cover = firstNew ? `<img src="${esc(firstNew)}" alt="" loading="lazy">` : `<div class="placeholder"></div>`;
         return `
-<section class="card">
-  <div class="rc-cluster-head">
-    <div>
-      <div style="font-weight:600;font-size:14px">${esc(g.topic || "(no topic)")}</div>
-      <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} images</div>
-    </div>
-  </div>
-  <div class="result-grid">${cards}</div>
-</section>`;
+<tr class="cluster-row" data-cluster-id="${esc(clusterId)}" onclick="rowClick(event, '${esc(clusterId)}')">
+  <td class="topic">
+    <div class="t">${esc(g.topic || "(no topic)")}</div>
+    <div class="cid"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
+  </td>
+  <td class="preview">${cover}</td>
+  <td class="types"><div class="pills-wrap">${pills}</div></td>
+  <td class="approve-status" data-cluster-id="${esc(clusterId)}" style="text-align:right;font-size:11px;color:var(--ink-faint)">click to review ↗</td>
+</tr>`;
       }).join("");
+
+      // Compact JSON the drawer reads to render image cards on demand.
+      const clusterPayload = [...grouped.entries()].map(([clusterId, g]) => ({
+        id: clusterId,
+        topic: g.topic,
+        rows: g.rows.map((r) => ({
+          image_id: r.image_id,
+          asset_type: r.asset_type,
+          aspect_ratio: r.aspect_ratio,
+          image_url_new: r.image_url_new,
+          description_used: r.description_used,
+          status: r.status,
+          error: r.error,
+        })),
+      }));
+      resultsPayload = JSON.stringify(clusterPayload);
 
       resultsHtml = `
 <section class="card" id="results-summary">
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <h2 style="margin:0">Results</h2>
-    <span class="sub">${rows.length} total · <strong style="color:var(--ok)">${totalCompleted} completed</strong></span>
-    <div style="margin-left:auto;display:flex;gap:8px">
-      <button onclick="applyAll()">Apply all to S3</button>
-    </div>
+    <h2 style="margin:0">Publish — verify new images before applying</h2>
+    <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
   </div>
-  <div class="banner warn" style="margin-top:10px">
-    <strong>Phase 2 — apply-to-S3 is not yet wired.</strong>
-    The button above logs intent + downloads a JSON manifest. Actual S3 PutObject lands in the next iteration.
-  </div>
+  <div class="sub" style="margin-top:6px">Click a row to open a drawer with the new images for that cluster. Toggle <strong>Approve</strong> on each one you're happy with; use <strong>Apply approved</strong> at the bottom to push them to S3 (Phase 2 — currently downloads a manifest).</div>
 </section>
-${groups}
+
+<section class="card" style="padding:0">
+  <table class="cluster-list">
+    <thead>
+      <tr>
+        <th>Topic / cluster_id</th>
+        <th style="width:84px">first new</th>
+        <th>asset breakdown</th>
+        <th style="width:160px;text-align:right">approval</th>
+      </tr>
+    </thead>
+    <tbody id="result-tbody">${clusterCards}</tbody>
+  </table>
+</section>
+
+<!-- Publish drawer -->
+<div class="drawer-overlay" id="publish-overlay" onclick="closePublishDrawer()"></div>
+<aside class="drawer" id="publish-drawer" aria-hidden="true">
+  <header>
+    <h3 id="publish-drawer-title">Cluster</h3>
+    <button class="ghost" onclick="closePublishDrawer()">×</button>
+  </header>
+  <div class="body" id="publish-drawer-body"></div>
+  <footer>
+    <div class="meta" id="publish-drawer-meta">— approved</div>
+    <button onclick="approveAllInDrawer(true)">Approve all</button>
+    <button onclick="approveAllInDrawer(false)">Clear</button>
+    <button class="primary" onclick="closePublishDrawer()">Done</button>
+  </footer>
+</aside>
+
+<!-- Sticky publish action bar -->
+<div class="action-bar">
+  <div class="stats">
+    <strong id="approved-count">0</strong> approved · <strong id="applied-count">0</strong> applied
+  </div>
+  <div class="right">
+    <span class="banner warn" style="margin:0;padding:6px 10px;font-size:12px">Phase 2: apply-to-S3 downloads a manifest; the actual <code>aws s3 cp</code> wires up next.</span>
+    <button class="primary" id="apply-approved-btn" onclick="applyApproved()" disabled>Apply approved →</button>
+  </div>
+</div>
 `;
     }
   }
@@ -1297,6 +1351,130 @@ const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
 
+// ── Publish drawer + lightbox ──
+const RUN_ID = window.location.pathname.split('/').pop();
+const PUBLISH_CLUSTERS = ${resultsPayload};
+const approved = new Set(); // image_id values
+const applied = new Set();  // image_id values
+
+let openClusterId = null;
+
+function rowClick(ev, cid) {
+  const t = ev.target;
+  if (t.closest('input,button,a,code')) return;
+  openPublishDrawer(cid);
+}
+function clusterById(id) { return PUBLISH_CLUSTERS.find(c => c.id === id); }
+
+function openPublishDrawer(cid) {
+  const c = clusterById(cid);
+  if (!c) return;
+  openClusterId = cid;
+  document.getElementById('publish-drawer-title').textContent = c.topic || '(no topic)';
+  const cards = c.rows.map((r) => {
+    const isApproved = approved.has(r.image_id);
+    const isApplied = applied.has(r.image_id);
+    const previewHtml = r.image_url_new
+      ? '<img src="' + r.image_url_new + '" alt="" loading="lazy" onclick="lbOpen(event, this.src, ' + JSON.stringify(r.asset_type + ' · ' + r.image_id) + ')">'
+      : '<div class="ph">' + (r.status || 'pending') + '</div>';
+    const errCell = r.error ? '<div class="err-line">' + r.error.slice(0, 240) + '</div>' : '';
+    return '<div class="img-card publish-card' + (isApproved ? ' approved' : '') + (isApplied ? ' applied' : '') + '" data-image-id="' + r.image_id + '">' +
+      '<div class="approve-cell">' +
+        '<label class="approve-toggle"><input type="checkbox" ' + (isApproved ? 'checked' : '') + ' ' + (isApplied ? 'disabled' : '') + ' onchange="onApprove(\\'' + r.image_id + '\\', this.checked)"> Approve</label>' +
+      '</div>' +
+      '<div class="pre publish-pre">' + previewHtml + '</div>' +
+      '<div>' +
+        '<div class="meta-row">' +
+          '<span class="pill ' + r.asset_type + '">' + r.asset_type + ' · ' + r.aspect_ratio + '</span>' +
+          (isApplied ? '<span class="pill internal">applied</span>' : '') +
+          '<code>' + r.image_id + '</code>' +
+        '</div>' +
+        '<div class="desc">' + (r.description_used || '<em style="color:var(--ink-faint)">(no description)</em>').slice(0, 320) + '</div>' +
+        errCell +
+        '<div class="rc-actions" style="margin-top:8px">' +
+          '<button onclick="applyOne(\\'' + r.image_id + '\\')" ' + (isApplied ? 'disabled' : '') + '>' + (isApplied ? 'Applied ✓' : 'Apply this to S3') + '</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+  document.getElementById('publish-drawer-body').innerHTML = cards;
+  refreshDrawerMeta();
+  document.getElementById('publish-drawer').classList.add('open');
+  document.getElementById('publish-overlay').classList.add('open');
+}
+function closePublishDrawer() {
+  document.getElementById('publish-drawer').classList.remove('open');
+  document.getElementById('publish-overlay').classList.remove('open');
+  openClusterId = null;
+}
+function onApprove(imageId, on) {
+  if (on) approved.add(imageId); else approved.delete(imageId);
+  // Reflect on the open card
+  const card = document.querySelector('[data-image-id="' + imageId + '"]');
+  if (card) card.classList.toggle('approved', on);
+  refreshAll();
+}
+function approveAllInDrawer(on) {
+  if (!openClusterId) return;
+  const c = clusterById(openClusterId);
+  if (!c) return;
+  for (const r of c.rows) {
+    if (applied.has(r.image_id)) continue;
+    if (on) approved.add(r.image_id); else approved.delete(r.image_id);
+  }
+  openPublishDrawer(openClusterId);
+  refreshAll();
+}
+function applyOne(imageId) {
+  if (applied.has(imageId)) return;
+  applied.add(imageId);
+  approved.delete(imageId);
+  if (openClusterId) openPublishDrawer(openClusterId);
+  refreshAll();
+}
+function applyApproved() {
+  const items = [...approved];
+  if (items.length === 0) return;
+  for (const id of items) { applied.add(id); approved.delete(id); }
+  // Download a manifest the (forthcoming) S3-push script will consume.
+  const payload = { run_id: RUN_ID, apply: items, count: items.length, generated_at: new Date().toISOString() };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'apply-manifest-' + RUN_ID + '.json'; a.click();
+  URL.revokeObjectURL(url);
+  if (openClusterId) openPublishDrawer(openClusterId);
+  refreshAll();
+}
+function refreshDrawerMeta() {
+  if (!openClusterId) return;
+  const c = clusterById(openClusterId);
+  if (!c) return;
+  const total = c.rows.length;
+  const appr = c.rows.filter((r) => approved.has(r.image_id)).length;
+  const appd = c.rows.filter((r) => applied.has(r.image_id)).length;
+  document.getElementById('publish-drawer-meta').textContent = appr + ' approved, ' + appd + ' applied (of ' + total + ')';
+}
+function refreshAll() {
+  document.getElementById('approved-count').textContent = approved.size;
+  document.getElementById('applied-count').textContent = applied.size;
+  document.getElementById('apply-approved-btn').disabled = approved.size === 0;
+  refreshDrawerMeta();
+  // Update the per-cluster approval status hint in the table.
+  for (const c of PUBLISH_CLUSTERS) {
+    const cell = document.querySelector('td.approve-status[data-cluster-id="' + c.id + '"]');
+    if (!cell) continue;
+    const total = c.rows.length;
+    const appr = c.rows.filter((r) => approved.has(r.image_id)).length;
+    const appd = c.rows.filter((r) => applied.has(r.image_id)).length;
+    if (appd === total) cell.innerHTML = '<span class="pill internal">all applied</span>';
+    else if (appr + appd === total) cell.innerHTML = '<span class="pill cover">' + (appr + appd) + '/' + total + ' approved</span>';
+    else if (appr + appd > 0) cell.innerHTML = '<span class="pill infographic">' + (appr + appd) + '/' + total + ' approved</span>';
+    else cell.innerHTML = '<span style="color:var(--ink-faint)">click to review ↗</span>';
+  }
+}
+
+// Lightbox (run page)
 function lbOpen(ev, src, caption) {
   if (ev) ev.stopPropagation();
   document.getElementById('rp-lb-img').src = src;
@@ -1308,33 +1486,14 @@ function lbClose() {
   document.getElementById('rp-lb-img').src = '';
 }
 function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') lbClose(); });
-
-// ── Apply-to-S3 stubs (Phase 2) ──
-const applied = new Set();
-function applyOne(btn, imageId, localPath) {
-  const card = btn.closest('.result-card');
-  if (applied.has(imageId)) return;
-  applied.add(imageId);
-  card.classList.add('applied');
-  btn.textContent = 'Marked for apply';
-  btn.disabled = true;
-}
-function applyAll() {
-  for (const card of document.querySelectorAll('.result-card')) {
-    const id = card.dataset.imageId;
-    const btn = card.querySelector('button.primary');
-    if (id && btn && !applied.has(id)) applyOne(btn, id, '');
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('rp-lightbox')?.classList.contains('open')) { lbClose(); return; }
+    if (document.getElementById('publish-drawer')?.classList.contains('open')) closePublishDrawer();
   }
-  // Download a JSON manifest the receiving operator can feed into the
-  // (forthcoming) push-to-S3 script.
-  const items = [...applied];
-  const blob = new Blob([JSON.stringify({ run_id: window.location.pathname.split('/').pop(), apply: items }, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'apply-manifest.json'; a.click();
-  URL.revokeObjectURL(url);
-}
+});
+
+if (PUBLISH_CLUSTERS.length > 0) refreshAll();
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
 es.onmessage = (ev) => {
