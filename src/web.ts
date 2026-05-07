@@ -275,17 +275,30 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .rc-desc { font-size: 12px; color: var(--ink-muted); margin-top: 6px; line-height: 1.45; }
   .result-card .err-line { background: var(--err-bg); color: var(--err); border-radius: 4px; padding: 4px 8px; margin-top: 6px; font-size: 11px; word-break: break-word; }
   .result-card .rc-actions { margin-top: 10px; display: flex; gap: 6px; }
-  .result-card.applied { border-color: var(--ok); }
-  .result-card.applied .rc-actions button.primary { background: var(--ok); border-color: var(--ok); }
+  /* Run page result cards — per-image state machine */
+  .result-card[data-state="approved"] { border-color: var(--ok); background: #f0fdf4; }
+  .result-card[data-state="rejected"] { border-color: #fda4af; background: #fef2f2; opacity: .75; }
+  .result-card[data-state="rejected"] .rc-img img { filter: grayscale(.7) opacity(.6); }
+  .result-card[data-state="applied"] { border-color: var(--ok); background: #d1fae5; }
+  .result-card[data-state="applied"] .rc-actions button.btn-apply { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .result-card .rc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .result-card .rc-actions button { font-size: 12px; padding: 5px 10px; }
+  .result-card .rc-actions .btn-approve[data-on], .result-card[data-state="approved"] .btn-approve { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+  .result-card[data-state="rejected"] .btn-reject { background: var(--err-bg); border-color: #fca5a5; color: var(--err); }
+  .result-card .btn-regen { width: 32px; padding: 5px; text-align: center; }
+  .result-card .state-pill { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; font-weight: 500; }
+  .result-card .state-pill.state-approved { background: var(--ok-bg); color: var(--ok); }
+  .result-card .state-pill.state-rejected { background: var(--err-bg); color: var(--err); }
+  .result-card .state-pill.state-applied { background: var(--ok); color: #fff; }
+  .result-card .state-pill.state-pending { display: none; }
 
-  /* Publish drawer cards (run page) — variant of .img-card with an
-     approve toggle in place of the multi-select checkbox. */
-  .img-card.publish-card { grid-template-columns: 110px 140px 1fr; gap: 14px; }
-  .img-card.publish-card.approved { border-color: var(--ok); background: #f0fdf4; }
-  .img-card.publish-card.applied { border-color: var(--ok); background: #d1fae5; opacity: .85; }
-  .img-card.publish-card .approve-cell { display: flex; align-items: center; justify-content: center; }
-  .img-card.publish-card .approve-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; font-size: 12px; color: var(--ink); white-space: nowrap; }
-  .img-card.publish-card .publish-pre { width: 140px; height: 90px; }
+  /* Cluster section header on run page */
+  .cluster-section .cs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .cluster-section .cs-actions { margin-left: auto; display: flex; gap: 6px; }
+
+  /* Phase-2 inline note */
+  .action-bar .phase2-note { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; padding: 4px 10px; border-radius: 6px; font-size: 11.5px; }
+  .action-bar .phase2-note code { font-size: 11px; background: rgba(255,255,255,.7); }
 
   /* Combobox */
   .combobox { position: relative; }
@@ -1007,6 +1020,26 @@ refreshTotals();
 // POST /workspace/:slug/brand — save brand guidelines
 // ────────────────────────────────────────────────────────────────────────
 
+async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let imageId = "", clusterId = "";
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { image_id?: string; cluster_id?: string };
+    imageId = body.image_id ?? "";
+    clusterId = body.cluster_id ?? "";
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON body" });
+  }
+  if (!imageId) return sendJson(res, 400, { error: "image_id required" });
+  // Mock: rotate the picsum seed so the operator sees a different
+  // image after Regenerate. The live wiring would kick off a single-
+  // image CLI subprocess and return its image_url_new from the CSV.
+  const seed = (imageId + "-" + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40);
+  const url = `https://picsum.photos/seed/${seed}/800/450`;
+  sendJson(res, 200, { image_url_new: url, mock: true, image_id: imageId, cluster_id: clusterId });
+}
+
 async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
   if (!findClient(slug)) return sendJson(res, 400, { error: "unknown client" });
   const chunks: Buffer[] = [];
@@ -1209,7 +1242,6 @@ async function runPage(res: ServerResponse, id: string) {
   // (Approve toggle + per-image Apply). Bulk "Apply approved" lives
   // in the sticky publish action bar at the bottom of the page.
   let resultsHtml = "";
-  let resultsPayload = "[]";
   if (state.done && state.csvPath) {
     const rows = await readRunCsv(state.csvPath);
     if (rows.length > 0) {
@@ -1222,89 +1254,73 @@ async function runPage(res: ServerResponse, id: string) {
       const totalCompleted = rows.filter((r) => r.status === "completed").length;
       const totalFailed = rows.filter((r) => r.status === "failed").length;
 
-      // Server-side per-cluster summaries — the drawer is rendered
-      // client-side from the same payload.
-      const clusterCards = [...grouped.entries()].map(([clusterId, g]) => {
-        const counts: Record<string, number> = {};
-        for (const r of g.rows) counts[r.asset_type] = (counts[r.asset_type] ?? 0) + 1;
-        const pills = Object.entries(counts).map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`).join(" ");
-        const firstNew = g.rows.find((r) => r.image_url_new)?.image_url_new ?? "";
-        const cover = firstNew ? `<img src="${esc(firstNew)}" alt="" loading="lazy">` : `<div class="placeholder"></div>`;
+      // Render inline cluster sections — each section is a grid of
+      // per-image cards with full controls visible at first glance.
+      const clusterSections = [...grouped.entries()].map(([clusterId, g]) => {
+        const cards = g.rows
+          .map((r) => {
+            const previewHtml = r.image_url_new
+              ? `<img src="${esc(r.image_url_new)}" alt="" data-base-url="${esc(r.image_url_new)}" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(r.asset_type + " · " + r.image_id))})">`
+              : `<div class="ph">${esc(r.status)}</div>`;
+            const errCell = r.error
+              ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
+              : "";
+            return `
+<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending">
+  <div class="rc-img">${previewHtml}</div>
+  <div class="rc-body">
+    <div class="rc-row">
+      <span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span>
+      <span class="state-pill"></span>
+    </div>
+    <div class="rc-id"><code>${esc(r.image_id)}</code></div>
+    <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
+    ${errCell}
+    <div class="rc-actions">
+      <button class="btn-approve" onclick="setState('${esc(r.image_id)}', 'approved')" title="Approve for apply">✓ Approve</button>
+      <button class="btn-reject"  onclick="setState('${esc(r.image_id)}', 'rejected')" title="Reject this image">✗ Reject</button>
+      <button class="btn-regen"   onclick="regenOne('${esc(r.image_id)}')" title="Regenerate this image">↻</button>
+      <button class="btn-apply primary" onclick="applyOne('${esc(r.image_id)}')" title="Apply this image to S3 (Phase 2)">Apply</button>
+    </div>
+  </div>
+</div>`;
+          })
+          .join("");
         return `
-<tr class="cluster-row" data-cluster-id="${esc(clusterId)}" onclick="rowClick(event, '${esc(clusterId)}')">
-  <td class="topic">
-    <div class="t">${esc(g.topic || "(no topic)")}</div>
-    <div class="cid"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
-  </td>
-  <td class="preview">${cover}</td>
-  <td class="types"><div class="pills-wrap">${pills}</div></td>
-  <td class="approve-status" data-cluster-id="${esc(clusterId)}" style="text-align:right;font-size:11px;color:var(--ink-faint)">click to review ↗</td>
-</tr>`;
+<section class="card cluster-section" id="cluster-${esc(clusterId)}">
+  <header class="cs-head">
+    <div>
+      <div style="font-weight:600;font-size:14px">${esc(g.topic || "(no topic)")}</div>
+      <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
+    </div>
+    <div class="cs-actions">
+      <button onclick="approveCluster('${esc(clusterId)}', 'approved')">Approve all in cluster</button>
+      <button onclick="approveCluster('${esc(clusterId)}', 'pending')">Clear cluster</button>
+    </div>
+  </header>
+  <div class="result-grid">${cards}</div>
+</section>`;
       }).join("");
-
-      // Compact JSON the drawer reads to render image cards on demand.
-      const clusterPayload = [...grouped.entries()].map(([clusterId, g]) => ({
-        id: clusterId,
-        topic: g.topic,
-        rows: g.rows.map((r) => ({
-          image_id: r.image_id,
-          asset_type: r.asset_type,
-          aspect_ratio: r.aspect_ratio,
-          image_url_new: r.image_url_new,
-          description_used: r.description_used,
-          status: r.status,
-          error: r.error,
-        })),
-      }));
-      resultsPayload = JSON.stringify(clusterPayload);
 
       resultsHtml = `
 <section class="card" id="results-summary">
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <h2 style="margin:0">Publish — verify new images before applying</h2>
     <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
   </div>
-  <div class="sub" style="margin-top:6px">Click a row to open a drawer with the new images for that cluster. Toggle <strong>Approve</strong> on each one you're happy with; use <strong>Apply approved</strong> at the bottom to push them to S3 (Phase 2 — currently downloads a manifest).</div>
+  <div class="sub" style="margin-top:6px">Click any image to enlarge. Use the per-card buttons to approve, reject, or regenerate that specific image — or use the cluster-level buttons in each section header. The sticky bar at the bottom applies every approved image at once.</div>
 </section>
 
-<section class="card" style="padding:0">
-  <table class="cluster-list">
-    <thead>
-      <tr>
-        <th>Topic / cluster_id</th>
-        <th style="width:84px">first new</th>
-        <th>asset breakdown</th>
-        <th style="width:160px;text-align:right">approval</th>
-      </tr>
-    </thead>
-    <tbody id="result-tbody">${clusterCards}</tbody>
-  </table>
-</section>
-
-<!-- Publish drawer -->
-<div class="drawer-overlay" id="publish-overlay" onclick="closePublishDrawer()"></div>
-<aside class="drawer" id="publish-drawer" aria-hidden="true">
-  <header>
-    <h3 id="publish-drawer-title">Cluster</h3>
-    <button class="ghost" onclick="closePublishDrawer()">×</button>
-  </header>
-  <div class="body" id="publish-drawer-body"></div>
-  <footer>
-    <div class="meta" id="publish-drawer-meta">— approved</div>
-    <button onclick="approveAllInDrawer(true)">Approve all</button>
-    <button onclick="approveAllInDrawer(false)">Clear</button>
-    <button class="primary" onclick="closePublishDrawer()">Done</button>
-  </footer>
-</aside>
+${clusterSections}
 
 <!-- Sticky publish action bar -->
 <div class="action-bar">
   <div class="stats">
-    <strong id="approved-count">0</strong> approved · <strong id="applied-count">0</strong> applied
+    <strong id="approved-count">0</strong> approved · <strong id="rejected-count">0</strong> rejected · <strong id="applied-count">0</strong> applied
   </div>
   <div class="right">
-    <span class="banner warn" style="margin:0;padding:6px 10px;font-size:12px">Phase 2: apply-to-S3 downloads a manifest; the actual <code>aws s3 cp</code> wires up next.</span>
-    <button class="primary" id="apply-approved-btn" onclick="applyApproved()" disabled>Apply approved →</button>
+    <span class="phase2-note">Phase 2: <code>aws s3 cp</code> wires up next; clicking Apply downloads a manifest for now.</span>
+    <button class="primary" id="apply-approved-btn" onclick="applyApproved()" disabled>Apply approved (0) →</button>
   </div>
 </div>
 `;
@@ -1328,7 +1344,6 @@ async function runPage(res: ServerResponse, id: string) {
   </div>
   <div id="links" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
     ${state.csvPath ? `<a class="btn" href="/files?p=${encodeURIComponent(state.csvPath)}">⬇ Download CSV</a>` : ""}
-    ${state.htmlPath ? `<a class="btn primary" href="/files?p=${encodeURIComponent(state.htmlPath)}" target="_blank">Open HTML report ↗</a>` : ""}
     <a class="btn" href="/workspace/${esc(state.client)}">← back to workspace</a>
   </div>
 </section>
@@ -1350,131 +1365,108 @@ ${resultsHtml}
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
-
-// ── Publish drawer + lightbox ──
 const RUN_ID = window.location.pathname.split('/').pop();
-const PUBLISH_CLUSTERS = ${resultsPayload};
-const approved = new Set(); // image_id values
-const applied = new Set();  // image_id values
 
-let openClusterId = null;
+// Per-image state machine. Mutually exclusive: a single image is at
+// most one of {pending, approved, rejected, applied}. Switching from
+// approved → rejected just flips the state; applied is terminal until
+// the page reloads.
+const stateOf = new Map(); // image_id → 'pending' | 'approved' | 'rejected' | 'applied'
 
-function rowClick(ev, cid) {
-  const t = ev.target;
-  if (t.closest('input,button,a,code')) return;
-  openPublishDrawer(cid);
+function setState(imageId, newState) {
+  // Toggle off if you click the same state twice (e.g. click Approve
+  // again to un-approve, leaving the card in pending).
+  const cur = stateOf.get(imageId) ?? 'pending';
+  if (cur === 'applied') return; // can't un-apply once marked
+  if (cur === newState) stateOf.set(imageId, 'pending');
+  else stateOf.set(imageId, newState);
+  paintCard(imageId);
+  refreshTotals();
 }
-function clusterById(id) { return PUBLISH_CLUSTERS.find(c => c.id === id); }
-
-function openPublishDrawer(cid) {
-  const c = clusterById(cid);
-  if (!c) return;
-  openClusterId = cid;
-  document.getElementById('publish-drawer-title').textContent = c.topic || '(no topic)';
-  const cards = c.rows.map((r) => {
-    const isApproved = approved.has(r.image_id);
-    const isApplied = applied.has(r.image_id);
-    const previewHtml = r.image_url_new
-      ? '<img src="' + r.image_url_new + '" alt="" loading="lazy" onclick="lbOpen(event, this.src, ' + JSON.stringify(r.asset_type + ' · ' + r.image_id) + ')">'
-      : '<div class="ph">' + (r.status || 'pending') + '</div>';
-    const errCell = r.error ? '<div class="err-line">' + r.error.slice(0, 240) + '</div>' : '';
-    return '<div class="img-card publish-card' + (isApproved ? ' approved' : '') + (isApplied ? ' applied' : '') + '" data-image-id="' + r.image_id + '">' +
-      '<div class="approve-cell">' +
-        '<label class="approve-toggle"><input type="checkbox" ' + (isApproved ? 'checked' : '') + ' ' + (isApplied ? 'disabled' : '') + ' onchange="onApprove(\\'' + r.image_id + '\\', this.checked)"> Approve</label>' +
-      '</div>' +
-      '<div class="pre publish-pre">' + previewHtml + '</div>' +
-      '<div>' +
-        '<div class="meta-row">' +
-          '<span class="pill ' + r.asset_type + '">' + r.asset_type + ' · ' + r.aspect_ratio + '</span>' +
-          (isApplied ? '<span class="pill internal">applied</span>' : '') +
-          '<code>' + r.image_id + '</code>' +
-        '</div>' +
-        '<div class="desc">' + (r.description_used || '<em style="color:var(--ink-faint)">(no description)</em>').slice(0, 320) + '</div>' +
-        errCell +
-        '<div class="rc-actions" style="margin-top:8px">' +
-          '<button onclick="applyOne(\\'' + r.image_id + '\\')" ' + (isApplied ? 'disabled' : '') + '>' + (isApplied ? 'Applied ✓' : 'Apply this to S3') + '</button>' +
-        '</div>' +
-      '</div>' +
-    '</div>';
-  }).join('');
-  document.getElementById('publish-drawer-body').innerHTML = cards;
-  refreshDrawerMeta();
-  document.getElementById('publish-drawer').classList.add('open');
-  document.getElementById('publish-overlay').classList.add('open');
-}
-function closePublishDrawer() {
-  document.getElementById('publish-drawer').classList.remove('open');
-  document.getElementById('publish-overlay').classList.remove('open');
-  openClusterId = null;
-}
-function onApprove(imageId, on) {
-  if (on) approved.add(imageId); else approved.delete(imageId);
-  // Reflect on the open card
-  const card = document.querySelector('[data-image-id="' + imageId + '"]');
-  if (card) card.classList.toggle('approved', on);
-  refreshAll();
-}
-function approveAllInDrawer(on) {
-  if (!openClusterId) return;
-  const c = clusterById(openClusterId);
-  if (!c) return;
-  for (const r of c.rows) {
-    if (applied.has(r.image_id)) continue;
-    if (on) approved.add(r.image_id); else approved.delete(r.image_id);
+function paintCard(imageId) {
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  const s = stateOf.get(imageId) ?? 'pending';
+  card.dataset.state = s;
+  const pill = card.querySelector('.state-pill');
+  if (pill) {
+    pill.textContent = s === 'pending' ? '' : s;
+    pill.className = 'state-pill state-' + s;
   }
-  openPublishDrawer(openClusterId);
-  refreshAll();
+}
+function approveCluster(clusterId, target) {
+  const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
+  for (const card of cards) {
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    if (stateOf.get(id) === 'applied') continue;
+    if (target === 'pending') stateOf.set(id, 'pending');
+    else stateOf.set(id, target); // 'approved'
+    paintCard(id);
+  }
+  refreshTotals();
 }
 function applyOne(imageId) {
-  if (applied.has(imageId)) return;
-  applied.add(imageId);
-  approved.delete(imageId);
-  if (openClusterId) openPublishDrawer(openClusterId);
-  refreshAll();
+  if (stateOf.get(imageId) === 'applied') return;
+  stateOf.set(imageId, 'applied');
+  paintCard(imageId);
+  refreshTotals();
+  // (Phase 2) — actual S3 PutObject would fire here.
 }
 function applyApproved() {
-  const items = [...approved];
-  if (items.length === 0) return;
-  for (const id of items) { applied.add(id); approved.delete(id); }
-  // Download a manifest the (forthcoming) S3-push script will consume.
-  const payload = { run_id: RUN_ID, apply: items, count: items.length, generated_at: new Date().toISOString() };
+  const ids = [...stateOf.entries()].filter(([, s]) => s === 'approved').map(([id]) => id);
+  if (ids.length === 0) return;
+  for (const id of ids) { stateOf.set(id, 'applied'); paintCard(id); }
+  // Download a manifest the forthcoming S3-push script consumes.
+  const payload = { run_id: RUN_ID, apply: ids, count: ids.length, generated_at: new Date().toISOString() };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = 'apply-manifest-' + RUN_ID + '.json'; a.click();
   URL.revokeObjectURL(url);
-  if (openClusterId) openPublishDrawer(openClusterId);
-  refreshAll();
+  refreshTotals();
 }
-function refreshDrawerMeta() {
-  if (!openClusterId) return;
-  const c = clusterById(openClusterId);
-  if (!c) return;
-  const total = c.rows.length;
-  const appr = c.rows.filter((r) => approved.has(r.image_id)).length;
-  const appd = c.rows.filter((r) => applied.has(r.image_id)).length;
-  document.getElementById('publish-drawer-meta').textContent = appr + ' approved, ' + appd + ' applied (of ' + total + ')';
-}
-function refreshAll() {
-  document.getElementById('approved-count').textContent = approved.size;
-  document.getElementById('applied-count').textContent = applied.size;
-  document.getElementById('apply-approved-btn').disabled = approved.size === 0;
-  refreshDrawerMeta();
-  // Update the per-cluster approval status hint in the table.
-  for (const c of PUBLISH_CLUSTERS) {
-    const cell = document.querySelector('td.approve-status[data-cluster-id="' + c.id + '"]');
-    if (!cell) continue;
-    const total = c.rows.length;
-    const appr = c.rows.filter((r) => approved.has(r.image_id)).length;
-    const appd = c.rows.filter((r) => applied.has(r.image_id)).length;
-    if (appd === total) cell.innerHTML = '<span class="pill internal">all applied</span>';
-    else if (appr + appd === total) cell.innerHTML = '<span class="pill cover">' + (appr + appd) + '/' + total + ' approved</span>';
-    else if (appr + appd > 0) cell.innerHTML = '<span class="pill infographic">' + (appr + appd) + '/' + total + ' approved</span>';
-    else cell.innerHTML = '<span style="color:var(--ink-faint)">click to review ↗</span>';
+async function regenOne(imageId) {
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  const btn = card.querySelector('.btn-regen');
+  if (btn) { btn.textContent = '…'; btn.disabled = true; }
+  try {
+    const r = await fetch('/api/regen-one', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ image_id: imageId, cluster_id: card.dataset.clusterId })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    const img = card.querySelector('.rc-img img');
+    if (img && j.image_url_new) img.src = j.image_url_new;
+    // A regenerated image goes back to pending so the operator
+    // re-reviews it before approving / applying.
+    stateOf.set(imageId, 'pending');
+    paintCard(imageId);
+  } catch (err) {
+    alert('regenerate failed: ' + err.message);
+  } finally {
+    if (btn) { btn.textContent = '↻'; btn.disabled = false; }
   }
+  refreshTotals();
+}
+function refreshTotals() {
+  let approved = 0, rejected = 0, applied = 0;
+  for (const s of stateOf.values()) {
+    if (s === 'approved') approved++;
+    else if (s === 'rejected') rejected++;
+    else if (s === 'applied') applied++;
+  }
+  document.getElementById('approved-count').textContent = approved;
+  document.getElementById('rejected-count').textContent = rejected;
+  document.getElementById('applied-count').textContent = applied;
+  const btn = document.getElementById('apply-approved-btn');
+  btn.disabled = approved === 0;
+  btn.textContent = 'Apply approved (' + approved + ') →';
 }
 
-// Lightbox (run page)
+// Lightbox (full-screen image viewer)
 function lbOpen(ev, src, caption) {
   if (ev) ev.stopPropagation();
   document.getElementById('rp-lb-img').src = src;
@@ -1482,31 +1474,28 @@ function lbOpen(ev, src, caption) {
   document.getElementById('rp-lightbox').classList.add('open');
 }
 function lbClose() {
-  document.getElementById('rp-lightbox').classList.remove('open');
-  document.getElementById('rp-lb-img').src = '';
+  const lb = document.getElementById('rp-lightbox');
+  if (lb) lb.classList.remove('open');
+  const img = document.getElementById('rp-lb-img');
+  if (img) img.src = '';
 }
 function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    if (document.getElementById('rp-lightbox')?.classList.contains('open')) { lbClose(); return; }
-    if (document.getElementById('publish-drawer')?.classList.contains('open')) closePublishDrawer();
-  }
-});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') lbClose(); });
 
-if (PUBLISH_CLUSTERS.length > 0) refreshAll();
+if (document.getElementById('approved-count')) refreshTotals();
+
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
 es.onmessage = (ev) => {
   try { const { text } = JSON.parse(ev.data); logEl.textContent += text; logEl.scrollTop = logEl.scrollHeight; } catch {}
 };
 es.addEventListener('end', (ev) => {
-  const { code, csvPath, htmlPath } = JSON.parse(ev.data);
-  statusEl.innerHTML = code === 0 ? '<div class="banner ok">finished, exit 0</div>' : '<div class="banner err">exited with code ' + code + '</div>';
-  const links = [];
-  if (csvPath) links.push('<a class="btn" href="/files?p=' + encodeURIComponent(csvPath) + '">⬇ Download CSV</a>');
-  if (htmlPath) links.push('<a class="btn primary" href="/files?p=' + encodeURIComponent(htmlPath) + '" target="_blank">Open HTML report ↗</a>');
-  links.push('<a class="btn" href="/workspace/${esc(state.client)}">← back to workspace</a>');
-  linksEl.innerHTML = links.join(' ');
+  const { code } = JSON.parse(ev.data);
+  statusEl.innerHTML = code === 0 ? '<div class="banner ok">finished, exit 0 — reloading to render the publish view…</div>' : '<div class="banner err">exited with code ' + code + '</div>';
+  // The publish view (Approve/Reject/Regenerate per card) is rendered
+  // server-side from the freshly-written CSV. Reload once the run
+  // finishes so it appears inline without an extra click.
+  if (code === 0) setTimeout(() => window.location.reload(), 800);
   es.close();
 });
 es.onerror = () => {};
@@ -1578,6 +1567,7 @@ export function startWebServer(port: number): void {
       }
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
+      if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
       if (method === "GET" && p === "/runs") return runListPage(res);
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {
