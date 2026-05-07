@@ -286,6 +286,13 @@ async function inlineRecordsForCluster(
 
 export interface CollectOptions {
   clusterIds?: Set<string>;
+  /**
+   * When set, only records whose `imageId` is in the set are kept. The
+   * web UI uses this to scope a regen to exactly the images the
+   * operator ticked, without accidentally pulling in their unselected
+   * siblings within the same cluster.
+   */
+  imageIds?: Set<string>;
   assetTypes?: Set<AssetType>;
   /** Required to enable S3 fetching for inline images. */
   stagingSubdomain?: string | null;
@@ -308,6 +315,7 @@ export async function collectImageRecords(
     const rows: ImageRecord[] = [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
     for (const r of rows) {
       if (options.assetTypes && !options.assetTypes.has(r.asset)) continue;
+      if (options.imageIds && !options.imageIds.has(r.imageId)) continue;
       records.push(r);
     }
   }

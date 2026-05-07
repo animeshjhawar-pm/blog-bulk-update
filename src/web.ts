@@ -960,7 +960,10 @@ async function saveBrand(e) {
   }
 }
 
-// ── Run regen ──
+// ── Run regen — sends every selected image_id (and the cluster_ids
+// they belong to). The server forwards both to the CLI's --image-ids
+// + --cluster-ids flags so the regen pipeline runs on exactly the
+// images that were ticked, not the rest of the cluster.
 async function runRegen(dryRun) {
   const items = [];
   for (const [cid, set] of selection.entries()) {
@@ -968,13 +971,13 @@ async function runRegen(dryRun) {
     items.push({ cluster_id: cid, image_ids: [...set] });
   }
   if (items.length === 0) return;
-  const allFullySelected = items.every(it => it.image_ids.length === imageIdsOf(it.cluster_id).length);
-  if (!allFullySelected) {
-    if (!confirm('Partial image selection detected. The current backend regenerates whole clusters — unselected images in those clusters will also be regenerated. Proceed?')) return;
-  }
+
   const fd = new FormData();
   fd.set('client', SLUG);
-  for (const it of items) fd.append('cluster_id', it.cluster_id);
+  for (const it of items) {
+    fd.append('cluster_id', it.cluster_id);
+    for (const id of it.image_ids) fd.append('image_id', id);
+  }
   if (dryRun) fd.set('dry_run', 'on');
   fd.set('provider', 'replicate');
   const r = await fetch('/regen', { method: 'POST', body: fd });
@@ -1048,6 +1051,7 @@ function parseMultipart(raw: string, contentType: string): URLSearchParams {
 function startRegen(opts: {
   client: string;
   clusterIds: string[];
+  imageIds: string[];
   dryRun: boolean;
   useSavedToken: boolean;
   assetTypes?: string;
@@ -1058,6 +1062,7 @@ function startRegen(opts: {
   if (opts.dryRun) args.push("--dry-run");
   if (opts.useSavedToken) args.push("--use-saved-token");
   if (opts.clusterIds.length) args.push("--cluster-ids", opts.clusterIds.join(","));
+  if (opts.imageIds.length) args.push("--image-ids", opts.imageIds.join(","));
   if (opts.assetTypes) args.push("--asset-types", opts.assetTypes);
   if (opts.provider) args.push("--provider", opts.provider);
 
@@ -1100,13 +1105,15 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     return;
   }
   const clusterIds = body.getAll("cluster_id");
-  if (clusterIds.length === 0) {
-    sendHtml(res, 400, shell("Error", `<div class="banner err">No clusters selected.</div>`));
+  const imageIds = body.getAll("image_id");
+  if (clusterIds.length === 0 && imageIds.length === 0) {
+    sendHtml(res, 400, shell("Error", `<div class="banner err">No images selected.</div>`));
     return;
   }
   const state = startRegen({
     client,
     clusterIds,
+    imageIds,
     dryRun: body.get("dry_run") === "on",
     useSavedToken: body.get("use_saved_token") === "on",
     assetTypes: body.get("asset_types") || undefined,

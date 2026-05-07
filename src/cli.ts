@@ -122,6 +122,7 @@ program
     `comma-separated subset of {${ASSET_TYPES.join(",")}}`,
   )
   .option("--cluster-ids <list>", "comma-separated cluster UUIDs to restrict to")
+  .option("--image-ids <list>", "comma-separated image_id values to restrict to (per-image scoping; the web UI uses this)")
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
   )
@@ -133,6 +134,7 @@ program
       useSavedToken: boolean;
       assetTypes?: string;
       clusterIds?: string;
+      imageIds?: string;
       provider?: Provider;
       concurrency: string;
     }) => {
@@ -140,6 +142,7 @@ program
       try {
         const assetTypes = parseAssetTypes(opts.assetTypes);
         const clusterIds = parseClusterIds(opts.clusterIds);
+        const imageIds = parseClusterIds(opts.imageIds); // same comma-split semantics
         const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 5);
 
         await runRegen({
@@ -148,6 +151,7 @@ program
           useSavedToken: Boolean(opts.useSavedToken),
           assetTypes,
           clusterIds,
+          imageIds,
           provider: opts.provider,
           concurrency,
         });

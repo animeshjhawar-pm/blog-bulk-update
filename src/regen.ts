@@ -28,6 +28,8 @@ export interface RegenOptions {
   useSavedToken: boolean;
   assetTypes?: Set<AssetType>;
   clusterIds?: Set<string>;
+  /** When set, only records whose `imageId` is in the set are regenerated. */
+  imageIds?: Set<string>;
   provider?: Provider;
   concurrency: number;
 }
@@ -243,9 +245,14 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   const records = await collectImageRecords(clusters, {
     assetTypes: options.assetTypes,
     clusterIds: options.clusterIds,
+    imageIds: options.imageIds,
     stagingSubdomain: project.staging_subdomain,
   });
-  process.stderr.write(`regen: ${records.length} image records to process\n`);
+  process.stderr.write(
+    `regen: ${records.length} image records to process` +
+      (options.imageIds ? ` (--image-ids filter: ${options.imageIds.size})` : "") +
+      "\n",
+  );
 
   if (records.length === 0) {
     process.stderr.write(`regen: nothing to do — exiting\n`);
@@ -270,6 +277,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     project_id: project.id,
     asset_types: options.assetTypes ? [...options.assetTypes] : null,
     cluster_ids: options.clusterIds ? [...options.clusterIds] : null,
+    image_ids: options.imageIds ? [...options.imageIds] : null,
     dry_run: options.dryRun,
     use_saved_token: options.useSavedToken,
     token_source: tokenSource,
