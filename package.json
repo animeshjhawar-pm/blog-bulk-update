@@ -12,6 +12,7 @@
     "extract-token": "tsx src/cli.ts extract-token",
     "regen": "tsx src/cli.ts regen",
     "web": "tsx src/cli.ts web",
+    "start": "tsx src/cli.ts web",
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "lint": "tsc --noEmit"
@@ -27,12 +28,12 @@
     "p-limit": "^6.2.0",
     "pg": "^8.13.1",
     "replicate": "^1.0.1",
+    "tsx": "^4.19.2",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }

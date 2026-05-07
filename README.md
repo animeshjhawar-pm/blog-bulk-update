@@ -16,11 +16,46 @@ This repo does not iterate on prompts.
 npm install
 cp .env.example .env.local
 # fill DATABASE_URL, FIRECRAWL_API_KEY, PORTKEY_API_KEY, PORTKEY_CONFIG_ID,
-#      REPLICATE_API_TOKEN, FAL_KEY (optional)
+#      REPLICATE_API_TOKEN, FAL_KEY (optional),
+#      AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  (for S3 reads + applies)
 ```
 
 Allow-list lives in [src/clients.ts](src/clients.ts). Adding a new client
 is a code change there.
+
+## Deploy on Railway
+
+Connect this repo as a Railway service. Railway picks up `railway.json`
+and uses `npm ci` to install + `npm start` to launch — which boots the
+web UI on `process.env.PORT`. No build step needed (we run TypeScript
+directly via `tsx`).
+
+Required env vars to set in the Railway service:
+
+| key                       | source                                                    |
+|---------------------------|-----------------------------------------------------------|
+| `DATABASE_URL`            | `gw_stormbreaker` read-only DSN                           |
+| `FIRECRAWL_API_KEY`       | Firecrawl dashboard                                       |
+| `PORTKEY_API_KEY`         | Portkey dashboard                                         |
+| `PORTKEY_CONFIG_ID`       | optional, defaults to `pc-portke-0dd3de`                  |
+| `REPLICATE_API_TOKEN`     | only required when running live (non-mock) regens         |
+| `AWS_ACCESS_KEY_ID`       | reads `gw-stormbreaker/page_data/...` and writes `gw-content-store/...` |
+| `AWS_SECRET_ACCESS_KEY`   | (same)                                                    |
+| `AWS_REGION`              | optional, defaults to `us-east-1`                         |
+| `S3_BUCKET`               | optional, defaults to `gw-stormbreaker` (placeholders fetch) |
+| `S3_CONTENT_BUCKET`       | optional, defaults to `gw-content-store` (apply-to-S3 target) |
+| `IMAGE_PROVIDER`          | optional, defaults to `replicate`                         |
+
+After the first deploy, hit the Railway-assigned domain → home page
+loads. The dropdown shows the allow-listed clients and you can run a
+mock dry-run end-to-end. Live image generation requires
+`REPLICATE_API_TOKEN`; "Apply to S3" requires the AWS keys.
+
+**Persistence note**: Railway containers are ephemeral on redeploy.
+The `graphic-tokens/<slug>.json` and `graphic-tokens/<slug>-brand.txt`
+files don't survive redeploys. If that becomes a problem, attach a
+Railway Volume mounted at `/app/graphic-tokens`, or move those reads
+to S3 (next iteration).
 
 ## Commands
 

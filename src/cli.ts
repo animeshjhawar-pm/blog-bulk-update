@@ -170,10 +170,14 @@ program
 
 program
   .command("web")
-  .description("Start a local web UI on http://localhost:<port> for picking clusters + triggering regen runs.")
-  .option("--port <n>", "port to bind", "3000")
-  .action((opts: { port: string }) => {
-    const port = Math.max(1, Number.parseInt(opts.port, 10) || 3000);
+  .description("Start the web UI for picking clusters + triggering regen runs.")
+  .option("--port <n>", "port to bind (defaults to $PORT or 3000)")
+  .action((opts: { port?: string }) => {
+    // Honour the platform-supplied PORT env var (Railway, Render, Fly,
+    // Heroku, etc. all inject one). Fall back to 3000 for local use.
+    const fromFlag = opts.port ? Number.parseInt(opts.port, 10) : NaN;
+    const fromEnv = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : NaN;
+    const port = Math.max(1, Number.isFinite(fromFlag) ? fromFlag : Number.isFinite(fromEnv) ? fromEnv : 3000);
     startWebServer(port);
   });
 
