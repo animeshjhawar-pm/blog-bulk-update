@@ -259,9 +259,33 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .warn-block { background: #fef9c3; color: #713f12; border: 1px solid #fde68a; border-radius: 6px; padding: 10px 12px; font-size: 12.5px; margin: 10px 0; }
   .warn-block strong { color: #78350f; }
 
-  /* Image card preview is now clickable */
-  .img-card .pre { cursor: zoom-in; transition: outline-color .15s; outline: 2px solid transparent; }
+  /* Image card preview is now clickable. Hovering surfaces a "+"
+     affordance in the corner so the operator knows it expands. */
+  .img-card .pre { cursor: zoom-in; transition: outline-color .15s; outline: 2px solid transparent; position: relative; overflow: hidden; }
   .img-card .pre:hover { outline-color: var(--brand); }
+  .img-card .pre::after,
+  .result-card .rc-img::after {
+    content: "+";
+    position: absolute;
+    top: 6px; right: 6px;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: rgba(15,23,42,.6);
+    color: #fff;
+    font: 600 16px/22px -apple-system, system-ui, sans-serif;
+    text-align: center;
+    opacity: 0;
+    transition: opacity .15s, transform .15s;
+    pointer-events: none;
+    z-index: 2;
+  }
+  .img-card .pre:hover::after,
+  .result-card .rc-img:hover::after {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  .result-card .rc-img { position: relative; cursor: zoom-in; }
+  .result-card .rc-img:hover img { filter: brightness(.94); }
 
   /* Run page result gallery */
   .rc-cluster-head { display: flex; align-items: start; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
@@ -341,6 +365,25 @@ ${body}
 ${scripts}
 </body>
 </html>`;
+}
+
+/**
+ * Encode a string for safe embedding inside an HTML double-quoted
+ * attribute that the browser will then evaluate as JavaScript
+ * (e.g. `onclick="…"`). Two passes: JSON.stringify gives a valid JS
+ * string literal; esc() HTML-encodes the surrounding quotes so they
+ * survive the HTML parse without truncating the attribute.
+ *
+ *   raw   = `cover · abc`
+ *   step1 = JSON.stringify(raw)  → "cover · abc"
+ *   step2 = esc(step1)           → &quot;cover · abc&quot;
+ *   embed = `onclick="lbOpen(event, this.src, ${embed})"`
+ *           → onclick="lbOpen(event, this.src, &quot;cover · abc&quot;)"
+ *   browser decodes attribute   → lbOpen(event, this.src, "cover · abc")
+ *   JS executes                  → lbOpen(event, this.src, "cover · abc")
+ */
+function jsAttr(v: string): string {
+  return esc(JSON.stringify(v));
 }
 
 function send(res: ServerResponse, status: number, ctype: string, body: string) {
@@ -902,8 +945,9 @@ function openDrawer(cid) {
     }
     const checked = set.has(img.id);
     const previewSrc = img.preview_url || c.cover_url || '';
+    const captionAttr = JSON.stringify(img.asset + ' · ' + img.id).replace(/"/g, '&quot;');
     const previewHtml = previewSrc
-      ? '<img src="' + previewSrc + '" alt="" loading="lazy" onclick="openLightbox(event, this.src, ' + JSON.stringify(img.asset + ' · ' + img.id) + ')">'
+      ? '<img src="' + previewSrc + '" alt="" loading="lazy" onclick="openLightbox(event, this.src, ' + captionAttr + ')">'
       : '<div class="ph">no preview<br>(post-regen)</div>';
     cardsHtml.push(
       '<label class="img-card' + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
@@ -1357,7 +1401,7 @@ async function runPage(res: ServerResponse, id: string) {
         const cards = g.rows
           .map((r) => {
             const previewHtml = r.image_url_new
-              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${JSON.stringify(esc(r.asset_type + " · " + r.image_id))})">`
+              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${jsAttr(r.asset_type + " · " + r.image_id)})">`
               : `<div class="ph">${esc(r.status)}</div>`;
             const errCell = r.error
               ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
