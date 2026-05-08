@@ -538,9 +538,17 @@ async function workspacePage(res: ServerResponse, slug: string) {
   const brand = (await loadBrandGuidelines(slug)) ?? "";
   const savedToken = await loadToken(slug);
 
+  // If AWS creds aren't set on this deployment we can't fetch the
+  // blog_with_image_placeholders.md from S3 — the parser would throw
+  // 57 times and silently fall back to cover/thumbnail only. Detect
+  // up front so the workspace can surface a clear banner instead of
+  // looking like the data is just missing.
+  const env = loadEnv();
+  const hasAwsCreds = Boolean(env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY);
+
   // Parallel S3 fetches for inline-image counts.
   const s3Cache = new Map<string, string | null>();
-  const stagingSubdomain = project.staging_subdomain;
+  const stagingSubdomain = hasAwsCreds ? project.staging_subdomain : null;
   const recordsByCluster: Record<string, ImageRecord[]> = {};
   const CONCURRENCY = 8;
   let cursor = 0;
@@ -626,7 +634,25 @@ async function workspacePage(res: ServerResponse, slug: string) {
          Object.values(logoUrls).find((v) => typeof v === "string" && (v as string).startsWith("http")))
       : null) as string | null | undefined;
 
+  const awsBanner = hasAwsCreds
+    ? ""
+    : `
+<section class="card" style="border-color:#fde68a;background:#fef9c3">
+  <div style="display:flex;align-items:start;gap:10px;font-size:13px;color:#713f12">
+    <span style="font-size:18px;line-height:1">⚠</span>
+    <div>
+      <strong>AWS credentials are not set on this deployment.</strong>
+      Inline images (infographic / internal / external / generic) live in
+      <code>s3://${esc(env.S3_BUCKET ?? "gw-stormbreaker")}/page_data/&lt;staging&gt;/blog/&lt;cluster&gt;/output/blog_with_image_placeholders.md</code>
+      and can't be fetched without keys — only cover + thumbnail are surfaced.
+      Apply-to-S3 also won't work.
+      <br>Set <code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code> in your service variables (Railway → Service → Variables) and redeploy.
+    </div>
+  </div>
+</section>`;
+
   const body = `
+${awsBanner}
 <section class="card">
   <div style="display:flex;align-items:start;gap:16px">
     ${primaryLogo ? `<img src="${esc(primaryLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
