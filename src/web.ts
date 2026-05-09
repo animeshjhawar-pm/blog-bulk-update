@@ -223,6 +223,43 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
   .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
 
+  /* How-it-works flowchart on the home page. Six numbered steps in a
+     responsive grid; arrows render as glyphs at desktop widths. */
+  .howto h2 { font-size: 16px; }
+  .howto .howto-steps {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+    counter-reset: howto;
+  }
+  .howto .howto-steps li {
+    display: flex; gap: 12px; align-items: flex-start;
+    padding: 14px; background: #f8fafc; border-radius: 10px;
+    border: 1px solid var(--border);
+    position: relative;
+  }
+  .howto .howto-num {
+    flex: 0 0 28px; width: 28px; height: 28px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--brand) 0%, #6366f1 100%);
+    color: #fff; border-radius: 50%; font-weight: 600; font-size: 13px;
+    box-shadow: 0 2px 6px rgba(67,56,202,.3);
+  }
+  .howto .howto-title { font-weight: 600; margin-bottom: 4px; font-size: 13.5px; color: var(--ink); }
+  .howto .howto-body { font-size: 12.5px; color: var(--ink-muted); line-height: 1.5; }
+  .howto .howto-body code { font-size: 11px; }
+  /* Arrow between consecutive steps on wide enough viewports. */
+  @media (min-width: 1100px) {
+    .howto .howto-steps li::after {
+      content: "→"; position: absolute;
+      right: -14px; top: 50%; transform: translateY(-50%);
+      color: var(--brand); font-size: 18px; font-weight: 600;
+      pointer-events: none;
+    }
+    .howto .howto-steps li:last-child::after,
+    .howto .howto-steps li:nth-child(3n)::after { content: ""; }
+  }
+
   .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
   .recent-row td { padding: 11px 14px; font-size: 13px; }
   .recent-row a.recent-link { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 8px; }
@@ -267,8 +304,12 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   table.cluster-list td.topic { max-width: 360px; }
   table.cluster-list td.topic .t { font-weight: 500; line-height: 1.35; }
   table.cluster-list td.topic .cid { font-size: 10.5px; color: var(--ink-muted); margin-top: 2px; word-break: break-all; }
-  table.cluster-list td.preview img { width: 64px; height: 36px; object-fit: cover; border-radius: 4px; border: 1px solid var(--border); display: block; background: #f1f5f9; }
-  table.cluster-list td.preview .placeholder { width: 64px; height: 36px; border-radius: 4px; border: 1px dashed var(--border-strong); background: #f8fafc; }
+  table.cluster-list td.preview img,
+  table.cluster-list td.preview .placeholder { object-fit: cover; border-radius: 4px; border: 1px solid var(--border); display: block; background: #f1f5f9; }
+  table.cluster-list td.preview .placeholder { border-style: dashed; background: #f8fafc; border-color: var(--border-strong); }
+  /* Aspect-ratio variants — width fixed, height computed. */
+  table.cluster-list td.preview .ar-16x9 { width: 64px; height: 36px; }
+  table.cluster-list td.preview .ar-1x1  { width: 48px; height: 48px; }
   table.cluster-list td.types .pills-wrap { display: flex; flex-wrap: wrap; gap: 3px; }
 
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
@@ -334,7 +375,9 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     align-items: start;
   }
   .img-card.selected { border-color: var(--brand); background: #f5f3ff; }
-  .img-card .pre { width: 96px; height: 60px; border-radius: 6px; border: 1px solid var(--border); background: #f1f5f9; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .img-card .pre { width: 96px; border-radius: 6px; border: 1px solid var(--border); background: #f1f5f9; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .img-card.pre-16x9 .pre { height: 54px; }
+  .img-card.pre-1x1 .pre { height: 96px; }
   .img-card .pre img { width: 100%; height: 100%; object-fit: cover; }
   .img-card .pre .ph { font-size: 10px; color: var(--ink-faint); text-align: center; padding: 4px; }
   .img-card .meta-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
@@ -563,12 +606,45 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     display: none;
   }
   .combobox.open .menu { display: block; }
+  /* Picked-state chip — replaces the input text so the selection
+     reads as a chosen entity. Lives inside .combobox absolutely so
+     it visually overlays the input control. */
+  .combo-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: #fff; border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 6px 8px 6px 10px; max-width: 100%;
+    box-shadow: var(--shadow);
+    font-size: 14px; color: var(--ink);
+  }
+  .combo-chip[hidden] { display: none; }
+  .combo-chip .fav { width: 18px; height: 18px; flex: 0 0 18px; }
+  .combo-chip span { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .combo-chip-x {
+    margin-left: 4px; padding: 0 6px; font-size: 16px; line-height: 1;
+    background: transparent; border: 0; color: var(--ink-faint);
+    cursor: pointer; border-radius: 4px;
+  }
+  .combo-chip-x:hover { color: var(--err); background: #fef2f2; }
+  .hero-search .combo-chip { font-size: 15px; padding: 10px 10px 10px 14px; }
+  .hero-search .combo-chip .fav { width: 22px; height: 22px; flex: 0 0 22px; }
   .combobox .menu .opt { padding: 8px 12px; cursor: pointer; font-size: 13px; color: var(--ink); background: #fff; }
   .combobox .menu .opt:hover, .combobox .menu .opt.active { background: var(--accent-bg); color: var(--brand); }
   .combobox .menu .opt strong { color: inherit; }
   .combobox .menu .opt .pid { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
 
   .log { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
+  /* Friendly activity feed — plain-English alternative to the raw log. */
+  .log-friendly { display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow-y: auto; padding: 4px 2px; }
+  .friendly-row { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-radius: 6px; font-size: 13px; line-height: 1.4; border: 1px solid transparent; }
+  .friendly-row code { font-size: 11px; }
+  .friendly-info { background: #f8fafc; color: var(--ink); border-color: var(--border); }
+  .friendly-ok   { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+  .friendly-err  { background: var(--err-bg); color: var(--err); border-color: #fca5a5; }
+  .friendly-verbose { background: transparent; color: var(--ink-faint); font-size: 11.5px; padding: 2px 8px; }
+  .friendly-row .fr-step { background: var(--accent-bg); color: var(--brand); padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; flex: 0 0 auto; }
+  .friendly-row .fr-asset { background: #fff; border: 1px solid var(--border); padding: 0 8px; border-radius: 999px; font-size: 11px; flex: 0 0 auto; }
+  .friendly-row .fr-cluster { color: var(--ink-muted); font-size: 11px; flex: 0 0 auto; }
+  .friendly-row .fr-state { margin-left: auto; font-weight: 500; }
 
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
   .row > * { flex: 1; min-width: 160px; }
@@ -823,12 +899,21 @@ async function homePage(res: ServerResponse) {
     <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
       <div class="hero-search">
         <div class="combobox" id="combo">
+          <!-- Picked-state chip (favicon + name + ×); replaces the input
+               when an item is selected so the choice doesn't read as
+               plain typed text. Clicking × clears the selection. -->
+          <div class="combo-chip" id="combo-chip" hidden>
+            <img class="fav" id="combo-chip-fav" alt="">
+            <span id="combo-chip-name"></span>
+            <button type="button" class="combo-chip-x" onclick="clearComboPick(event)" title="Clear selection" aria-label="Clear">×</button>
+          </div>
           <input type="text" id="client-input" placeholder="Search a client — name, URL, or project_id" autocomplete="off">
           <span class="arrow">▾</span>
           <div class="menu" id="combo-menu"></div>
         </div>
         <input type="hidden" id="client-slug">
         <input type="hidden" id="client-project-id">
+        <input type="hidden" id="client-url">
         <button class="primary hero-btn" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
       <p class="hero-hint">A handful of featured clients have their <code>graphic_token</code> pre-saved (loads instantly). Any other project is extracted on the fly — adds ~30 seconds to the one-time import.</p>
@@ -847,6 +932,56 @@ ${recent.length > 0 ? `
 <section class="card" style="margin-top:18px;text-align:center;padding:32px">
   <div class="sub">No runs yet. Pick a client above to get started.</div>
 </section>`}
+
+<!-- How-to flowchart — visual walkthrough of the end-to-end loop. -->
+<section class="card howto" style="margin-top:18px">
+  <h2 style="margin:0 0 6px">How it works</h2>
+  <div class="sub" style="margin-bottom:16px">A six-step loop from picking a client to live images on the site. Apply only writes when you click — nothing is automatic.</div>
+  <ol class="howto-steps">
+    <li>
+      <span class="howto-num">1</span>
+      <div>
+        <div class="howto-title">Pick a client</div>
+        <div class="howto-body">Search by name, URL or <code>project_id</code>. Featured clients have their <code>graphic_token</code> pre-saved; everything else extracts on the fly.</div>
+      </div>
+    </li>
+    <li>
+      <span class="howto-num">2</span>
+      <div>
+        <div class="howto-title">Choose page types</div>
+        <div class="howto-body">Blog, service, category — any combination. Only published pages appear.</div>
+      </div>
+    </li>
+    <li>
+      <span class="howto-num">3</span>
+      <div>
+        <div class="howto-title">Pick clusters &amp; images</div>
+        <div class="howto-body">Click a cluster row to open its drawer; tick the images to regenerate. The master checkbox selects every image in a cluster; "select all" works across clusters.</div>
+      </div>
+    </li>
+    <li>
+      <span class="howto-num">4</span>
+      <div>
+        <div class="howto-title">Generate</div>
+        <div class="howto-body">Hit <strong>Generate →</strong>. The run page streams logs while Claude builds prompts and Replicate produces images. Roughly 30–60 seconds per image.</div>
+      </div>
+    </li>
+    <li>
+      <span class="howto-num">5</span>
+      <div>
+        <div class="howto-title">Review &amp; regenerate</div>
+        <div class="howto-body">Each result becomes a card you can click to enlarge. Don't like one? Hit <strong>↻ Regenerate</strong> on that card — it re-rolls just that image, in place.</div>
+      </div>
+    </li>
+    <li>
+      <span class="howto-num">6</span>
+      <div>
+        <div class="howto-title">Apply to S3</div>
+        <div class="howto-body">When you're happy, tick the cards and click <strong>Apply selected →</strong>. The new image is pushed to <code>gw-content-store</code> at the same key the live page reads, so it shows up on the site immediately.</div>
+      </div>
+    </li>
+  </ol>
+</section>
 
 <!-- Page-type chooser modal (opens on Continue) -->
 <div class="drawer-overlay" id="pt-overlay" onclick="closePtModal(event)" style="z-index:80"></div>
@@ -895,6 +1030,7 @@ function faviconUrlForUi(rawUrl) {
 const inp = document.getElementById('client-input');
 const hidden = document.getElementById('client-slug');
 const hiddenPid = document.getElementById('client-project-id');
+const hiddenUrl = document.getElementById('client-url');
 const hiddenName = { value: '' };
 const menu = document.getElementById('combo-menu');
 const combo = document.getElementById('combo');
@@ -937,12 +1073,36 @@ function renderMenu(featured, dbHits, q) {
 function pick(i) {
   if (i < 0 || i >= visible.length) return;
   const c = visible[i];
-  inp.value = c.name;
+  inp.value = '';
   hidden.value = c.slug || c.projectId; // slug for allow-list, project_id otherwise
   hiddenPid.value = c.projectId;
   hiddenName.value = c.name;
+  hiddenUrl.value = c.url || '';
+  // Render a chip in place of the typed text so the selection reads
+  // as a chosen entity, not free-form text.
+  setComboChip(c.name, c.url || '');
   combo.classList.remove('open');
   btn.disabled = false;
+}
+function setComboChip(name, url) {
+  const chip = document.getElementById('combo-chip');
+  const fav = document.getElementById('combo-chip-fav');
+  const nm = document.getElementById('combo-chip-name');
+  fav.src = faviconUrlForUi(url);
+  nm.textContent = name;
+  chip.hidden = false;
+  inp.style.display = 'none';
+}
+function clearComboPick(ev) {
+  if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+  document.getElementById('combo-chip').hidden = true;
+  inp.style.display = '';
+  inp.value = '';
+  hidden.value = ''; hiddenPid.value = ''; hiddenName.value = ''; hiddenUrl.value = '';
+  btn.disabled = true;
+  inp.focus();
+  refresh('');
+  combo.classList.add('open');
 }
 async function refresh(q) {
   const featuredHits = FEATURED.filter((c) => !q
@@ -1275,9 +1435,13 @@ async function workspacePage(
   // the drawer (and vice versa).
   const tbody = payload
     .map((c) => {
+      // Aspect-ratio class drives the placeholder/thumbnail dimensions
+      // so service/category clusters render square and blog clusters
+      // render 16:9 — matches what the regen pipeline will produce.
+      const aspectClass = c.page_type === "blog" ? "ar-16x9" : "ar-1x1";
       const cover = c.cover_url
-        ? `<img src="${esc(c.cover_url)}" alt="" loading="lazy">`
-        : `<div class="placeholder"></div>`;
+        ? `<img src="${esc(c.cover_url)}" alt="" loading="lazy" class="${aspectClass}">`
+        : `<div class="placeholder ${aspectClass}"></div>`;
       const pills = Object.entries(c.by_asset)
         .map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`)
         .join(" ");
@@ -1400,7 +1564,7 @@ ${awsBanner}
 </section>
 
 <section class="card">
-  <details>
+  <details open>
     <summary><h2 style="display:inline">Client information</h2></summary>
     <div class="sub" style="margin:8px 0 14px">Logo + graphic_token are the only inputs the regen pipeline reads. Everything else is just shown for context.</div>
 
@@ -1468,7 +1632,7 @@ ${awsBanner}
       <tr>
         <th style="width:40px"></th>
         <th>Topic / cluster_id</th>
-        <th style="width:84px">cover</th>
+        <th style="width:84px">Image</th>
         <th>asset breakdown</th>
         <th style="width:120px;text-align:right"></th>
       </tr>
@@ -1659,11 +1823,20 @@ function openDrawer(cid) {
     const placeholderText = (img.asset === 'cover' || img.asset === 'thumbnail')
       ? 'no preview'
       : 'preview after generation';
+    // Map asset → aspect-ratio class so the preview / placeholder box
+    // matches the size of the image the regen pipeline will produce.
+    //   cover                  → 16:9
+    //   thumbnail              → 1:1
+    //   service_h1/body, category_industry → 1:1
+    //   everything else        → 16:9 (infographic / inline)
+    const arClass = (img.asset === 'cover' || img.asset === 'infographic' || img.asset === 'internal' || img.asset === 'external' || img.asset === 'generic')
+      ? 'pre-16x9'
+      : 'pre-1x1';
     const previewHtml = previewSrc
       ? '<img src="' + previewSrc + '" alt="" loading="lazy" onclick="openLightbox(event, this.src, ' + captionAttr + ')">'
       : '<div class="ph">' + placeholderText + '</div>';
     cardsHtml.push(
-      '<label class="img-card' + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
+      '<label class="img-card ' + arClass + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
         '<input type="checkbox" class="img-toggle" ' + (checked ? 'checked' : '') + ' onchange="onImgToggle(this)">' +
         '<div class="pre">' + previewHtml + '</div>' +
         '<div>' +
@@ -2594,8 +2767,14 @@ ${clusterSections}
 </section>
 
 <details class="card" ${state.done ? "" : "open"}>
-  <summary><h2 style="display:inline">Log</h2></summary>
-  <div id="log" class="log" style="margin-top:10px">${initial}</div>
+  <summary><h2 style="display:inline">Activity</h2></summary>
+  <div class="sub" style="margin:6px 0 12px">A plain-English view of what's happening behind the scenes. Use the toggle for the raw command output if you need to debug.</div>
+  <div id="log-friendly" class="log-friendly" style="margin-top:10px"></div>
+  <label class="toggle" style="margin-top:10px;cursor:pointer">
+    <input type="checkbox" id="log-raw-toggle" onchange="toggleRawLog(this.checked)">
+    Show raw log
+  </label>
+  <div id="log" class="log" style="margin-top:10px;display:none">${initial}</div>
 </details>
 
 ${resultsHtml}
@@ -2608,9 +2787,95 @@ ${resultsHtml}
 </div>
 `, `<script>
 const logEl = document.getElementById('log');
+const friendlyEl = document.getElementById('log-friendly');
 const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
 const RUN_ID = window.location.pathname.split('/').pop();
+
+// ── Friendly log: convert noisy CLI output into plain-English status ──
+// Buffers partial lines from the SSE stream and emits one rendered row
+// per recognised event. Falls back to a "verbose" line for anything we
+// don't pattern-match so nothing is silently dropped.
+let logBuf = '';
+function emitFriendly(html, kind) {
+  const row = document.createElement('div');
+  row.className = 'friendly-row friendly-' + (kind || 'info');
+  row.innerHTML = html;
+  friendlyEl.appendChild(row);
+  friendlyEl.scrollTop = friendlyEl.scrollHeight;
+}
+function shorten(id) { return (id || '').slice(0, 8); }
+function humanizeLine(line) {
+  if (!line) return;
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  // Per-image progress: "[3/12] cluster=… asset=… id=… status=completed"
+  const m = trimmed.match(/^\[(\d+)\/(\d+)\]\s+cluster=(\S+)\s+asset=(\S+)\s+id=(\S+)\s+(.*)$/);
+  if (m) {
+    const [, n, total, cluster, asset, id, rest] = m;
+    let kind = 'info', label = 'working…';
+    if (/status=completed/.test(rest)) { kind = 'ok'; label = '✓ image ready'; }
+    else if (/status=mock/.test(rest)) { kind = 'ok'; label = '✓ mock image generated'; }
+    else if (/status=dry-run/.test(rest)) { kind = 'info'; label = '(dry-run) prompt only'; }
+    else if (/status=failed/.test(rest)) {
+      kind = 'err';
+      const errMatch = rest.match(/error=(.+)$/);
+      label = '✗ failed' + (errMatch ? ' — ' + errMatch[1] : '');
+    } else if (/prompt=override/.test(rest)) {
+      kind = 'info'; label = '↻ reusing previous prompt (skipping Claude)';
+    } else if (/status=/.test(rest)) {
+      label = rest.replace('status=', '');
+    }
+    emitFriendly(
+      '<span class="fr-step">' + n + '/' + total + '</span>' +
+      '<span class="fr-asset">' + asset + '</span>' +
+      '<span class="fr-cluster">cluster ' + shorten(cluster) + '…</span>' +
+      '<span class="fr-state">' + label + '</span>',
+      kind
+    );
+    return;
+  }
+
+  // Setup messages — translate to plain English.
+  const TRANSLATIONS = [
+    [/^web: env ok/, 'Environment ready', 'info'],
+    [/^web: listening on (.+)/, (s) => 'Web server listening on ' + s, 'info'],
+    [/^regen: brand_guidelines=loaded \((\d+) chars/, (n) => 'Loaded brand guidelines (' + n + ' characters)', 'info'],
+    [/^regen: graphic_token=loaded/, 'Loaded saved graphic_token', 'info'],
+    [/^regen: graphic_token=fresh/, 'Extracting graphic_token from the live site (one-time)…', 'info'],
+    [/^regen: rows=(\d+)/, (n) => 'Found ' + n + ' image(s) to regenerate', 'info'],
+    [/^regen: csv=(.+)/, (p) => 'CSV report → <code>' + p + '</code>', 'info'],
+    [/^regen: html=(.+)/, (p) => 'HTML report → <code>' + p + '</code>', 'info'],
+    [/^regen: project=/, 'Loaded project + page data', 'info'],
+    [/^regen: applying brand directive/, 'Brand instructions are being applied to every prompt', 'info'],
+    [/^regen failed: (.+)/, (m) => '✗ Run failed: ' + m, 'err'],
+  ];
+  for (const [re, msg, kind] of TRANSLATIONS) {
+    const mm = trimmed.match(re);
+    if (mm) {
+      const text = typeof msg === 'function' ? msg(mm[1]) : msg;
+      emitFriendly(text, kind);
+      return;
+    }
+  }
+  // Fallback: render as muted verbose line.
+  const safe = trimmed.replace(/[<>&]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c]);
+  emitFriendly('<span class="fr-verbose">' + safe + '</span>', 'verbose');
+}
+function ingestLogChunk(text) {
+  logBuf += text;
+  const lines = logBuf.split('\n');
+  logBuf = lines.pop() ?? '';
+  for (const l of lines) humanizeLine(l);
+}
+function toggleRawLog(on) {
+  logEl.style.display = on ? 'block' : 'none';
+  friendlyEl.style.display = on ? 'none' : 'flex';
+}
+// Parse whatever was already on the server before the page rendered.
+ingestLogChunk(logEl.textContent || '');
+if (logBuf) { humanizeLine(logBuf); logBuf = ''; }
 
 // Per-image state machine. Two user actions: Apply (push to S3) and
 // Regenerate (re-roll the image). State is purely about Apply progress:
@@ -2845,7 +3110,12 @@ if (document.getElementById('apply-all-btn')) refreshTotals();
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
 es.onmessage = (ev) => {
-  try { const { text } = JSON.parse(ev.data); logEl.textContent += text; logEl.scrollTop = logEl.scrollHeight; } catch {}
+  try {
+    const { text } = JSON.parse(ev.data);
+    logEl.textContent += text;
+    logEl.scrollTop = logEl.scrollHeight;
+    ingestLogChunk(text);
+  } catch {}
 };
 es.addEventListener('end', (ev) => {
   const { code } = JSON.parse(ev.data);
