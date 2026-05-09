@@ -91,6 +91,86 @@ export async function listPublishedBlogClusters(projectId: string): Promise<Clus
   return listPublishedClusters(projectId, "blog");
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// media_registry — UUID → S3 key + CDN URLs
+// ────────────────────────────────────────────────────────────────────────
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface MediaUrls {
+  "360"?: string;
+  "720"?: string;
+  "1080"?: string;
+  [size: string]: string | undefined;
+}
+
+/**
+ * Bulk-lookup CDN URLs for the supplied image_ids. Two formats supported:
+ *  - UUID image_ids (service / category) → media_registry.id
+ *  - <timestamp>_<hex> image_ids (blog inline) → media_registry.key matches
+ *    `generated-images/<id>` (the key is prefixed in the DB).
+ *
+ * Returns a Map keyed by the requested image_id (verbatim) → its `urls`
+ * JSONB. Missing rows are simply absent from the map; callers fall back
+ * to a placeholder.
+ */
+export async function lookupImageUrls(imageIds: string[]): Promise<Map<string, MediaUrls>> {
+  if (imageIds.length === 0) return new Map();
+  const uuids: string[] = [];
+  const keys: string[] = [];
+  for (const id of imageIds) {
+    if (UUID_RE.test(id)) uuids.push(id);
+    else keys.push(`generated-images/${id}`);
+  }
+  const out = new Map<string, MediaUrls>();
+  const pool = getPool();
+
+  if (uuids.length > 0) {
+    const r = await pool.query<{ id: string; urls: MediaUrls }>(
+      `SELECT id::text AS id, urls FROM media_registry WHERE id = ANY($1::uuid[])`,
+      [uuids],
+    );
+    for (const row of r.rows) out.set(row.id, row.urls ?? {});
+  }
+  if (keys.length > 0) {
+    const r = await pool.query<{ key: string; urls: MediaUrls }>(
+      `SELECT key, urls FROM media_registry WHERE key = ANY($1::text[])`,
+      [keys],
+    );
+    for (const row of r.rows) {
+      // Map back to the original image_id (strip "generated-images/" prefix).
+      const orig = row.key.replace(/^generated-images\//, "");
+      out.set(orig, row.urls ?? {});
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Project search (across the entire DB, not just the allow-list)
+// ────────────────────────────────────────────────────────────────────────
+
+export interface ProjectSearchHit {
+  id: string;
+  name: string | null;
+  url: string | null;
+  staging_subdomain: string | null;
+}
+
+export async function searchProjects(query: string, limit = 20): Promise<ProjectSearchHit[]> {
+  const q = (query ?? "").trim();
+  if (!q) return [];
+  const sql = `
+    SELECT id, name, url, staging_subdomain
+    FROM projects
+    WHERE name ILIKE $1 OR url ILIKE $1 OR staging_subdomain ILIKE $1 OR id::text = $2
+    ORDER BY (CASE WHEN name ILIKE $1 THEN 0 ELSE 1 END), u_at DESC NULLS LAST
+    LIMIT $3
+  `;
+  const res = await getPool().query<ProjectSearchHit>(sql, [`%${q}%`, q, limit]);
+  return res.rows;
+}
+
 /** How many published clusters of each page_type does this project have? */
 export async function publishedClusterCountsByPageType(
   projectId: string,

@@ -265,9 +265,12 @@ export async function inspectForSlug(
   limit: number,
   pageType: PageType = "blog",
 ): Promise<void> {
-  const entry = findClient(slug);
+  // Accept allow-list slug OR raw project_id (UUID).
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let entry = findClient(slug);
+  if (!entry && UUID_RE.test(slug)) entry = { slug, projectId: slug };
   if (!entry) {
-    process.stderr.write(`error: '${slug}' is not in the CLIENTS allow-list\n`);
+    process.stderr.write(`error: '${slug}' is not in the CLIENTS allow-list and isn't a valid UUID\n`);
     await closePool();
     process.exit(2);
   }

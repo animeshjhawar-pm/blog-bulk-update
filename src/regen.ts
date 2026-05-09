@@ -245,10 +245,14 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   loadEnv();
   const slug = options.client;
 
-  const entry = findClient(slug);
+  // Accept allow-list slug OR raw project_id (UUID). Matches the web
+  // UI's live DB search, which lets operators pick any project.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let entry = findClient(slug);
+  if (!entry && UUID_RE.test(slug)) entry = { slug, projectId: slug };
   if (!entry) {
     process.stderr.write(
-      `error: '${slug}' is not in the hardcoded CLIENTS allow-list (src/clients.ts)\n`,
+      `error: '${slug}' is not in the allow-list and isn't a valid project UUID\n`,
     );
     await closePool();
     process.exit(2);

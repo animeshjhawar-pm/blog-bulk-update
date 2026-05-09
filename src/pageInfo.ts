@@ -1,4 +1,5 @@
 import type { ClusterPageInfo, ClusterRow } from "./db.js";
+import { lookupImageUrls } from "./db.js";
 import { fetchBlogPlaceholders } from "./s3.js";
 
 export type AssetType =
@@ -473,6 +474,23 @@ export async function collectImageRecords(
       if (options.assetTypes && !options.assetTypes.has(r.asset)) continue;
       if (options.imageIds && !options.imageIds.has(r.imageId)) continue;
       records.push(r);
+    }
+  }
+
+  // Bulk-resolve real CDN preview URLs from media_registry. Synthetic
+  // cover/thumbnail ids (containing "/") are skipped; their previewUrl
+  // was already populated from page_info.thumbnail by the resolver.
+  const lookupIds = records
+    .filter((r) => !r.imageId.includes("/") && !r.previewUrl)
+    .map((r) => r.imageId);
+  if (lookupIds.length > 0) {
+    const urlMap = await lookupImageUrls(lookupIds);
+    for (const r of records) {
+      const urls = urlMap.get(r.imageId);
+      if (urls) {
+        // Prefer 720 for the drawer thumbnail; fall back through sizes.
+        r.previewUrl = urls["720"] ?? urls["1080"] ?? urls["360"] ?? r.previewUrl;
+      }
     }
   }
   return records;

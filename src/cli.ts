@@ -19,13 +19,21 @@ const ASSET_TYPES: readonly AssetType[] = [
   "generic",
 ] as const;
 
+/**
+ * Accept either an allow-list slug OR a project_id (UUID) directly.
+ * The web UI's live DB search lets operators pick any project; we
+ * mirror that here so `npm run regen --client <uuid>` works the same
+ * way the workspace URL does.
+ */
+const UUID_RE_CLI = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function requireKnownClient(slug: string): void {
-  if (!findClient(slug)) {
-    process.stderr.write(
-      `error: '${slug}' is not in the hardcoded CLIENTS allow-list. Known: ${clientSlugList().join(", ") || "(none)"}\n`,
-    );
-    process.exit(2);
-  }
+  if (findClient(slug)) return;
+  if (UUID_RE_CLI.test(slug)) return;
+  process.stderr.write(
+    `error: '${slug}' is not in the allow-list and isn't a valid project UUID. ` +
+      `Known slugs: ${clientSlugList().join(", ") || "(none)"}\n`,
+  );
+  process.exit(2);
 }
 
 function parseAssetTypes(raw: string | undefined): Set<AssetType> | undefined {
@@ -89,9 +97,10 @@ program
     requireKnownClient(opts.client);
     try {
       loadEnvOrExit();
-      const entry = findClient(opts.client);
+      let entry = findClient(opts.client);
+      if (!entry && UUID_RE_CLI.test(opts.client)) entry = { slug: opts.client, projectId: opts.client };
       if (!entry) {
-        process.stderr.write(`error: '${opts.client}' not in allow-list\n`);
+        process.stderr.write(`error: '${opts.client}' not a known slug or project_id\n`);
         process.exit(2);
       }
       const project = await lookupProjectById(entry.projectId);

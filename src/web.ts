@@ -13,6 +13,7 @@ import {
   listPublishedClusters,
   publishedClusterCountsByPageType,
   lookupProjectById,
+  searchProjects,
   type ClusterRow,
   type ProjectRow,
   type PageType,
@@ -32,6 +33,23 @@ import { uploadBlogImage } from "./s3.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
+
+/**
+ * Resolve a workspace URL "slug" to a `{ slug, projectId }` pair. The
+ * slug is usually one of the allow-listed entries (e.g. `specgas`),
+ * but the UI's live DB search lets the operator pick any project —
+ * in that case the URL slug is the project_id (UUID) directly.
+ * Returns null only if the input is neither in the allow-list nor a
+ * valid UUID.
+ */
+function resolveClient(slug: string): { slug: string; projectId: string } | null {
+  const entry = findClient(slug);
+  if (entry) return entry;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(slug)) {
+    return { slug, projectId: slug };
+  }
+  return null;
+}
 
 interface RunState {
   id: string;
@@ -252,7 +270,22 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .toggle input { margin: 0; }
   .toggle.on { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
 
-  /* /import page-type chooser */
+  /* Combobox section headers + featured pill */
+  .combobox .menu .opt-header { padding: 6px 12px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-muted); background: #f8fafc; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
+  .featured-pill { color: #b45309; font-size: 10px; vertical-align: middle; }
+
+  /* Page-type chooser modal */
+  .pt-modal {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -52%) scale(.97);
+    width: min(640px, 92vw); max-height: 80vh; overflow: hidden;
+    background: #fff; border-radius: 14px; box-shadow: var(--shadow-lg);
+    z-index: 81; display: flex; flex-direction: column;
+    opacity: 0; pointer-events: none; transition: opacity .14s, transform .14s;
+  }
+  .pt-modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
+  .pt-modal .body { overflow-y: auto; flex: 1; }
+
+  /* /import page-type chooser (legacy fallback page) */
   .pt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
   .pt-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border-strong); border-radius: 10px; cursor: pointer; transition: border-color .15s, background .15s; background: #fff; }
   .pt-row:has(input:checked) { border-color: var(--brand); background: var(--accent-bg); }
@@ -262,11 +295,16 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .pt-meta .pt-count { font-size: 12px; color: var(--ink-muted); margin-top: 2px; }
 
   /* Page-type tabs (blog / service / category) */
-  .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; }
+  .page-tab-wrap { display: inline-flex; align-items: center; }
+  .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px 0 0 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; }
+  .page-tab:not(:has(+ .page-tab-x)) { border-radius: 999px; }
+  .page-tab-wrap:not(:has(.page-tab-x)) .page-tab { border-radius: 999px; }
   .page-tab:hover { color: var(--ink); border-color: var(--border-strong); text-decoration: none; }
   .page-tab.active { background: var(--ink); color: #fff; border-color: var(--ink); }
   .page-tab .ct { font-size: 11px; opacity: .7; }
   .page-tab.active .ct { color: #cbd5e1; opacity: 1; }
+  .page-tab-x { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid var(--border); border-left: none; border-radius: 0 999px 999px 0; color: var(--ink-faint); font-size: 14px; text-decoration: none; background: #fff; }
+  .page-tab-x:hover { color: var(--err); border-color: #fca5a5; text-decoration: none; }
 
   /* Lightbox (image viewer) */
   .lightbox-overlay {
@@ -448,6 +486,61 @@ async function loadClientPickerEntries(): Promise<ClientPickerEntry[]> {
   return out;
 }
 
+interface RecentRunSummary {
+  manifest: string;
+  client: string;
+  client_name: string | null;
+  project_id: string;
+  started_at: string;
+  finished_at: string | null;
+  ok: number;
+  failed: number;
+  csv: string | null;
+  html: string | null;
+  run_id: string | null;
+}
+
+async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
+  const dir = path.resolve(process.cwd(), "out");
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  const manifests = names.filter((n) => n.startsWith("manifest-") && n.endsWith(".json"));
+  // Sort by name (timestamp suffix) descending so newest first.
+  manifests.sort().reverse();
+  const out: RecentRunSummary[] = [];
+  for (const n of manifests.slice(0, limit)) {
+    try {
+      const raw = await fs.readFile(path.join(dir, n), "utf8");
+      const j = JSON.parse(raw);
+      const csvPath = typeof j.csv === "string" ? j.csv : null;
+      const htmlPath = typeof j.html === "string" ? j.html : null;
+      // run_id is the in-memory token; not in manifest, but the CSV
+      // filename embeds <slug>-<utc-stamp>. Map that back to a stable id
+      // — operators usually want the most recent run summary regardless.
+      out.push({
+        manifest: n,
+        client: j.client ?? "",
+        client_name: j.client_name ?? null,
+        project_id: j.project_id ?? "",
+        started_at: j.started_at ?? "",
+        finished_at: j.finished_at ?? null,
+        ok: j.summary?.ok ?? 0,
+        failed: j.summary?.failed ?? 0,
+        csv: csvPath,
+        html: htmlPath,
+        run_id: null,
+      });
+    } catch {
+      /* skip corrupt manifest */
+    }
+  }
+  return out;
+}
+
 async function homePage(res: ServerResponse) {
   let envOk = true;
   try {
@@ -455,101 +548,245 @@ async function homePage(res: ServerResponse) {
   } catch {
     envOk = false;
   }
-  const entries = envOk ? await loadClientPickerEntries() : CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }));
-  const optsJson = JSON.stringify(entries);
+  const featured = envOk ? await loadClientPickerEntries() : CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }));
+  const featuredJson = JSON.stringify(featured);
+  const recent = envOk ? await loadRecentRuns(6) : [];
+  const recentRows = recent
+    .map((r) => `
+<tr>
+  <td>${esc(r.client_name ?? r.client)}</td>
+  <td><code style="font-size:11px">${esc((r.started_at ?? "").slice(0, 19))}</code></td>
+  <td>${r.finished_at ? `<span class="pill internal">${r.ok} ok</span>` : `<span class="pill infographic">running</span>`}${r.failed ? ` <span class="pill external">${r.failed} failed</span>` : ""}</td>
+  <td style="text-align:right">${r.csv ? `<a href="/files?p=${encodeURIComponent(r.csv)}">CSV</a>` : ""}${r.html ? ` · <a href="/files?p=${encodeURIComponent(r.html)}" target="_blank">report</a>` : ""}</td>
+</tr>`)
+    .join("");
 
   sendHtml(res, 200, shell("Home", `
 <section class="card">
   <h1>${esc(APP_TITLE)}</h1>
-  <div class="sub">Bulk-regenerate published-page images (blog · service · category) for any client in <code>gw_stormbreaker</code>. Pick a client, choose which page types to load, then review and apply image-by-image.</div>
+  <div class="sub">Bulk-generate replacement images for any published page (blog · service · category). Pick a client, choose which page types to load, choose which images to edit, run, review, and apply image-by-image — or all together.</div>
 </section>
 
 <section class="card">
-  <h2>Choose a client</h2>
-  <form id="import-form" onsubmit="goToImport(event)" autocomplete="off">
+  <h2>Pick a client</h2>
+  <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
     <div class="row">
       <div style="flex:2">
-        <label for="client-input">Client</label>
         <div class="combobox" id="combo">
-          <input type="text" id="client-input" placeholder="Search by project name or project ID" autocomplete="off">
+          <input type="text" id="client-input" placeholder="Search across every project — name, URL, or project_id" autocomplete="off">
           <span class="arrow">▾</span>
           <div class="menu" id="combo-menu"></div>
         </div>
-        <input type="hidden" id="client-slug" name="client" required>
+        <input type="hidden" id="client-slug">
+        <input type="hidden" id="client-project-id">
       </div>
       <div style="flex:0 0 auto">
         <button class="primary" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
     </div>
+    <div class="sub" style="margin-top:6px;font-size:12px">Featured (with pre-fetched graphic_tokens) appear on top. Other clients are searched live from the DB; their tokens get extracted on first run.</div>
   </form>
 </section>
+
+${recent.length > 0 ? `
+<section class="card">
+  <h2>Recent runs</h2>
+  <table class="cluster-list"><thead><tr>
+    <th>client</th><th>started</th><th>status</th><th style="text-align:right">artefacts</th>
+  </tr></thead><tbody>${recentRows}</tbody></table>
+</section>` : ""}
 
 <section class="card">
   <h2>How it works</h2>
   <ol class="sub" style="font-size:13px;color:var(--ink);line-height:1.7;padding-left:18px;margin:0">
-    <li>Pick a client → choose which page types to load (blog · service · category) — the workspace only shows clusters whose <code>page_status='PUBLISHED'</code>.</li>
-    <li>Search by topic or cluster_id; tick whole clusters or open a row to review individual images.</li>
-    <li>Click <strong>Dry run</strong> → log streams on a dedicated run page; new images render as they're ready.</li>
-    <li>Per-image: <strong>↻ Regenerate</strong> re-rolls in place, <strong>Apply to S3</strong> pushes the chosen image to <code>gw-content-store</code> at the canonical key keyed on <code>image_id</code>.</li>
+    <li>Pick a client.</li>
+    <li>Choose which page types to load (blog / service / category).</li>
+    <li>Choose which images to edit — tick whole clusters or open a row for individual images.</li>
+    <li>Apply the process — dry-run in seconds, live regen as long as Replicate takes.</li>
+    <li>Review the new images, then apply image-by-image or all together.</li>
   </ol>
 </section>
+
+<!-- Page-type chooser modal (opens on Continue) -->
+<div class="drawer-overlay" id="pt-overlay" onclick="closePtModal(event)" style="z-index:80"></div>
+<div id="pt-modal" class="pt-modal" role="dialog" aria-modal="true">
+  <header style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+    <h3 id="pt-title" style="margin:0;font-size:15px;font-weight:600;flex:1">Choose page types</h3>
+    <button class="ghost" onclick="hidePtModal()">×</button>
+  </header>
+  <div class="body" style="padding:18px 20px">
+    <div class="sub" style="margin-bottom:12px">Only published pages are loaded. Pick the types you want to work on; you can change this later.</div>
+    <div id="pt-loading" class="sub">loading counts…</div>
+    <div id="pt-grid" class="pt-grid" style="display:none"></div>
+  </div>
+  <footer style="padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center">
+    <span class="sub" id="pt-warn" style="color:var(--err);flex:1"></span>
+    <button onclick="hidePtModal()">Cancel</button>
+    <button class="primary" onclick="ptContinue()" id="pt-continue" disabled>Continue →</button>
+  </footer>
+</div>
 `, `<script>
-function goToImport(e) {
-  e.preventDefault();
-  if (!hidden.value) return;
-  window.location.href = '/import?client=' + encodeURIComponent(hidden.value);
+let lastSearchTimer = null;
+let modalOpen = false;
+async function searchProjects(q) {
+  if (!q || q.length < 2) return [];
+  try {
+    const r = await fetch('/api/projects/search?q=' + encodeURIComponent(q));
+    if (!r.ok) return [];
+    const j = await r.json();
+    return Array.isArray(j.hits) ? j.hits : [];
+  } catch { return []; }
 }
-const CLIENTS = ${optsJson};
+async function onContinue(e) {
+  e.preventDefault();
+  if (!hidden.value || !hiddenPid.value) return;
+  await openPtModal(hidden.value, hiddenPid.value, hiddenName.value || hidden.value);
+}
+const FEATURED = ${featuredJson};
 const inp = document.getElementById('client-input');
 const hidden = document.getElementById('client-slug');
+const hiddenPid = document.getElementById('client-project-id');
+const hiddenName = { value: '' };
 const menu = document.getElementById('combo-menu');
 const combo = document.getElementById('combo');
 const btn = document.getElementById('import-btn');
 let activeIdx = -1;
-let visible = [];
+let visible = []; // unified list (featured + db results)
 
-function render(filter) {
-  const f = filter.toLowerCase().trim();
-  visible = CLIENTS.filter(c => !f
-    || c.name.toLowerCase().includes(f)
-    || c.slug.toLowerCase().includes(f)
-    || c.projectId.toLowerCase().includes(f));
-  if (visible.length === 0) {
-    menu.innerHTML = '<div class="opt" style="color:var(--ink-faint);cursor:default">no matches</div>';
-  } else {
-    menu.innerHTML = visible.map((c, i) =>
-      '<div class="opt' + (i === activeIdx ? ' active' : '') + '" data-i="' + i + '">' +
-        '<div><strong>' + c.name + '</strong></div>' +
-        '<div class="pid">' + c.slug + ' · ' + c.projectId + '</div>' +
-      '</div>'
-    ).join('');
+function renderMenu(featured, dbHits, q) {
+  const items = [];
+  if (featured.length > 0) {
+    items.push({ kind: 'header', label: 'Featured (graphic_token pre-fetched)' });
+    for (const c of featured) items.push({ kind: 'opt', name: c.name, slug: c.slug, projectId: c.projectId, featured: true });
   }
+  if (dbHits.length > 0) {
+    items.push({ kind: 'header', label: q ? 'Search results' : 'All projects' });
+    for (const h of dbHits) items.push({ kind: 'opt', name: h.name ?? h.id, slug: '', projectId: h.id, url: h.url, featured: false });
+  }
+  visible = items.filter((x) => x.kind === 'opt');
+  if (items.length === 0) {
+    menu.innerHTML = '<div class="opt" style="color:var(--ink-faint);cursor:default">type to search across every project</div>';
+    return;
+  }
+  let html = '';
+  let optI = 0;
+  for (const it of items) {
+    if (it.kind === 'header') {
+      html += '<div class="opt-header">' + it.label + '</div>';
+    } else {
+      const idx = optI++;
+      html += '<div class="opt' + (idx === activeIdx ? ' active' : '') + '" data-i="' + idx + '">' +
+        '<div><strong>' + (it.name || '(no name)') + '</strong>' + (it.featured ? ' <span class="featured-pill">★</span>' : '') + '</div>' +
+        '<div class="pid">' + (it.slug ? it.slug + ' · ' : '') + it.projectId + (it.url ? ' · ' + it.url : '') + '</div>' +
+      '</div>';
+    }
+  }
+  menu.innerHTML = html;
 }
 function pick(i) {
   if (i < 0 || i >= visible.length) return;
   const c = visible[i];
   inp.value = c.name;
-  hidden.value = c.slug;
+  hidden.value = c.slug || c.projectId; // slug for allow-list, project_id otherwise
+  hiddenPid.value = c.projectId;
+  hiddenName.value = c.name;
   combo.classList.remove('open');
   btn.disabled = false;
 }
-inp.addEventListener('focus', () => { render(inp.value); combo.classList.add('open'); });
-inp.addEventListener('input', (e) => { hidden.value = ''; btn.disabled = true; activeIdx = -1; render(e.target.value); combo.classList.add('open'); });
+async function refresh(q) {
+  const featuredHits = FEATURED.filter((c) => !q
+    || c.name.toLowerCase().includes(q.toLowerCase())
+    || c.slug.toLowerCase().includes(q.toLowerCase())
+    || c.projectId.toLowerCase().includes(q.toLowerCase()));
+  let dbHits = [];
+  if (q && q.length >= 2) {
+    dbHits = await searchProjects(q);
+    // Drop duplicates already in featured.
+    const featuredIds = new Set(FEATURED.map((c) => c.projectId));
+    dbHits = dbHits.filter((h) => !featuredIds.has(h.id));
+  }
+  renderMenu(featuredHits, dbHits, q);
+}
+inp.addEventListener('focus', () => { refresh(inp.value); combo.classList.add('open'); });
+inp.addEventListener('input', (e) => {
+  hidden.value = ''; hiddenPid.value = ''; btn.disabled = true; activeIdx = -1;
+  combo.classList.add('open');
+  if (lastSearchTimer) clearTimeout(lastSearchTimer);
+  lastSearchTimer = setTimeout(() => refresh(e.target.value), 200);
+});
 inp.addEventListener('keydown', (e) => {
-  if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, visible.length - 1); render(inp.value); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); render(inp.value); }
+  if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, visible.length - 1); refresh(inp.value); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); refresh(inp.value); }
   else if (e.key === 'Enter') { e.preventDefault(); if (activeIdx >= 0) pick(activeIdx); else if (visible.length === 1) pick(0); }
   else if (e.key === 'Escape') combo.classList.remove('open');
 });
 menu.addEventListener('mousedown', (e) => {
   const el = e.target.closest('.opt[data-i]');
   if (!el) return;
+  e.preventDefault();
   pick(Number(el.dataset.i));
 });
 document.addEventListener('mousedown', (e) => {
   if (!combo.contains(e.target)) combo.classList.remove('open');
 });
-render('');
+
+// ── Page-type chooser modal ──
+async function openPtModal(slug, projectId, name) {
+  modalOpen = true;
+  document.getElementById('pt-title').textContent = 'Page types — ' + name;
+  document.getElementById('pt-loading').style.display = 'block';
+  document.getElementById('pt-grid').style.display = 'none';
+  document.getElementById('pt-warn').textContent = '';
+  document.getElementById('pt-modal').classList.add('open');
+  document.getElementById('pt-overlay').classList.add('open');
+
+  let counts = { blog: 0, service: 0, category: 0 };
+  try {
+    const r = await fetch('/api/page-type-counts?project_id=' + encodeURIComponent(projectId));
+    const j = await r.json();
+    if (j && j.counts) counts = j.counts;
+  } catch {}
+  const grid = document.getElementById('pt-grid');
+  const cards = [
+    { pt: 'blog',     label: 'Blog pages' },
+    { pt: 'service',  label: 'Service pages' },
+    { pt: 'category', label: 'Category pages' },
+  ].map(({ pt, label }) => {
+    const n = counts[pt] || 0;
+    return '<label class="pt-row' + (n === 0 ? ' disabled' : '') + '">' +
+      '<input type="checkbox" name="pt" value="' + pt + '" ' + (n > 0 ? 'checked' : 'disabled') + ' onchange="ptUpdate()">' +
+      '<div class="pt-meta"><div class="pt-label">' + label + '</div>' +
+      '<div class="pt-count">' + n + ' published</div></div>' +
+    '</label>';
+  }).join('');
+  grid.innerHTML = cards;
+  grid.dataset.slug = slug;
+  document.getElementById('pt-loading').style.display = 'none';
+  grid.style.display = 'grid';
+  ptUpdate();
+}
+function ptUpdate() {
+  const checks = document.querySelectorAll('#pt-grid input[name=pt]:checked');
+  document.getElementById('pt-continue').disabled = checks.length === 0;
+}
+function ptContinue() {
+  const checks = Array.from(document.querySelectorAll('#pt-grid input[name=pt]:checked')).map((c) => c.value);
+  if (checks.length === 0) { document.getElementById('pt-warn').textContent = 'pick at least one'; return; }
+  const slug = document.getElementById('pt-grid').dataset.slug;
+  const params = new URLSearchParams();
+  params.set('page_type', checks[0]);
+  if (checks.length > 1) params.set('selected', checks.join(','));
+  window.location.href = '/workspace/' + encodeURIComponent(slug) + '?' + params.toString();
+}
+function closePtModal(ev) { if (ev.target === ev.currentTarget) hidePtModal(); }
+function hidePtModal() {
+  modalOpen = false;
+  document.getElementById('pt-modal').classList.remove('open');
+  document.getElementById('pt-overlay').classList.remove('open');
+}
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modalOpen) hidePtModal(); });
+
+refresh('');
 </script>`));
 }
 
@@ -583,9 +820,9 @@ interface ClusterPayload {
  * for the first selected page_type, with the others available as tabs.
  */
 async function importPage(res: ServerResponse, slug: string) {
-  const entry = findClient(slug);
+  const entry = resolveClient(slug);
   if (!entry) {
-    sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' is not in the CLIENTS allow-list.</div>`));
+    sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' isn't a known slug or project_id.</div>`));
     return;
   }
   try {
@@ -663,9 +900,9 @@ async function workspacePage(
   pageType: PageType = "blog",
   selectedPageTypes?: Set<PageType>,
 ) {
-  const entry = findClient(slug);
+  const entry = resolveClient(slug);
   if (!entry) {
-    sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' is not in the CLIENTS allow-list.</div>`));
+    sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' isn't a known slug or project_id.</div>`));
     return;
   }
   try {
@@ -767,7 +1004,7 @@ async function workspacePage(
         .join(" ");
       return `
 <tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
-  <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onchange="onClusterCheck('${esc(c.id)}', this.checked)"></td>
+  <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onclick="onClusterCheck('${esc(c.id)}', this.checked, event)"></td>
   <td class="topic">
     <div class="t">${esc(c.topic)}</div>
     <div class="cid"><code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
@@ -821,8 +1058,22 @@ async function workspacePage(
     ? `&selected=${[...selectedPageTypes].join(",")}`
     : "";
   const tabHref = (pt: PageType) => `/workspace/${esc(slug)}?page_type=${pt}${selectedQs}`;
-  const tabBtn = (pt: PageType, label: string) =>
-    `<a class="page-tab${pageType === pt ? " active" : ""}" href="${tabHref(pt)}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
+  // Each tab has a small × that drops it from the selected set; clicking
+  // the tab itself navigates to that page_type's view. The current
+  // active tab can't be removed (would leave an empty selection).
+  const tabBtn = (pt: PageType, label: string) => {
+    const isActive = pageType === pt;
+    const closeable = !isActive;
+    const dropQs = (() => {
+      if (!selectedPageTypes || selectedPageTypes.size <= 1) return "";
+      const remaining = [...visibleTabs].filter((t) => t !== pt).join(",");
+      return remaining ? `?page_type=${pageType}&selected=${remaining}` : `?page_type=${pageType}`;
+    })();
+    return `<span class="page-tab-wrap">
+      <a class="page-tab${isActive ? " active" : ""}" href="${tabHref(pt)}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>
+      ${closeable && selectedPageTypes && selectedPageTypes.size > 1 ? `<a class="page-tab-x" href="/workspace/${esc(slug)}${dropQs}" title="remove from selection">×</a>` : ""}
+    </span>`;
+  };
 
   const body = `
 ${awsBanner}
@@ -830,9 +1081,9 @@ ${awsBanner}
   <div style="display:flex;align-items:start;gap:16px">
     ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
     <div style="flex:1">
-      <h1>${esc(project.name ?? slug)} <span style="color:var(--ink-faint);font-weight:400;font-size:14px">/ ${esc(slug)}</span></h1>
+      <h1>${esc(project.name ?? slug)}</h1>
       <div class="sub">
-        project_id <code>${esc(project.id)}</code> · ${clusters.length} published ${esc(pageType)} clusters · ${totalImages} images (${totalsBadges})
+        ${clusters.length} ${esc(pageType)} pages · ${totalImages} images (${totalsBadges})
       </div>
       <div class="page-tabs" style="margin-top:10px;display:flex;gap:6px">
         ${visibleTabs.map((pt) => tabBtn(pt, pt[0]!.toUpperCase() + pt.slice(1))).join("")}
@@ -849,66 +1100,50 @@ ${awsBanner}
 <section class="card">
   <details>
     <summary><h2 style="display:inline">Client information</h2></summary>
-    <div class="sub" style="margin:8px 0 14px">Live values from the <code>projects</code> row + the saved graphic_token. Most operators don't need to touch any of this — the workflow uses these values automatically.</div>
+    <div class="sub" style="margin:8px 0 14px">Logo + graphic_token are the only inputs the regen pipeline reads. Everything else is just shown for context.</div>
+
+    <!-- Logo: real preview + URL override + Save (auto-refreshes the
+         preview on success so the operator sees the override take). -->
+    <div style="display:flex;gap:14px;align-items:center;margin-bottom:14px">
+      <div id="logo-preview-wrap">
+        ${effectiveLogo
+          ? `<img id="logo-preview" src="${esc(effectiveLogo)}" alt="logo" style="width:72px;height:72px;border-radius:8px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:6px">`
+          : `<div id="logo-preview" style="width:72px;height:72px;border-radius:8px;background:#f8fafc;border:1px dashed var(--border-strong);display:flex;align-items:center;justify-content:center;color:var(--ink-faint);font-size:11px">no logo</div>`}
+      </div>
+      <form id="logo-form" onsubmit="saveLogo(event)" style="flex:1">
+        <label style="font-size:12px;color:var(--ink-muted)">Logo URL (overrides the project's primary_logo)</label>
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
+          <button class="primary" type="submit">Save</button>
+        </div>
+        <span id="logo-status" class="sub" style="margin-top:4px;display:inline-block"></span>
+      </form>
+    </div>
 
     <div class="info-grid">
       <div class="k">name</div>           <div class="v">${esc(project.name ?? "—")}</div>
-      <div class="k">project_id</div>     <div class="v"><code>${esc(project.id)}</code></div>
-      <div class="k">staging_subdomain</div><div class="v"><code>${esc(project.staging_subdomain ?? "—")}</code></div>
       <div class="k">homepage url</div>   <div class="v">${project.url ? `<a href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url)}</a>` : "—"}</div>
     </div>
-
-    <!-- Logo URL override lives inside Client info now (was a top-level
-         card; per spec it should be tucked away unless the operator
-         explicitly wants to override). -->
-    <details style="margin-top:14px">
-      <summary><strong style="font-size:13px">Logo URL override</strong></summary>
-      <div class="sub" style="margin:6px 0 8px">Override the logo URL fed to image-gen prompts as <code>image_input</code>. Leave blank to fall back to <code>logo_urls.primary_logo</code> from the DB.</div>
-      <form id="logo-form" onsubmit="saveLogo(event)" style="display:flex;gap:8px;align-items:center">
-        <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
-        ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="" style="width:32px;height:32px;border-radius:4px;object-fit:contain;background:#fff;border:1px solid var(--border)">` : ""}
-        <button class="primary" type="submit">Save</button>
-        <span id="logo-status" class="sub"></span>
-      </form>
-    </details>
-
-    <details style="margin-top:8px">
-      <summary><strong style="font-size:13px">company_info</strong></summary>
-      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.company_info))}</pre>
-    </details>
-    <details style="margin-top:8px">
-      <summary><strong style="font-size:13px">business_context (additional_info)</strong></summary>
-      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.additional_info))}</pre>
-    </details>
-    <details style="margin-top:8px">
-      <summary><strong style="font-size:13px">graphic_token (saved)</strong></summary>
-      ${savedToken
-        ? `<pre class="json-dump" style="margin-top:8px">${esc(fmtJson(savedToken))}</pre>`
-        : `<div class="sub" style="margin-top:8px">No saved graphic_token. Run <code>npm run extract-token -- --client ${esc(slug)}</code> to generate one.</div>`}
-    </details>
-    <details style="margin-top:8px">
-      <summary><strong style="font-size:13px">logo_urls (raw)</strong></summary>
-      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.logo_urls))}</pre>
-    </details>
-    <details style="margin-top:8px">
-      <summary><strong style="font-size:13px">design_tokens (raw)</strong></summary>
-      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.design_tokens))}</pre>
-    </details>
   </details>
 </section>
 
 <section class="card">
   <details>
-    <summary><h2 style="display:inline">Brand guidelines (optional)</h2></summary>
+    <summary>
+      <h2 style="display:inline">Brand guidelines · graphic_token</h2>
+    </summary>
     <div class="sub" style="margin:8px 0 10px">
-      Skip this if the saved <code>graphic_token</code> (under Client information above) already captures the brand.
-      Use this <em>only</em> when something specific is missing — color preferences not in the token, mandatory
-      taglines, things to avoid, etc. Free-form text gets injected into every prompt as
-      <code>business_context.client_brand_guidelines</code> and saved to
-      <code>graphic-tokens/${esc(slug)}-brand.txt</code> (gitignored).
+      The graphic_token JSON below is what the prompts read. To add brand guidelines (colors not in the token, mandatory taglines, things to avoid, etc.), type them in the box at the bottom and click <strong>Save</strong> — they're appended to the token under <code>additional_instructions</code> and become part of every prompt going forward.
     </div>
+
+    <details style="margin-bottom:12px">
+      <summary><strong style="font-size:13px">graphic_token (read-only view)</strong></summary>
+      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(savedToken))}</pre>
+    </details>
+
     <form id="brand-form" onsubmit="saveBrand(event)">
-      <textarea id="brand-text" placeholder="(skip if graphic_token is enough) e.g. Use deep navy + gold only. No stock-photo people. Always include the Sentinel mark in the footer.">${esc(brand)}</textarea>
+      <label style="font-size:12px;color:var(--ink-muted)">Append to <code>graphic_token.additional_instructions</code></label>
+      <textarea id="brand-text" style="margin-top:4px" placeholder="(optional) e.g. Use deep navy + gold only. Avoid stock-photo people. Always include the brand mark in the footer.">${esc(brand)}</textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button type="submit" class="primary">Save</button>
         <span id="brand-status" class="sub"></span>
@@ -994,9 +1229,30 @@ function imageIdsOf(clusterId) {
 }
 function clusterById(id) { return CLUSTERS.find(c => c.id === id); }
 
-function onClusterCheck(clusterId, on) {
+// Track the last-clicked cluster checkbox so shift-click extends a range.
+let lastClickedClusterId = null;
+function onClusterCheck(clusterId, on, ev) {
+  // Shift-click range select: tick (or untick) every visible row between
+  // the previous click and this one.
+  if (ev && ev.shiftKey && lastClickedClusterId && lastClickedClusterId !== clusterId) {
+    const visibleIds = visibleRows().map((tr) => tr.dataset.clusterId).filter(Boolean);
+    const a = visibleIds.indexOf(lastClickedClusterId);
+    const b = visibleIds.indexOf(clusterId);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      for (let i = lo; i <= hi; i++) {
+        const cid = visibleIds[i];
+        if (on) selection.set(cid, new Set(imageIdsOf(cid)));
+        else selection.delete(cid);
+      }
+      refreshTotals();
+      lastClickedClusterId = clusterId;
+      return;
+    }
+  }
   if (on) selection.set(clusterId, new Set(imageIdsOf(clusterId)));
   else selection.delete(clusterId);
+  lastClickedClusterId = clusterId;
   refreshTotals();
   refreshDrawerIfOpen(clusterId);
 }
@@ -1194,7 +1450,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ── Logo URL override ──
+// ── Logo URL override (auto-refreshes preview on save) ──
 async function saveLogo(e) {
   e.preventDefault();
   const url = document.getElementById('logo-url-input').value.trim();
@@ -1206,7 +1462,16 @@ async function saveLogo(e) {
       body: JSON.stringify({ logo_url: url })
     });
     if (!r.ok) throw new Error(await r.text());
-    status.textContent = 'saved ✓ (reload to see preview)';
+    const j = await r.json();
+    // Hot-swap the preview so the operator sees the override apply.
+    const wrap = document.getElementById('logo-preview-wrap');
+    const newSrc = j.effective_logo || '';
+    if (newSrc) {
+      wrap.innerHTML = '<img id="logo-preview" src="' + newSrc + '?_=' + Date.now() + '" alt="logo" style="width:72px;height:72px;border-radius:8px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:6px">';
+    } else {
+      wrap.innerHTML = '<div id="logo-preview" style="width:72px;height:72px;border-radius:8px;background:#f8fafc;border:1px dashed var(--border-strong);display:flex;align-items:center;justify-content:center;color:var(--ink-faint);font-size:11px">no logo</div>';
+    }
+    status.textContent = url ? 'saved ✓ override active' : 'saved ✓ (using project default)';
     setTimeout(() => { status.textContent = ''; }, 2200);
   } catch (err) {
     status.textContent = 'error: ' + err.message;
@@ -1360,7 +1625,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
 }
 
 async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
-  if (!findClient(slug)) return sendJson(res, 400, { error: "unknown client" });
+  if (!resolveClient(slug)) return sendJson(res, 400, { error: "unknown client" });
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   let text = "";
@@ -1370,12 +1635,33 @@ async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug:
   } catch {
     return sendJson(res, 400, { error: "invalid JSON body" });
   }
-  const target = await saveBrandGuidelines(slug, text);
-  sendJson(res, 200, { ok: true, path: target, length: text.length });
+  const trimmed = (text ?? "").trim();
+
+  // Two writes:
+  //  1) Mutate graphic-tokens/<slug>.json so prompts that already
+  //     interpolate {{graphic_token}} pick this up via
+  //     graphic_token.additional_instructions — the user's spec.
+  //  2) Keep saving the raw text to graphic-tokens/<slug>-brand.txt
+  //     so the existing regen pipeline (which reads brand guidelines
+  //     out of that file and merges into business_context) still
+  //     works without code changes elsewhere.
+  let tokenPath: string | null = null;
+  try {
+    const token = (await loadToken(slug)) ?? {};
+    if (trimmed) (token as Record<string, unknown>).additional_instructions = trimmed;
+    else delete (token as Record<string, unknown>).additional_instructions;
+    const { saveToken } = await import("./tokens.js");
+    tokenPath = await saveToken(slug, token);
+  } catch (err) {
+    process.stderr.write(`saveBrand: graphic_token append failed: ${(err as Error).message}\n`);
+  }
+  const brandPath = await saveBrandGuidelines(slug, trimmed);
+
+  sendJson(res, 200, { ok: true, brand_path: brandPath, token_path: tokenPath, length: trimmed.length });
 }
 
 async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
-  if (!findClient(slug)) return sendJson(res, 400, { error: "unknown client" });
+  if (!resolveClient(slug)) return sendJson(res, 400, { error: "unknown client" });
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   let logo_url = "";
@@ -1389,7 +1675,28 @@ async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: 
     return sendJson(res, 400, { error: "logo_url must start with http(s)://" });
   }
   const target = await saveProjectOverrides(slug, { logo_url: logo_url || undefined });
-  sendJson(res, 200, { ok: true, path: target, logo_url });
+
+  // Compute the effective logo so the client can hot-swap the preview.
+  let effective: string | null = logo_url || null;
+  if (!effective) {
+    const entry = resolveClient(slug);
+    if (entry) {
+      const project = await lookupProjectById(entry.projectId);
+      const lu = project?.logo_urls as Record<string, unknown> | null;
+      if (lu && typeof lu === "object") {
+        for (const k of ["primary_logo", "logo", "primaryLogo"]) {
+          const v = lu[k];
+          if (typeof v === "string" && v.startsWith("http")) { effective = v; break; }
+        }
+        if (!effective) {
+          for (const v of Object.values(lu)) {
+            if (typeof v === "string" && v.startsWith("http")) { effective = v; break; }
+          }
+        }
+      }
+    }
+  }
+  sendJson(res, 200, { ok: true, path: target, logo_url, effective_logo: effective });
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1485,7 +1792,7 @@ function startRegen(opts: {
 async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
   const body = await readBody(req);
   const client = body.get("client") ?? "";
-  if (!findClient(client)) {
+  if (!resolveClient(client)) {
     sendHtml(res, 400, shell("Error", `<div class="banner err">unknown client</div>`));
     return;
   }
@@ -1969,6 +2276,28 @@ export function startWebServer(port: number): void {
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
       if (method === "POST" && p === "/api/apply-one") return await applyOneHandler(req, res);
+      if (method === "GET" && p === "/api/projects/search") {
+        try {
+          loadEnv();
+          const q = url.searchParams.get("q") ?? "";
+          const limit = Math.min(20, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
+          const hits = await searchProjects(q, limit);
+          return sendJson(res, 200, { hits });
+        } catch (err) {
+          return sendJson(res, 500, { error: (err as Error).message });
+        }
+      }
+      if (method === "GET" && p === "/api/page-type-counts") {
+        try {
+          loadEnv();
+          const pid = url.searchParams.get("project_id") ?? "";
+          if (!/^[0-9a-f-]{36}$/i.test(pid)) return sendJson(res, 400, { error: "project_id required" });
+          const counts = await publishedClusterCountsByPageType(pid);
+          return sendJson(res, 200, { counts });
+        } catch (err) {
+          return sendJson(res, 500, { error: (err as Error).message });
+        }
+      }
       if (method === "GET" && p === "/runs") return runListPage(res);
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {
