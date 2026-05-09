@@ -1,0 +1,165 @@
+{
+  "brand": {
+    "name": "Sentinel Asset Management",
+    "website": "https://sentinelassetmanagementllc.com",
+    "personality_keywords": [
+      "authoritative-professional",
+      "trust-anchored",
+      "wealth-conservative",
+      "understated-premium",
+      "legacy-focused",
+      "muted-sophisticated"
+    ]
+  },
+  "extraction_note": "HTML source is a WordPress site with minimal inline styles and no embedded <style> blocks or SVG gradient definitions visible in the scraped markdown. Colour palette relies primarily on branding_json.colors, which the branding API reported with 0.9 confidence. The accent colour '#FF0000' from branding_json was demoted: pure red has no natural home in a conservative financial brand and no functional prominence evidence (no buttons, headings, or hero elements using it are confirmed in HTML source). It is excluded from the final palette. '#788D92' (secondary) is retained as a muted supporting tone. The background colour '#ECE9E4' (warm off-white/linen) is a credible light background confirmed as the site's light-scheme canvas. '#04313F' (deep teal-green) appears as primary, textPrimary, and link — all three roles pointing to the same hex, indicating it is the dominant brand colour used for text, headings, and CTAs. Font roles in branding_json.typography.fontStacks are internally inconsistent (heading stack lists 'Arpona' then 'Halyard_Display', body stack lists 'Halyard_Display') — these appear to be swapped. Cross-referencing branding_json.fonts array where Halyard Display is explicitly labelled 'heading' and Arpona is labelled 'body': treating Halyard Display as display/heading and Arpona as body, which is consistent with the fonts array. Neither font has a Google Fonts link in the HTML markdown provided, so both are sourced via json_fonts and marked accordingly. No SVG gradients, inline style hex values, or embedded CSS blocks were visible in the scraped HTML markdown. borderRadius of 5px sourced from branding_json.spacing. components object is empty in branding_json — no button component data available.",
+  "colours": {
+    "palette": [
+      {
+        "role": "primary",
+        "name": "Sentinel Deep Teal",
+        "hex": "#04313F",
+        "source": "json_colors",
+        "usage": "Dominant brand colour for headings, body text, navigation, CTAs, and section anchors. Use as the primary canvas on dark-variant backgrounds and as the headline colour on light backgrounds."
+      },
+      {
+        "role": "background_light",
+        "name": "Warm Linen",
+        "hex": "#ECE9E4",
+        "source": "json_colors",
+        "usage": "Primary page canvas for light-scheme layouts. Use as the dominant background surface for infographic panels, cover image backgrounds, and section fills."
+      },
+      {
+        "role": "secondary",
+        "name": "Slate Sage",
+        "hex": "#788D92",
+        "source": "json_colors",
+        "usage": "Supporting muted tone for subheadings, labels, secondary text, stat descriptors, dividers, and supporting UI elements. Not suitable as a dominant surface colour."
+      }
+    ],
+    "proportion_rule": "60% warm linen (#ECE9E4) canvas, 30% deep teal (#04313F) for text, headers, and structural elements, 10% slate sage (#788D92) for supporting labels, muted text, and dividers"
+  },
+  "gradients": [],
+  "typography": {
+    "fonts": [
+      {
+        "role": "display",
+        "family": "Halyard Display",
+        "source": "json_fonts",
+        "google_font_fallback": "DM Sans"
+      },
+      {
+        "role": "heading",
+        "family": "Halyard Display",
+        "source": "json_fonts",
+        "google_font_fallback": "DM Sans"
+      },
+      {
+        "role": "body",
+        "family": "Arpona",
+        "source": "json_fonts",
+        "google_font_fallback": "Lora"
+      }
+    ],
+    "hierarchy": {
+      "cover_title": {
+        "font_role": "display",
+        "weight": "700",
+        "size_range_px": "56–80",
+        "letter_spacing": "normal",
+        "text_transform": "none"
+      }
+    }
+  },
+  "design_patterns": {
+    "shape_language": {
+      "corner_radius_px": "5",
+      "dominant_shapes": [
+        "slightly-rounded-rectangle",
+        "rectangular-card",
+        "pill-button"
+      ],
+      "overall_feel": "slightly-rounded"
+    },
+    "backgrounds": {
+      "light_variant": "Solid warm linen #ECE9E4 — a neutral, warm off-white canvas with no texture or pattern confirmed in source",
+      "dark_variant": "Solid deep teal #04313F — used for dark sections, footers, and high-contrast hero panels"
+    },
+    "texture_and_pattern": {
+      "used": false,
+      "type": "none",
+      "intensity": "none",
+      "css_implementation": null
+    },
+    "shadows": {
+      "style": "none/flat",
+      "css_value": "none"
+    },
+    "borders_and_rules": {
+      "used": false,
+      "css_value": "not_found_in_source",
+      "application": "No border or rule styling confirmed in available source"
+    },
+    "decorative_elements": [
+      "Rectangular image panels (WordPress Rectangle-xx named assets) used as full-bleed or contained photo blocks within service and hero sections",
+      "Circular avatar/badge image used in event promotion section (06c3ad4c asset, 150x150px)"
+    ]
+  },
+  "iconography": {
+    "style": "not_found_in_source",
+    "stroke_weight": "not_found_in_source",
+    "colour_usage": "No icon SVG elements confirmed in scraped HTML source; likely uses #04313F deep teal or #788D92 slate sage consistent with brand palette"
+  },
+  "illustration_style": {
+    "present": false,
+    "type": "photographic",
+    "colour_treatment": "full-colour",
+    "line_quality": "none"
+  },
+  "data_visualisation": {
+    "observed_in_source": false,
+    "chart_aesthetic": "Derived from brand patterns: minimal flat style with #ECE9E4 background, #04313F axis labels and data bars, #788D92 gridlines — clean and understated with no decorative chartjunk",
+    "colour_sequence": [
+      "#04313F",
+      "#788D92",
+      "#ECE9E4"
+    ],
+    "stat_callout_format": "Large bold numeral in Halyard Display heavy weight in #04313F, small descriptor label below in Arpona regular weight in #788D92 — as observed in homepage stats (5 offices, 100+ years, 2,000+ clients)"
+  },
+  "brand_marks": {
+    "logo_type": "combination",
+    "logo_url": "https://sentinelassetmanagementllc.com/wp-content/uploads/2025/10/4a06cad629f59bb28992dbdae40c02ce3a518214.png",
+    "logo_placement_convention": "Top-left on web layout per standard WordPress header convention; centered placement suitable for social square assets"
+  },
+  "brand_guardrails": [
+    {
+      "avoid": "Using bright, saturated accent colours (e.g. red, orange, electric blue) anywhere in brand visuals",
+      "instead": "Restrict palette strictly to #04313F deep teal, #ECE9E4 warm linen, and #788D92 slate sage — all three support the brand's conservative, trust-anchored financial identity"
+    },
+    {
+      "avoid": "High-contrast neon or gradient treatments that suggest tech-startup or crypto-adjacent aesthetics",
+      "instead": "Use flat, solid colour fills on #ECE9E4 or #04313F backgrounds with no gradients — the brand has no documented gradient signature"
+    },
+    {
+      "avoid": "Decorative typefaces, script fonts, or display fonts with strong personality (e.g. slab serifs, condensed gothic)",
+      "instead": "Use Halyard Display for headings and display text, Arpona for body copy — both convey measured, professional credibility"
+    },
+    {
+      "avoid": "Rounded or playful corner radii (16px+) that create a soft, consumer-app feel",
+      "instead": "Use 5px border-radius consistently to maintain slightly-rounded, professional card and button shapes"
+    },
+    {
+      "avoid": "Dense, busy layouts with multiple competing colours, textures, or graphic elements",
+      "instead": "Use generous white/linen space on #ECE9E4 canvas with #04313F anchoring headlines and structural elements — restraint is the brand's visual language"
+    },
+    {
+      "avoid": "Photography or illustration with casual, playful, or digitally-rendered aesthetics",
+      "instead": "Use high-quality photographic imagery of people, families, and professional settings consistent with retirement and legacy planning subject matter"
+    }
+  ],
+  "generation_suffixes": {
+    "core": "Deep teal #04313F and warm linen #ECE9E4 colour system with slate sage #788D92 as a muted supporting tone. Halyard Display display typography paired with Arpona serif body text. Slightly-rounded 5px corners, flat surfaces with no gradients or textures. Conservative, trust-anchored financial authority register — understated premium, legacy-focused gravitas.",
+    "infographic": "Deep teal #04313F structural elements and stat numerals on warm linen #ECE9E4 panels, with slate sage #788D92 labels and supporting data annotations. Halyard Display bold for headline figures, Arpona for descriptive copy. Flat geometric shapes with 5px corner radius, no gradients. Authoritative and data-restrained — every element earns its place in a measured, professional financial tone.",
+    "cover_image": "Warm linen #ECE9E4 canvas with deep teal #04313F headline typography in Halyard Display bold weight. Slate sage #788D92 used for subtitle and supporting text in Arpona. Flat solid surfaces, no gradients, 5px slightly-rounded card elements. Premium conservative financial advisory tone — legacy-focused, trustworthy, quietly authoritative.",
+    "social_square": "Deep teal #04313F dominant background or warm linen #ECE9E4 canvas, with Halyard Display bold headline in contrasting tone. Slate sage #788D92 for supporting label or statistic descriptor. Flat, textureless surfaces with 5px corner radius. Concise, trust-signalling, understated-premium financial brand register — no decorative clutter."
+  }
+}

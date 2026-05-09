@@ -1,0 +1,190 @@
+{
+  "brand": {
+    "name": "Trussed AI",
+    "website": "https://trussed.ai",
+    "personality_keywords": [
+      "enterprise-authoritative",
+      "technically-precise",
+      "governance-focused",
+      "minimal-structured",
+      "professional-dark",
+      "compliance-driven"
+    ]
+  },
+  "extraction_note": "Primary HTML source was provided as rendered markdown rather than raw HTML with inline styles or embedded <style> blocks, meaning no verbatim hex codes, font-family declarations, SVG gradients, or Tailwind arbitrary-value classes were extractable from html_source. All colour values are therefore sourced from branding_json and validated against usage context described in the markdown content. branding_json.components.buttonPrimary.background is listed as #F9F8F6 (the page background cream) with textColor #FFFFFF — this appears to be a mis-read by the upstream branding API (the actual CTA 'Book Demo' button is almost certainly a dark or brand-blue fill, not the page background colour). The #374EBE secondary/blue is the most plausible CTA fill based on the button shadow value rgba(55, 78, 190, 0.2) in buttonPrimary, which decodes exactly to rgb(55,78,190) = #374EBE — this confirms #374EBE is the actual primary CTA fill. branding_json.colorScheme is listed as 'light'; the markdown content and background hex #F9F8F6 confirm a light-dominant scheme with dark text/navy, so colorScheme is accepted as light. branding_json.colors.accent is #F9F8F6 which is identical to background — this is a JSON labelling error; #F9F8F6 is the background/surface, not an accent. #374EBE functions as the true accent/CTA colour. All font values sourced from branding_json typography as no font-family declarations were present in html_source. borderRadius of 12px sourced from branding_json.components buttons as primary shape token; 2px spacing borderRadius noted but likely applies to micro-elements. No SVG gradients were present in the provided source. No CSS gradient strings were found. gradients array is empty.",
+  "colours": {
+    "palette": [
+      {
+        "role": "primary",
+        "name": "Deep Navy",
+        "hex": "#151B28",
+        "source": "json_colors",
+        "usage": "Primary brand colour for headings, hero section backgrounds, and dominant text elements; use as the main dark canvas in cover images and infographic frames"
+      },
+      {
+        "role": "accent",
+        "name": "Brand Blue",
+        "hex": "#374EBE",
+        "source": "json_colors",
+        "usage": "Primary accent and CTA fill colour; confirmed by buttonPrimary shadow rgba(55,78,190,0.2) which decodes to this exact hex; use for call-to-action elements, data highlights, stat callout numerals, and key emphasis strokes in infographics"
+      },
+      {
+        "role": "background_light",
+        "name": "Warm Off-White",
+        "hex": "#F9F8F6",
+        "source": "json_colors",
+        "usage": "Primary page background and light surface; use as base canvas for light-mode infographic backgrounds and card surfaces"
+      },
+      {
+        "role": "body_text",
+        "name": "Mid Grey",
+        "hex": "#676F7E",
+        "source": "json_colors",
+        "usage": "Body text, supporting copy, metadata labels, and secondary descriptors; use for infographic body text and supporting annotations"
+      },
+      {
+        "role": "background_dark",
+        "name": "Pure White",
+        "hex": "#FFFFFF",
+        "source": "json_components_button_secondary",
+        "usage": "Secondary button backgrounds and card surfaces against the off-white page background; use for elevated card surfaces in infographics"
+      },
+      {
+        "role": "border",
+        "name": "Light Border Grey",
+        "hex": "#DCDFE5",
+        "source": "json_components_button_secondary",
+        "usage": "Subtle border and divider colour for cards, secondary buttons, and rule separators; use as thin divider strokes in infographic layouts"
+      }
+    ],
+    "proportion_rule": "60% background tones (#F9F8F6, #FFFFFF), 25% primary navy (#151B28) for headings and structural elements, 10% body/muted text (#676F7E), 5% accent blue (#374EBE) for CTAs, highlights, and key data points"
+  },
+  "gradients": [],
+  "typography": {
+    "fonts": [
+      {
+        "role": "heading",
+        "family": "Inter",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "body",
+        "family": "Inter",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "ui",
+        "family": "Inter",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      }
+    ],
+    "hierarchy": {
+      "cover_title": {
+        "font_role": "heading",
+        "weight": "700",
+        "size_range_px": "60–72",
+        "letter_spacing": "normal",
+        "text_transform": "none"
+      }
+    }
+  },
+  "design_patterns": {
+    "shape_language": {
+      "corner_radius_px": "12",
+      "dominant_shapes": [
+        "rounded-rectangle",
+        "pill-button",
+        "card-container"
+      ],
+      "overall_feel": "slightly-rounded"
+    },
+    "backgrounds": {
+      "light_variant": "Solid warm off-white #F9F8F6 as primary canvas, white #FFFFFF for elevated card surfaces, light border #DCDFE5 for structural separation",
+      "dark_variant": "Solid deep navy #151B28 for hero sections, headers, and dark-mode panel treatments"
+    },
+    "texture_and_pattern": {
+      "used": false,
+      "type": "none",
+      "intensity": "none",
+      "css_implementation": null
+    },
+    "shadows": {
+      "style": "soft-subtle",
+      "css_value": "rgba(55, 78, 190, 0.2) 0px 4px 20px -4px"
+    },
+    "borders_and_rules": {
+      "used": true,
+      "css_value": "1px solid #DCDFE5",
+      "application": "Secondary buttons, card containers, and section dividers"
+    },
+    "decorative_elements": [
+      "Numbered step indicators (01–06) used as large typographic anchors in feature sections, rendered in brand blue #374EBE or navy #151B28",
+      "Architecture diagram with connected node layout showing control plane flow between user-facing systems, AI models, tools, and internal systems",
+      "Metric callout badges displaying performance stats (+3B Tokens/Day, <1% Compliance Violations, <20ms Latency) as prominent hero-section proof points",
+      "Compliance certification badge row (SOC 2 Type II, HIPAA, GDPR, FERPA, NIST AI RMF, ISO 27001)"
+    ]
+  },
+  "iconography": {
+    "style": "flat",
+    "stroke_weight": "not_found_in_source",
+    "colour_usage": "Icons and UI marks rendered in #374EBE accent blue or #151B28 navy against light backgrounds; muted secondary icons in #676F7E grey"
+  },
+  "illustration_style": {
+    "present": true,
+    "type": "flat-vector",
+    "colour_treatment": "uses brand palette",
+    "line_quality": "clean-geometric"
+  },
+  "data_visualisation": {
+    "observed_in_source": false,
+    "chart_aesthetic": "Minimal flat style with no visible gridlines; clean sans-serif axis labels in Inter #676F7E; data-forward presentation aligned with enterprise dashboard aesthetic",
+    "colour_sequence": [
+      "#374EBE",
+      "#151B28",
+      "#676F7E",
+      "#DCDFE5",
+      "#F9F8F6"
+    ],
+    "stat_callout_format": "Large bold numeral in Inter 700 weight in #151B28 navy or #374EBE accent blue, with compact descriptor label in Inter regular #676F7E directly below; metric value visually dominant at 2–3× label size"
+  },
+  "brand_marks": {
+    "logo_type": "combination",
+    "logo_url": "https://trussed.ai/assets/trussed-logo-vPfQkU_M.jpg",
+    "logo_placement_convention": "Top-left on page headers and cover assets; centered on social square assets"
+  },
+  "brand_guardrails": [
+    {
+      "avoid": "Decorative gradients or rainbow colour treatments not grounded in the brand palette",
+      "instead": "Use flat solid fills from the documented palette: #151B28 navy, #374EBE blue, #F9F8F6 off-white, and #676F7E grey"
+    },
+    {
+      "avoid": "Warm, playful, or rounded-organic visual styles (bubbly UI, cartoon illustration, hand-drawn strokes)",
+      "instead": "Maintain clean-geometric flat vector style with slightly-rounded 12px corners and precision-technical line quality reflecting enterprise compliance positioning"
+    },
+    {
+      "avoid": "Oversaturated or consumer-oriented colour palettes (bright orange, vivid green, neon tones)",
+      "instead": "Restrict palette to the five documented brand hexes; use #374EBE as the single accent for highlights and CTAs"
+    },
+    {
+      "avoid": "Heavy drop shadows, embossed 3D effects, or dramatic vignettes",
+      "instead": "Apply the documented soft blue-tinted shadow (rgba(55,78,190,0.2) 0px 4px 20px -4px) sparingly on interactive or elevated card elements only"
+    },
+    {
+      "avoid": "Decorative serif typefaces, display script fonts, or mixed font stacks",
+      "instead": "Use Inter exclusively across all weights; maintain typographic hierarchy with weight contrast (700 for headings, 400–500 for body) rather than typeface switching"
+    },
+    {
+      "avoid": "Light, airy, or consumer-lifestyle photographic imagery",
+      "instead": "Use technical platform UI screenshots (as in the documented trussed-platform-cropped asset), architecture diagrams, and dashboard visualisations aligned with the enterprise AI infrastructure context"
+    }
+  ],
+  "generation_suffixes": {
+    "core": "Deep navy #151B28 structural foundations with warm off-white #F9F8F6 canvas surfaces and brand blue #374EBE precision accents. Inter typeface throughout in bold geometric weight. Slightly-rounded 12px corners on all containers. Flat minimal surfaces with soft blue-tinted shadow depth. Enterprise compliance authority tone — technically precise, institutional, structured.",
+    "infographic": "Deep navy #151B28 and warm off-white #F9F8F6 palette with #374EBE blue reserved for data highlights, stat numerals, and key metric callouts. Inter bold for numeral-forward stat callouts at dominant scale, Inter regular in #676F7E for supporting labels. Flat clean-geometric vector style with subtle #DCDFE5 border rules separating data zones. Enterprise technical register — authoritative, data-forward, compliance-focused.",
+    "cover_image": "Deep navy #151B28 dominant canvas with warm off-white #F9F8F6 typographic contrast and #374EBE brand blue for title emphasis strokes or highlight treatments. Inter bold display weight for cover headline typography. Slightly-rounded 12px geometric containers. Clean flat surfaces with soft blue-shadow depth (rgba(55,78,190,0.2)). Institutional enterprise AI authority tone — precise, structured, governance-ready.",
+    "social_square": "Warm off-white #F9F8F6 or deep navy #151B28 canvas with #374EBE accent blue for focal emphasis and Inter bold typographic treatment. Flat minimal aesthetic with clean geometric shapes and 12px rounded containers. Subtle #DCDFE5 border rules for structural clarity. Compact enterprise authority tone — credible, technically grounded, compliance-assured."
+  }
+}

@@ -1,0 +1,191 @@
+{
+  "brand": {
+    "name": "ACH Engineering",
+    "website": "https://www.achengineering.com",
+    "personality_keywords": [
+      "technical-precise",
+      "industrial-professional",
+      "clean-minimal",
+      "authority-driven",
+      "bold-red-accented",
+      "structured-systematic"
+    ]
+  },
+  "extraction_note": "Primary colour #C90000 (red) confirmed in branding_json.colors.primary, buttonPrimary.background, buttonPrimary.borderColor, and link colour (#CC0000 is a near-duplicate and treated as the same brand red — only #C90000 retained as the canonical value). #428BCA (blue) appears in branding_json.colors.secondary but has no verifiable inline HTML evidence in the provided source; retained as supplementary JSON-sourced secondary with note of limited HTML validation. Background #F2F2F2 confirmed in branding_json.colors.background. Text black #000000 confirmed in branding_json.colors.textPrimary. White #FFFFFF confirmed in branding_json.components.buttonPrimary.textColor and buttonSecondary.textColor. Input field hex #112337 (dark navy text) appears only in branding_json.components.input.textColor — retained as form_text. Input border #686E77 appears only in branding_json.components.input — retained as form_border. colorScheme confirmed as light — HTML page content and background evidence (#F2F2F2) supports this. Fonts Maven Pro (body) and Poppins (heading) confirmed via branding_json.typography.fontFamilies; HTML source uses WordPress/Beaver Builder markup without explicit Google Fonts link tags visible in markdown, so both fonts marked as json_fonts source. No SVG gradient definitions found in the provided HTML source; gradients array is empty. Logo alt text 'ach-black-bold-red-hub-letters' confirms combination mark with black wordmark and red accent lettering. #CC0000 (link colour) is a near-duplicate of #C90000 and excluded from palette per anti-aliasing/near-duplicate rule — #C90000 serves as the canonical red.",
+  "colours": {
+    "palette": [
+      {
+        "role": "cta_fill",
+        "name": "ACH Red",
+        "hex": "#C90000",
+        "source": "json_components_button_primary",
+        "usage": "Primary CTA buttons ('Get a Quote', 'Talk to an Expert'), key call-to-action elements, brand accent on logo lettering. Use sparingly as the high-energy action colour."
+      },
+      {
+        "role": "background_light",
+        "name": "Light Grey Canvas",
+        "hex": "#F2F2F2",
+        "source": "json_colors",
+        "usage": "Page and section backgrounds, card surfaces, and infographic canvas base. Dominant neutral field."
+      },
+      {
+        "role": "body_text",
+        "name": "Pure Black",
+        "hex": "#000000",
+        "source": "json_colors",
+        "usage": "Primary body copy, headings on light backgrounds, and data labels."
+      },
+      {
+        "role": "cta_text",
+        "name": "Pure White",
+        "hex": "#FFFFFF",
+        "source": "json_components_button_primary",
+        "usage": "Button text on red CTA buttons, text on dark or coloured backgrounds, secondary button text and border."
+      },
+      {
+        "role": "secondary",
+        "name": "Steel Blue",
+        "hex": "#428BCA",
+        "source": "json_colors",
+        "usage": "Secondary UI accents, links, supporting informational elements. Use to complement the red accent without competing with it."
+      },
+      {
+        "role": "form_border",
+        "name": "Mid Grey",
+        "hex": "#686E77",
+        "source": "json_components_input",
+        "usage": "Form field borders, dividers, subtle rule lines, muted text labels."
+      },
+      {
+        "role": "surface",
+        "name": "White Surface",
+        "hex": "#FFFFFF",
+        "source": "json_components_button_primary",
+        "usage": "Card backgrounds, input field fills, white content panels sitting on the #F2F2F2 canvas."
+      }
+    ],
+    "proportion_rule": "65% neutrals (#F2F2F2, #FFFFFF), 25% body text and structural black (#000000), 7% accent red (#C90000), 3% secondary blue (#428BCA)"
+  },
+  "gradients": [],
+  "typography": {
+    "fonts": [
+      {
+        "role": "heading",
+        "family": "Poppins",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "body",
+        "family": "Maven Pro",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      }
+    ],
+    "hierarchy": {
+      "cover_title": {
+        "font_role": "heading",
+        "weight": "700",
+        "size_range_px": "48–64",
+        "letter_spacing": "normal",
+        "text_transform": "uppercase"
+      }
+    }
+  },
+  "design_patterns": {
+    "shape_language": {
+      "corner_radius_px": "4 (general), 25 (pill buttons), 5 (form inputs)",
+      "dominant_shapes": [
+        "pill-button",
+        "rounded-rectangle",
+        "rectangular-card"
+      ],
+      "overall_feel": "mixed"
+    },
+    "backgrounds": {
+      "light_variant": "Solid #F2F2F2 light grey as dominant page canvas with #FFFFFF white card surfaces",
+      "dark_variant": "Not prominently observed in source; no confirmed dark section background hex available"
+    },
+    "texture_and_pattern": {
+      "used": false,
+      "type": "none",
+      "intensity": "none",
+      "css_implementation": null
+    },
+    "shadows": {
+      "style": "soft-subtle",
+      "css_value": "rgba(18, 25, 97, 0.08) 0px 1px 4px 0px"
+    },
+    "borders_and_rules": {
+      "used": true,
+      "css_value": "1px solid #686E77",
+      "application": "Form input field borders; secondary button outline (#FFFFFF border on transparent background)"
+    },
+    "decorative_elements": [
+      "Pill-shaped CTA buttons with 25px border radius as a recurring interactive motif",
+      "Bold uppercase section headings creating strong visual hierarchy",
+      "Step-numbered milestone sequence (1–5) as structured process diagram element",
+      "Partner/certification logo strip (horizontal scrolling row of institution logos)"
+    ]
+  },
+  "iconography": {
+    "style": "flat",
+    "stroke_weight": "N/A",
+    "colour_usage": "Icons and UI arrows appear inline with text; colour usage not explicitly defined in source — likely inheriting body black #000000 or accent red #C90000 based on context"
+  },
+  "illustration_style": {
+    "present": true,
+    "type": "photographic",
+    "colour_treatment": "full-colour",
+    "line_quality": "none"
+  },
+  "data_visualisation": {
+    "observed_in_source": false,
+    "chart_aesthetic": "Derived from brand patterns: clean minimal axes on #F2F2F2 background, no gridline clutter, black labels in Maven Pro body font, red #C90000 highlight for primary data series",
+    "colour_sequence": [
+      "#C90000",
+      "#428BCA",
+      "#000000",
+      "#686E77",
+      "#F2F2F2"
+    ],
+    "stat_callout_format": "Large bold Poppins numeral in #C90000 or #000000 at 48–64px, supporting label in Maven Pro at 14–16px in #000000 or #686E77 beneath"
+  },
+  "brand_marks": {
+    "logo_type": "combination",
+    "logo_url": "https://www.achengineering.com/wp-content/uploads/2019/11/ach-black-bold-red-hub-letters-1.png",
+    "logo_placement_convention": "Top-left on page headers; combination mark with black 'ACH' wordmark and red 'Hub' accent lettering"
+  },
+  "brand_guardrails": [
+    {
+      "avoid": "Using gradients as a primary design element — no gradient definitions exist in the brand source",
+      "instead": "Use flat solid fills from the defined palette: #C90000 for accent, #F2F2F2 and #FFFFFF for background surfaces, #000000 for text and structural elements"
+    },
+    {
+      "avoid": "Dark or black-dominant canvas backgrounds that suggest a tech/dark-mode aesthetic",
+      "instead": "Use light grey #F2F2F2 as the dominant canvas with white #FFFFFF card surfaces — the brand is a clean, professional light-scheme identity"
+    },
+    {
+      "avoid": "Overusing red #C90000 as a fill — it is a functional CTA and accent colour, not a background or dominant field colour",
+      "instead": "Reserve #C90000 for buttons, key numerical callouts, and single emphasis elements; keep it at approximately 7% of canvas coverage"
+    },
+    {
+      "avoid": "Soft rounded corners (8–16px) on cards and containers that create a consumer/lifestyle feel",
+      "instead": "Use sharp-to-minimal rounding (4px on containers) to reinforce the industrial and technical brand character; reserve 25px pill shape exclusively for CTA buttons"
+    },
+    {
+      "avoid": "Decorative textures, noise/grain overlays, or illustrative elements that obscure the clean technical aesthetic",
+      "instead": "Maintain flat, clean surfaces with ample white space; use photography of actual cleanroom environments as the illustrative element"
+    },
+    {
+      "avoid": "Introducing new typefaces or font pairings beyond Poppins (headings) and Maven Pro (body)",
+      "instead": "Use Poppins bold for all display and heading text, Maven Pro for all body copy and data labels"
+    }
+  ],
+  "generation_suffixes": {
+    "core": "Clean industrial aesthetic on light grey #F2F2F2 canvas with white #FFFFFF panel surfaces, bold red #C90000 accent for emphasis elements, structured black #000000 typography in Poppins bold headings and Maven Pro body, sharp-to-minimal 4px corner radius on containers, pill-shaped red CTA elements, soft shadow depth, professional technical authority register.",
+    "infographic": "Light grey #F2F2F2 infographic canvas with white #FFFFFF data panels, bold red #C90000 callout numerals in heavy-weight Poppins, Maven Pro labels in #000000, flat solid fills from brand palette (#428BCA for secondary data series), sharp geometric structure with 4px container rounding, minimal flat aesthetic with no gradients or textures, technical precision tone appropriate for cleanroom and engineering industry.",
+    "cover_image": "Light grey #F2F2F2 background field with white #FFFFFF surface panels, bold red #C90000 applied to headline emphasis or accent band, display typography in heavy Poppins uppercase conveying industrial authority, Maven Pro supporting text in #000000, flat clean surfaces with soft shadow depth, no gradients or decorative textures, professional engineering sector tone with structured visual hierarchy.",
+    "social_square": "Clean #F2F2F2 or #FFFFFF canvas with bold red #C90000 accent element, heavy Poppins uppercase headline in #000000 or white on red band, Maven Pro supporting copy in #000000, flat minimal aesthetic with 4px container geometry and pill-shaped red accent detail, technical and authoritative tone suited to B2B cleanroom and controlled environment engineering audience."
+  }
+}

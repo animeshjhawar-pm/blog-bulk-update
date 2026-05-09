@@ -3,7 +3,11 @@ dist/
 .env
 .env.local
 .env.*.local
-graphic-tokens/
 out/
 *.log
 .DS_Store
+
+# graphic_tokens are pre-fetched and committed (cheap brand-extract JSON).
+# But operator-edited brand text and per-client overrides stay local.
+graphic-tokens/*-brand.txt
+graphic-tokens/*-overrides.json

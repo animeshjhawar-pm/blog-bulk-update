@@ -1,0 +1,186 @@
+{
+  "brand": {
+    "name": "SpecGas Inc.",
+    "website": "https://specgasinc.com/",
+    "personality_keywords": [
+      "technical-precision",
+      "industrial-authority",
+      "clean-utilitarian",
+      "scientific-professional",
+      "light-structured",
+      "trustworthy-reliable"
+    ]
+  },
+  "extraction_note": "HTML source was sparse — primarily page markdown with no embedded <style> blocks, no inline style attributes, no SVG gradient definitions, and no Tailwind arbitrary-value classes. All colour values derive from branding_json.colors, which was treated as the primary palette source given the absence of HTML evidence. branding_json.colors.accent (#007AFF) and branding_json.colors.link (#007AFF) are identical hex values; only one entry retained, labelled 'accent/link'. branding_json.typography fontSizes (h1: 16px, h2: 16px, body: 14px) are flagged as likely nav-link samples rather than true heading sizes — used with low confidence for hierarchy derivation. No SVG gradients, CSS gradients, embedded style blocks, or Tailwind hex classes found in the provided HTML source; gradients array is empty. components object in branding_json was empty — no button or input styling extractable. Font families (Open Sans, Montserrat, Roboto, PT Serif, Georgia) sourced from branding_json.fonts; no Google Fonts <link> or @font-face rules present in the provided HTML. colorScheme set to 'light' — consistent with branding_json and the white/light-background content visible in the markdown. No chart or data visualisation elements observed in source.",
+  "colours": {
+    "palette": [
+      {
+        "role": "primary",
+        "name": "Industrial Blue",
+        "hex": "#0072BB",
+        "source": "json_colors",
+        "usage": "Primary brand colour for headings, key UI elements, and structural emphasis in infographics and covers"
+      },
+      {
+        "role": "secondary",
+        "name": "Safety Green",
+        "hex": "#92C141",
+        "source": "json_colors",
+        "usage": "Secondary accent for supporting callouts, data highlights, success indicators, and visual contrast against blue"
+      },
+      {
+        "role": "accent",
+        "name": "Link Blue",
+        "hex": "#007AFF",
+        "source": "json_colors",
+        "usage": "Hyperlinks, interactive elements, and subtle accent highlights; close to primary blue — use sparingly to differentiate interactive states"
+      },
+      {
+        "role": "background_light",
+        "name": "Pure White",
+        "hex": "#FFFFFF",
+        "source": "json_colors",
+        "usage": "Primary canvas background for all assets; dominant neutral surface"
+      },
+      {
+        "role": "body_text",
+        "name": "Dark Charcoal",
+        "hex": "#444444",
+        "source": "json_colors",
+        "usage": "Body copy, descriptive labels, supporting text in infographics and covers"
+      }
+    ],
+    "proportion_rule": "60% white/light neutral (#FFFFFF), 30% primary industrial blue (#0072BB), 8% secondary green (#92C141), 2% accent link blue (#007AFF)"
+  },
+  "gradients": [],
+  "typography": {
+    "fonts": [
+      {
+        "role": "heading",
+        "family": "Montserrat",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "body",
+        "family": "Open Sans",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "body",
+        "family": "Roboto",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "accent",
+        "family": "PT Serif",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      },
+      {
+        "role": "accent",
+        "family": "Georgia",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      }
+    ],
+    "hierarchy": {
+      "cover_title": {
+        "font_role": "heading",
+        "weight": "700",
+        "size_range_px": "36–56",
+        "letter_spacing": "normal",
+        "text_transform": "none"
+      }
+    }
+  },
+  "design_patterns": {
+    "shape_language": {
+      "corner_radius_px": "3",
+      "dominant_shapes": [
+        "slightly-rounded-rectangle",
+        "standard-button"
+      ],
+      "overall_feel": "slightly-rounded"
+    },
+    "backgrounds": {
+      "light_variant": "solid white #FFFFFF — clean, flat, no texture or overlay observed",
+      "dark_variant": "not_found_in_source"
+    },
+    "texture_and_pattern": {
+      "used": false,
+      "type": "none",
+      "intensity": "none",
+      "css_implementation": null
+    },
+    "shadows": {
+      "style": "not_found_in_source",
+      "css_value": "not_found_in_source"
+    },
+    "borders_and_rules": {
+      "used": false,
+      "css_value": "not_found_in_source",
+      "application": "not_found_in_source"
+    },
+    "decorative_elements": [
+      "none observed in source"
+    ]
+  },
+  "iconography": {
+    "style": "not_found_in_source",
+    "stroke_weight": "not_found_in_source",
+    "colour_usage": "not_found_in_source — no inline SVG icons observed in provided HTML; likely uses #0072BB primary blue or #92C141 green based on brand palette"
+  },
+  "illustration_style": {
+    "present": true,
+    "type": "photographic",
+    "colour_treatment": "full-colour",
+    "line_quality": "none"
+  },
+  "data_visualisation": {
+    "observed_in_source": false,
+    "chart_aesthetic": "Clean, flat-style charts on white #FFFFFF background with minimal gridlines; industrial-technical register aligned with scientific sector audience",
+    "colour_sequence": [
+      "#0072BB",
+      "#92C141",
+      "#007AFF",
+      "#444444"
+    ],
+    "stat_callout_format": "Large bold Montserrat numeral in #0072BB with smaller Open Sans label in #444444 beneath"
+  },
+  "brand_marks": {
+    "logo_type": "combination",
+    "logo_url": "https://specgasinc.com/wp-content/uploads/2022/06/Specgas-Inc-Logo-Web-02.png",
+    "logo_placement_convention": "Top-left header placement; centered use appropriate for social assets"
+  },
+  "brand_guardrails": [
+    {
+      "avoid": "Dark or black canvas backgrounds — no dark-mode treatment observed in source",
+      "instead": "Use white #FFFFFF as the primary canvas with #0072BB structural elements for depth and hierarchy"
+    },
+    {
+      "avoid": "Decorative gradients or multi-colour gradient treatments — no gradient evidence found in source",
+      "instead": "Use flat solid fills of #0072BB, #92C141, and #FFFFFF for all backgrounds, shapes, and UI elements"
+    },
+    {
+      "avoid": "Highly rounded or pill-shaped design elements that suggest consumer/lifestyle brand identity",
+      "instead": "Use the documented 3px border radius for a precise, technical, slightly-rounded aesthetic appropriate for industrial and scientific audiences"
+    },
+    {
+      "avoid": "Warm colour palettes (oranges, reds, yellows) that undermine technical credibility",
+      "instead": "Anchor all assets in the cool industrial blue #0072BB and neutral white #FFFFFF, with green #92C141 as the only warm-leaning accent"
+    },
+    {
+      "avoid": "Decorative script typefaces or hand-drawn illustration styles",
+      "instead": "Use Montserrat (heading, bold) and Open Sans (body) for a precise, professional, scientifically credible typographic register"
+    }
+  ],
+  "generation_suffixes": {
+    "core": "Clean industrial colour palette: dominant white #FFFFFF canvas, structural industrial blue #0072BB, safety green #92C141 accent. Bold Montserrat headings with Open Sans body text. Precise slightly-rounded geometry with 3px radius. Flat solid fills, no gradients. Technical-professional register suited to scientific and industrial sectors.",
+    "infographic": "White #FFFFFF base with industrial blue #0072BB section headers and structural dividers, safety green #92C141 data highlights and callout numerals. Bold Montserrat for stat labels, Open Sans for supporting copy. Flat solid fills, sharp-yet-slightly-rounded 3px geometry. Technical-precision aesthetic with scientific-industrial authority.",
+    "cover_image": "White #FFFFFF primary canvas with industrial blue #0072BB dominant headline treatment and bold Montserrat display typography at heavy weight. Safety green #92C141 used as a targeted accent highlight. Flat solid colour blocks, no gradients. Slightly-rounded 3px shape language. Clean, authoritative, precision-industrial tone.",
+    "social_square": "White #FFFFFF background with bold industrial blue #0072BB Montserrat headline and safety green #92C141 accent detail. Flat solid fills, no textures or gradients. Precise 3px slightly-rounded geometry. Open Sans supporting text in dark charcoal #444444. Technical-professional, scientific-credibility register."
+  }
+}

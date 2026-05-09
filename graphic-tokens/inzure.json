@@ -1,0 +1,203 @@
+{
+  "brand": {
+    "name": "Inzure",
+    "website": "https://www.inzure.dk",
+    "personality_keywords": [
+      "dark-minimal",
+      "trust-forward",
+      "fintech-precise",
+      "consumer-advocate",
+      "bold-typographic",
+      "high-contrast"
+    ]
+  },
+  "extraction_note": "Dark colour scheme confirmed by branding_json.colorScheme='dark' and background #111111/#1B1B1B dominance in components. branding_json.textPrimary='#111111' is incorrect — this is the background colour, not text; body text on dark backgrounds is #F0E8DA (confirmed in input.textColor). #2D463C (branding_json.colors.link) has no verifiable HTML inline or SVG occurrence in the provided source — demoted and excluded from palette. #416E63 (buttonSecondary.textColor) appears in branding_json.components only — included as secondary button text with json_components_button_secondary source. SVG fills include flag colours (#0052B4, #FFDA44, #C60C30, #EEEEEE, #BE1E2D) and icon colours (#78DCB4, #C8A45A, #128D5C, #12925F) — these are decorative national flag / badge icons and do not meet palette inclusion criteria (single-use, third-party flag imagery, not brand-defining). #78DCB4 appears as an icon fill on the 'Ingen binding' checkmark SVG — included as icon_color due to functional prominence as a brand UI signal. No CSS gradients or SVG linearGradient/radialGradient brand elements found in source. Font: Bricolage Grotesque Variable confirmed via branding_json.typography.fontFamilies; no Google Fonts link tag present in provided HTML source, but Tailwind/Next.js obfuscated class context assumed given framework=tailwind — marked as json_fonts. borderRadius '33554400px' in components is a CSS pill/full-radius value (equivalent to 9999px/fully rounded). branding_json.spacing.borderRadius='0px' applies to cards/sections, not buttons. Both values retained with appropriate context.",
+  "colours": {
+    "palette": [
+      {
+        "role": "background_dark",
+        "name": "Void Black",
+        "hex": "#111111",
+        "source": "json_colors",
+        "usage": "Primary canvas background for all dark-mode layouts, hero sections, and full-bleed infographic backgrounds"
+      },
+      {
+        "role": "surface",
+        "name": "Charcoal Surface",
+        "hex": "#1B1B1B",
+        "source": "json_components_input",
+        "usage": "Elevated card surfaces, input fields, and UI component backgrounds sitting above the primary dark canvas"
+      },
+      {
+        "role": "primary",
+        "name": "Mint Green",
+        "hex": "#82E4BE",
+        "source": "json_components_button_primary",
+        "usage": "Primary CTA button fills, key stat callouts, highlight text, accent rules, and any element requiring highest visual priority"
+      },
+      {
+        "role": "body_text",
+        "name": "Warm Cream",
+        "hex": "#F0E8DA",
+        "source": "json_components_input",
+        "usage": "Primary body text, input text, and paragraph content on dark backgrounds"
+      },
+      {
+        "role": "border",
+        "name": "Dark Border",
+        "hex": "#353535",
+        "source": "json_components_input",
+        "usage": "Input field borders, card dividers, and subtle UI separators on dark surfaces"
+      },
+      {
+        "role": "cta_text",
+        "name": "Button Label Black",
+        "hex": "#111111",
+        "source": "json_components_button_primary",
+        "usage": "Text colour on mint green (#82E4BE) primary CTA buttons — ensures high contrast legibility"
+      },
+      {
+        "role": "secondary",
+        "name": "Pure White",
+        "hex": "#FFFFFF",
+        "source": "json_components_button_secondary",
+        "usage": "Secondary CTA button background, testimonial card surfaces, and high-contrast UI elements"
+      },
+      {
+        "role": "muted_text",
+        "name": "Forest Button Text",
+        "hex": "#416E63",
+        "source": "json_components_button_secondary",
+        "usage": "Secondary button text colour; use for de-emphasised labels and supporting UI text on white/light surfaces"
+      },
+      {
+        "role": "icon_color",
+        "name": "Light Mint",
+        "hex": "#78DCB4",
+        "source": "html_svg_fill",
+        "usage": "Checkmark icons and positive-signal UI indicators — slightly desaturated variant of the primary mint, used for confirmatory iconography"
+      }
+    ],
+    "proportion_rule": "65% background darks (#111111, #1B1B1B), 20% text/neutral (#F0E8DA, #FFFFFF), 10% primary accent (#82E4BE), 5% supporting tones (#353535, #416E63, #78DCB4)"
+  },
+  "gradients": [],
+  "typography": {
+    "fonts": [
+      {
+        "role": "heading",
+        "family": "Bricolage Grotesque Variable",
+        "source": "json_fonts",
+        "google_font_fallback": "Bricolage Grotesque"
+      },
+      {
+        "role": "body",
+        "family": "ui-sans-serif, system-ui, sans-serif",
+        "source": "json_fonts",
+        "google_font_fallback": "not_found_in_source"
+      }
+    ],
+    "hierarchy": {
+      "cover_title": {
+        "font_role": "heading",
+        "weight": "700",
+        "size_range_px": "48–67",
+        "letter_spacing": "normal",
+        "text_transform": "none"
+      }
+    }
+  },
+  "design_patterns": {
+    "shape_language": {
+      "corner_radius_px": "0 (cards/sections) | pill/full-radius (buttons and inputs — 9999px equivalent)",
+      "dominant_shapes": [
+        "pill-button",
+        "sharp-rectangle-card",
+        "angular-section"
+      ],
+      "overall_feel": "mixed"
+    },
+    "backgrounds": {
+      "light_variant": "Warm cream #F0E8DA solid or white #FFFFFF surface for testimonial cards and secondary UI elements",
+      "dark_variant": "Solid #111111 primary canvas with #1B1B1B elevated surface for interactive components"
+    },
+    "texture_and_pattern": {
+      "used": false,
+      "type": "none",
+      "intensity": "none",
+      "css_implementation": null
+    },
+    "shadows": {
+      "style": "none/flat",
+      "css_value": "none"
+    },
+    "borders_and_rules": {
+      "used": true,
+      "css_value": "1px solid #353535",
+      "application": "Input field borders and card/component edges on dark surfaces"
+    },
+    "decorative_elements": [
+      "Inline SVG national flag icons (EU, Danish) used as trust badges — circular/rectangular, full-colour, decorative only",
+      "Scrolling ticker/marquee strip of social proof savings claims — horizontal animated banner in high contrast",
+      "UI mockup cards embedded in content (PDF document mock, pricing comparison table mock, notification mock) — flat, sharp-cornered, dark-surfaced"
+    ]
+  },
+  "iconography": {
+    "style": "filled/solid",
+    "stroke_weight": "N/A — filled",
+    "colour_usage": "Icons use brand mint variants (#78DCB4, #82E4BE) for positive/confirmatory signals; gold (#C8A45A) for heart/loyalty; red (#C60C30) for flag/national identity. Brand UI icons default to mint family."
+  },
+  "illustration_style": {
+    "present": true,
+    "type": "photographic",
+    "colour_treatment": "full-colour",
+    "line_quality": "none"
+  },
+  "data_visualisation": {
+    "observed_in_source": true,
+    "chart_aesthetic": "Flat bar/price progression display using text-based stat rows on dark #111111 or #1B1B1B surface. No gridlines or axes visible — data presented as labelled value pairs (year + DKK amount). Clean, high-contrast, minimal. Numbers in #F0E8DA or #82E4BE on dark ground.",
+    "colour_sequence": [
+      "#82E4BE",
+      "#F0E8DA",
+      "#78DCB4",
+      "#416E63"
+    ],
+    "stat_callout_format": "Large bold DKK number in #82E4BE or #F0E8DA (Bricolage Grotesque Variable, weight 700, ~48px+), with small muted label below in body text size. Savings amounts displayed with bold emphasis against dark card surface."
+  },
+  "brand_marks": {
+    "logo_type": "wordmark",
+    "logo_url": "https://www.inzure.dk/assets/inzure-CIap5JQG.svg",
+    "logo_placement_convention": "Top-left in navigation header; centered on standalone social/cover assets"
+  },
+  "brand_guardrails": [
+    {
+      "avoid": "Gradients of any kind — no purple-to-teal, no multi-stop colour fades",
+      "instead": "Use solid #111111 or #1B1B1B dark backgrounds with flat #82E4BE mint accent elements only"
+    },
+    {
+      "avoid": "Rounded corners on cards, sections, or container blocks",
+      "instead": "Use sharp 0px corner radius for all layout containers and cards; reserve full pill-radius exclusively for buttons and input fields"
+    },
+    {
+      "avoid": "Light or white primary backgrounds — Inzure is a dark-first brand",
+      "instead": "Default to #111111 canvas with #1B1B1B surface elevation; use #F0E8DA or #FFFFFF only for small UI components or testimonial cards"
+    },
+    {
+      "avoid": "Multiple competing accent colours — do not combine mint, gold, and red as brand accents",
+      "instead": "Use #82E4BE as the sole brand accent; restrict #78DCB4 to confirmatory icons only; exclude flag/badge colours (#C8A45A, #C60C30) from brand compositions"
+    },
+    {
+      "avoid": "Decorative textures, grain overlays, or geometric background patterns",
+      "instead": "Maintain flat, clean dark surfaces with no texture — the contrast between #111111 and #82E4BE is the visual signature"
+    },
+    {
+      "avoid": "Serif typefaces or display fonts other than Bricolage Grotesque Variable",
+      "instead": "Use Bricolage Grotesque Variable for all headings and display text; fall back to system sans-serif for body copy"
+    }
+  ],
+  "generation_suffixes": {
+    "core": "Deep void-black #111111 canvas with charcoal #1B1B1B surface elevation and mint-green #82E4BE accent highlights. Bricolage Grotesque Variable typography in bold weight. Sharp-edged geometric layout with pill-shaped CTA elements. Flat, texture-free surfaces. High-contrast, consumer-advocacy fintech tone.",
+    "infographic": "Deep void-black #111111 background with #1B1B1B raised data panels. Mint-green #82E4BE used for key statistics, callout numbers, and data highlight bars. Warm cream #F0E8DA for supporting labels and body text. Bricolage Grotesque Variable bold for numerical callouts. Sharp-cornered data containers, flat and texture-free. High-contrast, authoritative, trust-signal aesthetic.",
+    "cover_image": "Void-black #111111 full-bleed canvas with mint-green #82E4BE headline emphasis and warm cream #F0E8DA supporting text. Bricolage Grotesque Variable in heavy bold weight for display headlines. Sharp geometric containment shapes with no rounded cards. Flat surface treatment, no gradients or textures. Consumer-advocacy fintech authority tone — direct, bold, and transparent.",
+    "social_square": "Void-black #111111 background with mint-green #82E4BE as the dominant accent colour for key message emphasis. Warm cream #F0E8DA for secondary text. Bricolage Grotesque Variable bold typography. Flat, sharp-cornered graphic elements with pill-shaped badge or label treatments. No texture, no gradients. High-contrast, modern Scandinavian fintech aesthetic."
+  }
+}
