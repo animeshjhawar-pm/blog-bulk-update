@@ -254,12 +254,71 @@ function thumbnailRecord(cluster: ClusterRow): ImageRecord {
 // Inline-image resolution: S3 → DB Shape A → Shape B
 // ────────────────────────────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────────────────────────────
+// Shape MDX — page_info.blog_text.md with <Image imageId="<UUID>" alt="…"/>
+// (Sentinel-style template; the UUID maps to media_registry for the
+// real CDN URL.)
+// ────────────────────────────────────────────────────────────────────────
+
+const MDX_IMAGE_TAG_RE =
+  /<Image\b[^>]*?\bimageId\s*=\s*"([^"]+)"[^>]*?(?:alt\s*=\s*"([^"]*)")?[^>]*?\/>/gi;
+
+interface MdxImageTag {
+  imageId: string;
+  alt: string;
+}
+
+function scanMdxImageTags(md: string): MdxImageTag[] {
+  const out: MdxImageTag[] = [];
+  for (const m of md.matchAll(MDX_IMAGE_TAG_RE)) {
+    const imageId = (m[1] ?? "").trim();
+    if (!imageId) continue;
+    out.push({ imageId, alt: (m[2] ?? "").trim() });
+  }
+  return out;
+}
+
+function blogTextMd(pi: ClusterPageInfo): string | null {
+  const bt = pi.blog_text;
+  if (typeof bt === "string") return bt;
+  if (bt && typeof bt === "object" && typeof (bt as { md?: unknown }).md === "string") {
+    return (bt as { md: string }).md;
+  }
+  return null;
+}
+
+/**
+ * Convert MDX <Image> tags to ImageRecords. Convention (per the user's
+ * spec for Sentinel-style blogs):
+ *   1st tag → cover
+ *   subsequent tags → infographic
+ * (page_info.thumbnail is handled separately by thumbnailRecord.)
+ */
+function mdxToRecords(cluster: ClusterRow, tags: MdxImageTag[]): ImageRecord[] {
+  const out: ImageRecord[] = [];
+  tags.forEach((t, i) => {
+    const asset: AssetType = i === 0 ? "cover" : "infographic";
+    out.push({
+      cluster,
+      asset,
+      imageId: t.imageId,
+      description: t.alt,
+      aspectRatio: DEFAULT_ASPECT[asset],
+      // Reuse the s3-shape-A enum for now — these aren't <image_requirement>
+      // tags but they share the same downstream shape (image-id keyed
+      // record from page_info content).
+      source: "s3-shape-A",
+    });
+  });
+  return out;
+}
+
 async function inlineRecordsForCluster(
   cluster: ClusterRow,
   stagingSubdomain: string | null,
   cache: Map<string, string | null>,
 ): Promise<ImageRecord[]> {
-  // 1. S3 markdown (canonical source for blog clusters).
+  // 1. S3 markdown (canonical for the IMAGE_PLACEHOLDER flow).
   if (stagingSubdomain) {
     let body: string | null;
     if (cache.has(cluster.id)) {
@@ -288,7 +347,17 @@ async function inlineRecordsForCluster(
   const dbTags = scanRequirementTags(piText);
   if (dbTags.length > 0) return shapeAToRecords(cluster, dbTags, "db-shape-A");
 
-  // 3. Shape B: tree walk for image-shaped objects
+  // 3. MDX shape — page_info.blog_text.md with <Image imageId="…"/> tags.
+  // This is Sentinel's actual template. Each tag's UUID maps to
+  // media_registry for a real CDN URL; the per-cluster classifier
+  // below makes the 1st MDX Image the "cover".
+  const md = blogTextMd(cluster.page_info ?? {});
+  if (md) {
+    const mdxTags = scanMdxImageTags(md);
+    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags);
+  }
+
+  // 4. Shape B: tree walk for image-shaped objects
   const bHits = walkShapeB(cluster.page_info);
   if (bHits.length > 0) return shapeBToRecords(cluster, bHits);
 
@@ -453,9 +522,18 @@ async function recordsForClusterByType(
 ): Promise<ImageRecord[]> {
   if (pageType === "service") return serviceRecords(cluster);
   if (pageType === "category") return categoryRecords(cluster);
-  // Default = blog: cover + thumbnail (synthesized) + Shape-A inline.
+
+  // Blog: page_info.thumbnail is the thumbnail (synthesized record); the
+  // inline parser may already supply a real "cover" (Sentinel-style MDX
+  // 1st-image convention). When it does, drop the synthetic cover so we
+  // don't render two covers per cluster.
   const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
-  return [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
+  const inlineProvidesCover = inline.some((r) => r.asset === "cover");
+  const out: ImageRecord[] = [];
+  if (!inlineProvidesCover) out.push(coverRecord(cluster));
+  out.push(thumbnailRecord(cluster));
+  out.push(...inline);
+  return out;
 }
 
 export async function collectImageRecords(
@@ -496,5 +574,43 @@ export async function collectImageRecords(
       }
     }
   }
+
+  // Fallback for clusters whose S3 markdown carries placeholder ids
+  // that haven't been re-keyed into media_registry yet (e.g., Sentinel
+  // template). The MDX `<Image imageId="<UUID>"/>` tags in
+  // page_info.blog_text.md DO map to media_registry, so pair them with
+  // the still-null records by document-order index.
+  // The id we surface to the receiving PM stays the original (from S3
+  // markdown / Shape A / Shape B) — only the previewUrl borrows the
+  // MDX-resolved CDN URL.
+  const stillMissing = records.filter((r) => !r.previewUrl && !r.imageId.includes("/"));
+  if (stillMissing.length > 0) {
+    // Group by cluster.
+    const byCluster = new Map<string, ImageRecord[]>();
+    for (const r of stillMissing) {
+      if (!byCluster.has(r.cluster.id)) byCluster.set(r.cluster.id, []);
+      byCluster.get(r.cluster.id)!.push(r);
+    }
+    for (const [, missingForCluster] of byCluster) {
+      const cluster = missingForCluster[0]!.cluster;
+      const md = blogTextMd(cluster.page_info ?? {});
+      if (!md) continue;
+      const mdxTags = scanMdxImageTags(md);
+      if (mdxTags.length === 0) continue;
+      const mdxUrls = await lookupImageUrls(mdxTags.map((t) => t.imageId));
+      const orderedMdxRecords = mdxTags.map((t) => mdxUrls.get(t.imageId));
+      // Pair by document-order index: missingForCluster[i] borrows the
+      // URL from orderedMdxRecords[i]. If counts differ, we just stop
+      // at the shorter array — better some previews than none.
+      const len = Math.min(missingForCluster.length, orderedMdxRecords.length);
+      for (let i = 0; i < len; i++) {
+        const urls = orderedMdxRecords[i];
+        if (!urls) continue;
+        missingForCluster[i]!.previewUrl =
+          urls["720"] ?? urls["1080"] ?? urls["360"] ?? undefined;
+      }
+    }
+  }
+
   return records;
 }

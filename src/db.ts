@@ -125,10 +125,10 @@ export interface MediaUrls {
 export async function lookupImageUrls(imageIds: string[]): Promise<Map<string, MediaUrls>> {
   if (imageIds.length === 0) return new Map();
   const uuids: string[] = [];
-  const keys: string[] = [];
+  const hashIds: string[] = [];
   for (const id of imageIds) {
     if (UUID_RE.test(id)) uuids.push(id);
-    else keys.push(`generated-images/${id}`);
+    else hashIds.push(id);
   }
   const out = new Map<string, MediaUrls>();
   const pool = getPool();
@@ -140,14 +140,28 @@ export async function lookupImageUrls(imageIds: string[]): Promise<Map<string, M
     );
     for (const row of r.rows) out.set(row.id, row.urls ?? {});
   }
-  if (keys.length > 0) {
+
+  // Hash-shaped image_ids (e.g. "1775738395157117_94580...") can live
+  // under several key prefixes:
+  //   generated-images/<hash>            (service H1, blog cover/infographic via flat layout)
+  //   refined-images/<hash>              (service body or fallback service variants)
+  //   blog-images/<cluster_id>/<hash>    (Sentinel-style blog images)
+  // We don't always know the cluster up front, so do a single suffix
+  // match — the trailing `/<hash>` is unique enough (timestamp + 32 hex).
+  if (hashIds.length > 0) {
+    // PostgreSQL doesn't support `LIKE ANY(...)` directly; we OR
+    // against a small per-call set instead. With many IDs this builds
+    // one statement with all `%/<id>` patterns.
+    const patterns = hashIds.map((id) => `%/${id}`);
     const r = await pool.query<{ key: string; urls: MediaUrls }>(
-      `SELECT key, urls FROM media_registry WHERE key = ANY($1::text[])`,
-      [keys],
+      `SELECT key, urls FROM media_registry
+       WHERE key LIKE ANY($1::text[])`,
+      [patterns],
     );
     for (const row of r.rows) {
-      // Map back to the original image_id (strip "generated-images/" prefix).
-      const orig = row.key.replace(/^generated-images\//, "");
+      // Map back to the original image_id by extracting the suffix
+      // after the last "/".
+      const orig = row.key.split("/").pop() ?? row.key;
       out.set(orig, row.urls ?? {});
     }
   }

@@ -585,6 +585,8 @@ async function homePage(res: ServerResponse) {
 </section>
 
 <section class="card">
+  <h2 style="margin-bottom:8px">Search a client</h2>
+  <div class="sub" style="margin-bottom:10px">A handful of featured clients have their <code>graphic_token</code> pre-saved (loads instantly). For any other project, the token is extracted on the fly the first time you click Continue — it adds ~30 seconds to that one-time import.</div>
   <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
     <div class="row">
       <div style="flex:2">
@@ -1034,13 +1036,21 @@ async function workspacePage(
     try { return JSON.stringify(v, null, 2); } catch { return String(v); }
   }
   const logoUrls = (project.logo_urls ?? null) as Record<string, unknown> | null;
-  const primaryLogo =
-    (logoUrls && typeof logoUrls === "object"
-      ? (logoUrls.primary_logo ??
-         logoUrls.logo ??
-         logoUrls.primaryLogo ??
-         Object.values(logoUrls).find((v) => typeof v === "string" && (v as string).startsWith("http")))
-      : null) as string | null | undefined;
+  // The "favicon" — small timestamped logo from projects.logo_urls.
+  // Used only as the small badge next to the project name in the header.
+  const faviconLogo = (logoUrls && typeof logoUrls === "object"
+    ? (logoUrls.favicon ??
+       logoUrls.primary_logo ??
+       logoUrls.logo ??
+       logoUrls.primaryLogo ??
+       Object.values(logoUrls).find((v) => typeof v === "string" && (v as string).startsWith("http")))
+    : null) as string | null | undefined;
+  // The canonical brand logo (image-gen `image_input`). This is the
+  // well-known asset/logo/logo.webp path per staging_subdomain — a real
+  // logo file rather than a 16×16 favicon. Operators can override.
+  const primaryLogo = project.staging_subdomain
+    ? `https://file-host.link/website/${project.staging_subdomain}/assets/logo/logo.webp`
+    : null;
 
   const awsBanner = hasAwsCreds
     ? ""
@@ -1091,7 +1101,7 @@ async function workspacePage(
 ${awsBanner}
 <section class="card">
   <div style="display:flex;align-items:start;gap:16px">
-    ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
+    ${faviconLogo ? `<img src="${esc(faviconLogo)}" alt="" style="width:36px;height:36px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:3px;flex:0 0 auto" onerror="this.style.display='none'">` : ""}
     <div style="flex:1">
       <h1>${esc(project.name ?? slug)}</h1>
       <div class="sub">

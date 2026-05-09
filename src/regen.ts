@@ -49,10 +49,21 @@ export interface RegenOptions {
 }
 
 function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
-  // Operator-edited override always wins. Saved at
-  // graphic-tokens/<slug>-overrides.json by the workspace UI.
+  // Operator-edited override always wins.
   if (override && override.startsWith("http")) return override;
 
+  // Canonical brand logo (the asset image-gen prompts should use as
+  // image_input) is at the well-known per-staging path
+  //   https://file-host.link/website/<staging>/assets/logo/logo.webp
+  // We prefer this over the timestamped favicon-style entries in
+  // projects.logo_urls because the latter are usually 16×16 favicon
+  // PNGs that produce poor results when fed to Replicate as a
+  // reference image.
+  if (project.staging_subdomain) {
+    return `https://file-host.link/website/${project.staging_subdomain}/assets/logo/logo.webp`;
+  }
+
+  // Last-resort fallback: anything in projects.logo_urls.
   const lu = project.logo_urls as Record<string, unknown> | null;
   if (!lu || typeof lu !== "object") return null;
   for (const k of ["primary_logo", "logo", "primaryLogo"]) {
