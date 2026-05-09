@@ -138,6 +138,7 @@ program
   .addOption(
     new Option("--page-type <type>", "which page_type to regen for the client").choices(["blog", "service", "category"]).default("blog"),
   )
+  .option("--run-id <id>", "stamp this run with a stable id (web UI uses this to link to /runs/<id> after a server restart)")
   .option("--mock", "skip Portkey + image generation; emit synthetic prompts and picsum.photos URLs (UX validation, no API spend)", false)
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
@@ -152,6 +153,7 @@ program
       clusterIds?: string;
       imageIds?: string;
       pageType?: "blog" | "service" | "category";
+      runId?: string;
       mock?: boolean;
       provider?: Provider;
       concurrency: string;
@@ -171,6 +173,7 @@ program
           clusterIds,
           imageIds,
           pageType: opts.pageType ?? "blog",
+          runId: opts.runId,
           mock: Boolean(opts.mock),
           provider: opts.provider,
           concurrency,

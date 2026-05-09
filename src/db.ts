@@ -56,33 +56,41 @@ export async function lookupProjectById(projectId: string): Promise<ProjectRow |
  */
 export type ClusterPageInfo = Record<string, unknown>;
 
+export type PageType = "blog" | "service" | "category";
+
 export interface ClusterRow {
   id: string;
   topic: string | null;
   page_info: ClusterPageInfo | null;
   updated_at: Date;
+  /** Which page_type this cluster belongs to (carried so the combined
+   * multi-page-type list can render a per-row pill without a refetch). */
+  page_type: PageType;
 }
-
-export type PageType = "blog" | "service" | "category";
 
 /**
  * Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
  * (uppercase), clusters.u_at (not updated_at). Page-status filter is enforced
  * for every page_type — we never surface unpublished clusters in the UI.
+ *
+ * Accepts a single page_type or an array. When an array is passed the
+ * results are merged in u_at-DESC order (newest first across types).
  */
 export async function listPublishedClusters(
   projectId: string,
-  pageType: PageType = "blog",
+  pageType: PageType | PageType[] = "blog",
 ): Promise<ClusterRow[]> {
+  const types = Array.isArray(pageType) ? pageType : [pageType];
+  if (types.length === 0) return [];
   const sql = `
-    SELECT id, topic, page_info, u_at AS updated_at
+    SELECT id, topic, page_info, u_at AS updated_at, page_type
     FROM clusters
     WHERE p_id = $1::uuid
-      AND page_type = $2
+      AND page_type = ANY($2::text[])
       AND page_status = 'PUBLISHED'
     ORDER BY u_at DESC
   `;
-  const res = await getPool().query<ClusterRow>(sql, [projectId, pageType]);
+  const res = await getPool().query<ClusterRow>(sql, [projectId, types]);
   return res.rows;
 }
 

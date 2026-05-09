@@ -33,6 +33,9 @@ export interface RegenOptions {
   imageIds?: Set<string>;
   /** Defaults to "blog". */
   pageType?: PageType;
+  /** When set, persisted to the manifest so the web UI can link
+   * `/runs/<id>` back to this run after a server restart. */
+  runId?: string;
   provider?: Provider;
   concurrency: number;
   /**
@@ -340,6 +343,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
 
   const startedAt = new Date().toISOString();
   const baseManifest = {
+    run_id: options.runId ?? null,
     client: slug,
     client_name: project.name,
     project_id: project.id,

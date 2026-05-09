@@ -464,12 +464,15 @@ export async function collectImageRecords(
 ): Promise<ImageRecord[]> {
   const cache = options.s3Cache ?? new Map<string, string | null>();
   const stagingSubdomain = options.stagingSubdomain ?? null;
-  const pageType: PageType = options.pageType ?? "blog";
+  // Per-cluster dispatch uses the cluster's own page_type. Falls back to
+  // options.pageType (or "blog") if the cluster row didn't carry one.
+  const fallbackPageType: PageType = options.pageType ?? "blog";
 
   const records: ImageRecord[] = [];
   for (const cluster of clusters) {
     if (options.clusterIds && !options.clusterIds.has(cluster.id)) continue;
-    const rows = await recordsForClusterByType(cluster, pageType, stagingSubdomain, cache);
+    const pt: PageType = cluster.page_type ?? fallbackPageType;
+    const rows = await recordsForClusterByType(cluster, pt, stagingSubdomain, cache);
     for (const r of rows) {
       if (options.assetTypes && !options.assetTypes.has(r.asset)) continue;
       if (options.imageIds && !options.imageIds.has(r.imageId)) continue;

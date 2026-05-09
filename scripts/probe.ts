@@ -1,36 +1,44 @@
 import { loadEnv } from "../src/env.js";
-import { Pool } from "pg";
+import { listPublishedClusters, lookupImageUrls, closePool } from "../src/db.js";
+import { collectImageRecords } from "../src/pageInfo.js";
 
 loadEnv();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
 
-async function main() {
-  const cols = await pool.query(
-    `SELECT column_name, data_type FROM information_schema.columns
-     WHERE table_name = 'media_registry' ORDER BY ordinal_position`,
-  );
-  console.log("media_registry columns:");
-  for (const r of cols.rows) console.log("  -", r.column_name, "(" + r.data_type + ")");
+async function audit(slug: string, projectId: string) {
+  console.log(`\n=== ${slug} (${projectId}) ===`);
 
-  // Test lookup with the known service-page UUID and a category UUID.
-  for (const id of [
-    "12e80b1a-9630-41ee-b381-ed554f30c131", // UnleashX service H1
-    "8ac6fe7c-aa3c-450b-8f27-33f50c0eaab5", // The Mesh Nest category industry
-  ]) {
-    const r = await pool.query(`SELECT * FROM media_registry WHERE id = $1::uuid LIMIT 1`, [id]);
-    console.log(`\nlookup ${id}:`);
-    if (r.rows.length === 0) {
-      // try id::text or other column names
-      const fallback = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = 'media_registry'`,
-      );
-      console.log("  no hit by id; columns are:", fallback.rows.map((x) => x.column_name));
-    } else {
-      for (const row of r.rows) console.log("  ", JSON.stringify(row, null, 2).slice(0, 500));
+  for (const pageType of ["blog", "service", "category"] as const) {
+    const clusters = await listPublishedClusters(projectId, pageType);
+    if (clusters.length === 0) {
+      console.log(`  ${pageType}: 0 clusters`);
+      continue;
+    }
+    const records = await collectImageRecords(clusters, { pageType });
+    const byAsset: Record<string, number> = {};
+    for (const r of records) byAsset[r.asset] = (byAsset[r.asset] ?? 0) + 1;
+    const withPreview = records.filter((r) => r.previewUrl).length;
+    const expected = pageType === "blog"
+      ? `cover ${clusters.length} + thumbnail ${clusters.length} + N inline (variable)`
+      : pageType === "service"
+        ? `up to ${clusters.length * 2} (H1 + body per cluster)`
+        : `variable (one per industry item)`;
+    console.log(`  ${pageType}: ${clusters.length} clusters → ${records.length} image records (expected: ${expected})`);
+    console.log(`    by asset:`, byAsset);
+    console.log(`    with real previewUrl: ${withPreview}/${records.length}`);
+    // Show first cluster's records for sanity
+    if (records.length > 0) {
+      const firstCluster = records[0]!.cluster.id;
+      const sample = records.filter((r) => r.cluster.id === firstCluster);
+      console.log(`    cluster ${firstCluster}: ${sample.length} records`);
+      for (const r of sample) {
+        console.log(`      - ${r.asset} ${r.imageId} preview=${r.previewUrl ? "YES" : "no"}`);
+      }
     }
   }
 }
-main().then(() => pool.end()).catch(async (e) => { console.error(e); await pool.end(); process.exit(1); });
+
+async function main() {
+  await audit("specgas", "c56bcf16-262c-41e4-8a34-4f14f7d4c579");
+}
+
+main().then(() => closePool()).catch(async (e) => { console.error(e); await closePool(); process.exit(1); });

@@ -271,8 +271,13 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .toggle.on { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
 
   /* Combobox section headers + featured pill */
-  .combobox .menu .opt-header { padding: 6px 12px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-muted); background: #f8fafc; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
-  .featured-pill { color: #b45309; font-size: 10px; vertical-align: middle; }
+  .combobox .menu .opt-header { padding: 6px 12px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-muted); background: #f8fafc; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1; }
+  .featured-pill { color: #b45309; font-size: 10px; vertical-align: middle; margin-left: 4px; }
+
+  /* Per-cluster page_type pill (tiny, neutral) */
+  .pill.pt-blog     { background: #dbeafe; color: #1e40af; padding: 0 6px; font-size: 10px; }
+  .pill.pt-service  { background: #ede9fe; color: #5b21b6; padding: 0 6px; font-size: 10px; }
+  .pill.pt-category { background: #fef3c7; color: #92400e; padding: 0 6px; font-size: 10px; }
 
   /* Page-type chooser modal */
   .pt-modal {
@@ -532,7 +537,7 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
         failed: j.summary?.failed ?? 0,
         csv: csvPath,
         html: htmlPath,
-        run_id: null,
+        run_id: typeof j.run_id === "string" ? j.run_id : null,
       });
     } catch {
       /* skip corrupt manifest */
@@ -552,28 +557,39 @@ async function homePage(res: ServerResponse) {
   const featuredJson = JSON.stringify(featured);
   const recent = envOk ? await loadRecentRuns(6) : [];
   const recentRows = recent
-    .map((r) => `
-<tr>
-  <td>${esc(r.client_name ?? r.client)}</td>
-  <td><code style="font-size:11px">${esc((r.started_at ?? "").slice(0, 19))}</code></td>
-  <td>${r.finished_at ? `<span class="pill internal">${r.ok} ok</span>` : `<span class="pill infographic">running</span>`}${r.failed ? ` <span class="pill external">${r.failed} failed</span>` : ""}</td>
-  <td style="text-align:right">${r.csv ? `<a href="/files?p=${encodeURIComponent(r.csv)}">CSV</a>` : ""}${r.html ? ` · <a href="/files?p=${encodeURIComponent(r.html)}" target="_blank">report</a>` : ""}</td>
-</tr>`)
+    .map((r) => {
+      const started = (r.started_at ?? "").slice(0, 19).replace("T", " ");
+      const status = !r.finished_at
+        ? `<span class="pill infographic">running</span>`
+        : r.failed > 0
+          ? `<span class="pill external">${r.failed} failed</span>`
+          : `<span class="pill internal">${r.ok} ok</span>`;
+      const linkable = r.run_id;
+      const cellOpen = linkable
+        ? `<a href="/runs/${esc(r.run_id!)}" style="display:contents;text-decoration:none;color:inherit">`
+        : "";
+      const cellClose = linkable ? `</a>` : "";
+      return `
+<tr class="recent-row" ${linkable ? `onclick="location='/runs/${esc(r.run_id!)}'" style="cursor:pointer"` : ""}>
+  <td>${cellOpen}${esc(r.client_name ?? r.client)}${cellClose}</td>
+  <td>${cellOpen}<code style="font-size:11px">${esc(started)}</code>${cellClose}</td>
+  <td>${cellOpen}${status}${cellClose}</td>
+  <td style="text-align:right">${linkable ? `<a href="/runs/${esc(r.run_id!)}">open run ↗</a>` : `${r.csv ? `<a href="/files?p=${encodeURIComponent(r.csv)}">CSV</a>` : ""}`}</td>
+</tr>`;
+    })
     .join("");
 
   sendHtml(res, 200, shell("Home", `
 <section class="card">
-  <h1>${esc(APP_TITLE)}</h1>
-  <div class="sub">Bulk-generate replacement images for any published page (blog · service · category). Pick a client, choose which page types to load, choose which images to edit, run, review, and apply image-by-image — or all together.</div>
+  <h1 style="margin-bottom:0">${esc(APP_TITLE)}</h1>
 </section>
 
 <section class="card">
-  <h2>Pick a client</h2>
   <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
     <div class="row">
       <div style="flex:2">
         <div class="combobox" id="combo">
-          <input type="text" id="client-input" placeholder="Search across every project — name, URL, or project_id" autocomplete="off">
+          <input type="text" id="client-input" placeholder="Search a client — name, URL, or project_id" autocomplete="off">
           <span class="arrow">▾</span>
           <div class="menu" id="combo-menu"></div>
         </div>
@@ -584,28 +600,14 @@ async function homePage(res: ServerResponse) {
         <button class="primary" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
     </div>
-    <div class="sub" style="margin-top:6px;font-size:12px">Featured (with pre-fetched graphic_tokens) appear on top. Other clients are searched live from the DB; their tokens get extracted on first run.</div>
   </form>
 </section>
 
 ${recent.length > 0 ? `
-<section class="card">
-  <h2>Recent runs</h2>
-  <table class="cluster-list"><thead><tr>
-    <th>client</th><th>started</th><th>status</th><th style="text-align:right">artefacts</th>
-  </tr></thead><tbody>${recentRows}</tbody></table>
+<section class="card" style="padding:0">
+  <div style="padding:12px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center"><h2 style="margin:0">Recent runs</h2></div>
+  <table class="cluster-list"><tbody>${recentRows}</tbody></table>
 </section>` : ""}
-
-<section class="card">
-  <h2>How it works</h2>
-  <ol class="sub" style="font-size:13px;color:var(--ink);line-height:1.7;padding-left:18px;margin:0">
-    <li>Pick a client.</li>
-    <li>Choose which page types to load (blog / service / category).</li>
-    <li>Choose which images to edit — tick whole clusters or open a row for individual images.</li>
-    <li>Apply the process — dry-run in seconds, live regen as long as Replicate takes.</li>
-    <li>Review the new images, then apply image-by-image or all together.</li>
-  </ol>
-</section>
 
 <!-- Page-type chooser modal (opens on Continue) -->
 <div class="drawer-overlay" id="pt-overlay" onclick="closePtModal(event)" style="z-index:80"></div>
@@ -796,6 +798,7 @@ refresh('');
 
 interface ClusterPayload {
   id: string;
+  page_type: PageType;
   topic: string;
   updated_at: string | null;
   cover_url: string | null;
@@ -921,8 +924,16 @@ async function workspacePage(
       sendHtml(res, 404, shell("Not found", `<div class="banner err">Project <code>${esc(entry.projectId)}</code> not found in DB.</div>`));
       return;
     }
+    // Multi-page-type rendering: when the operator picked >1 page type
+    // in the modal, query all of them in a single SQL and render the
+    // combined list. The active "tab" is now just a hint for which to
+    // visually highlight; the cluster list shows everything in the
+    // selected set, with a per-row page_type pill.
+    const queryTypes: PageType[] = selectedPageTypes && selectedPageTypes.size > 0
+      ? [...selectedPageTypes]
+      : [pageType];
     [clusters, pageTypeCounts] = await Promise.all([
-      listPublishedClusters(entry.projectId, pageType),
+      listPublishedClusters(entry.projectId, queryTypes),
       publishedClusterCountsByPageType(entry.projectId),
     ]);
   } catch (err) {
@@ -962,9 +973,10 @@ async function workspacePage(
     const recs = recordsByCluster[c.id] ?? [];
     const counts: Record<string, number> = {};
     for (const r of recs) counts[r.asset] = (counts[r.asset] ?? 0) + 1;
-    const cover = recs.find((r) => r.asset === "cover");
+    const cover = recs.find((r) => r.asset === "cover" || r.asset === "service_h1" || r.asset === "category_industry");
     return {
       id: c.id,
+      page_type: c.page_type,
       topic: c.topic ?? "(no topic)",
       updated_at: c.updated_at ? c.updated_at.toISOString().slice(0, 10) : null,
       cover_url: cover?.previewUrl ?? null,
@@ -1003,11 +1015,11 @@ async function workspacePage(
         .map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`)
         .join(" ");
       return `
-<tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
+<tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-page-type="${esc(c.page_type)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
   <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onclick="onClusterCheck('${esc(c.id)}', this.checked, event)"></td>
   <td class="topic">
     <div class="t">${esc(c.topic)}</div>
-    <div class="cid"><code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
+    <div class="cid"><span class="pill pt-${esc(c.page_type)}">${esc(c.page_type)}</span> <code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
   </td>
   <td class="preview">${cover}</td>
   <td class="types"><div class="pills-wrap">${pills}</div></td>
@@ -1748,7 +1760,7 @@ function startRegen(opts: {
   provider?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
-  const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client];
+  const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client, "--run-id", id];
   if (opts.mock) args.push("--mock");
   if (opts.dryRun) args.push("--dry-run");
   if (opts.useSavedToken) args.push("--use-saved-token");
@@ -1876,11 +1888,63 @@ async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
   }
 }
 
+/**
+ * Walk ./out/manifest-*.json looking for the run-id stamp the CLI wrote
+ * during regen. If found, build a synthetic RunState the run-page handler
+ * can render from. log + listeners are empty (the live process is gone);
+ * csvPath / htmlPath / done / exitCode come from the manifest.
+ */
+async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
+  const dir = path.resolve(process.cwd(), "out");
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return null;
+  }
+  for (const n of names) {
+    if (!n.startsWith("manifest-") || !n.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(dir, n), "utf8");
+      const j = JSON.parse(raw);
+      if (j?.run_id !== id) continue;
+      // Match — synthesise.
+      const state: RunState = {
+        id,
+        client: typeof j.client === "string" ? j.client : "",
+        args: ["(persisted run)"],
+        startedAt: typeof j.started_at === "string" ? j.started_at : "",
+        log: ["(log not available — server was restarted after this run finished)\n"],
+        done: true,
+        exitCode: 0,
+        csvPath: typeof j.csv === "string" ? j.csv : undefined,
+        htmlPath: typeof j.html === "string" ? j.html : undefined,
+        proc: { kill() { /* no-op */ } } as unknown as ChildProcess,
+        listeners: new Set(),
+      };
+      RUNS.set(id, state);
+      return state;
+    } catch {
+      /* skip corrupt manifest */
+    }
+  }
+  return null;
+}
+
 async function runPage(res: ServerResponse, id: string) {
-  const state = RUNS.get(id);
+  let state = RUNS.get(id);
   if (!state) {
-    sendHtml(res, 404, shell("Not found", `<div class="banner err">run ${esc(id)} not found</div>`));
-    return;
+    // Manifest fallback: a previous server process spawned this run; the
+    // in-memory state is gone but the artefacts are still on disk.
+    // Reconstruct a "completed" RunState from the manifest so the publish
+    // view still renders. The log + live SSE features won't work here —
+    // the operator gets the persisted CSV + cluster grid only.
+    const reconstructed = await tryReconstructRunFromDisk(id);
+    if (!reconstructed) {
+      sendHtml(res, 404, shell("Not found", `<div class="banner err">run ${esc(id)} not found</div>`));
+      return;
+    }
+    state = reconstructed;
   }
   const initial = esc(state.log.join(""));
   const cmd = esc(`npx ${state.args.join(" ")}`);
