@@ -1,38 +1,45 @@
 import { loadEnv } from "../src/env.js";
-import { Pool } from "pg";
+import { S3Client, ListObjectsV2Command } from "@aws-sdk/client-s3";
 
 loadEnv();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+const s3 = new S3Client({
+  region: process.env.AWS_REGION ?? "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
 });
 
-async function main() {
-  const queries = [
-    { label: "specgas",         pat: ["%specgas%", "%spec gas%"] },
-    { label: "trussed AI",      pat: ["%trussed%"] },
-    { label: "ACH Engineering", pat: ["%ach engineering%", "%ach %"] },
-    { label: "Inzure",          pat: ["%inzure%"] },
-    { label: "hydrogen-cyanide-cost (verify)", pat: ["%hydrogen cyanide%", "%hydrogen-cyanide%"] },
-  ];
+const BUCKET = "gw-content-store";
 
-  for (const { label, pat } of queries) {
-    console.log(`\n=== ${label} ===`);
-    const conditions = pat.map((_, i) => `(name ILIKE $${i + 1} OR url ILIKE $${i + 1} OR staging_subdomain ILIKE $${i + 1})`).join(" OR ");
-    const r = await pool.query<{ id: string; name: string; url: string | null; staging_subdomain: string | null }>(
-      `SELECT id, name, url, staging_subdomain FROM projects WHERE ${conditions} ORDER BY u_at DESC NULLS LAST LIMIT 8`,
-      pat,
-    );
-    if (r.rows.length === 0) console.log("  (no matches)");
-    for (const row of r.rows) {
-      console.log(`  ${row.id}  ${row.name}  ${row.url ?? ""}  staging=${row.staging_subdomain ?? ""}`);
+async function main() {
+  const cases = [
+    { sub: "unleashx-1r3z1u", img: "12e80b1a-9630-41ee-b381-ed554f30c131" },
+    { sub: "unleashx-1r3z1u", img: "ccd399ac-f791-40cd-b162-1acec4e8518c" },
+    { sub: "unleashx-1r3z1u", img: "3baa6d10-9f55-402d-b8f5-a038c0c1fc68" },
+  ];
+  for (const { sub, img } of cases) {
+    console.log(`\n=== sub=${sub} img=${img} ===`);
+    const candidates = [
+      `website/${sub}/assets/generated-images/${img}`,
+      `website/${sub}/assets/refined-images/${img}`,
+      `website/${sub}/assets/preprocessed-images/${img}`,
+      `website/${sub}/assets/uploaded-assets/${img}`,
+    ];
+    for (const prefix of candidates) {
+      const lr = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix, MaxKeys: 6 }));
+      if ((lr.KeyCount ?? 0) > 0) {
+        console.log(`  HIT prefix='${prefix}'`);
+        for (const k of lr.Contents ?? []) console.log(`    - ${k.Key} (${k.Size}B)`);
+      }
     }
   }
 
-  // Verify the explicitly given hydrogen-cyanide-cost project_id
-  const hcc = await pool.query(`SELECT id, name, url, staging_subdomain FROM projects WHERE id = 'c56bcf16-262c-41e4-8a34-4f14f7d4c579'::uuid`);
-  console.log("\n=== hydrogen-cyanide-cost (by given UUID) ===");
-  for (const row of hcc.rows) console.log(`  ${row.id}  ${row.name}  ${row.url ?? ""}  staging=${row.staging_subdomain ?? ""}`);
+  // Also enumerate generated-images/ to see naming conventions
+  console.log("\n=== website/unleashx-1r3z1u/assets/generated-images/ first 8 ===");
+  const gi = await s3.send(
+    new ListObjectsV2Command({ Bucket: BUCKET, Prefix: "website/unleashx-1r3z1u/assets/generated-images/", MaxKeys: 8 }),
+  );
+  for (const k of gi.Contents ?? []) console.log(`  - ${k.Key}`);
 }
-
-main().then(() => pool.end()).catch(async (e) => { console.error(e); await pool.end(); process.exit(1); });
+main().catch((e) => { console.error(e); process.exit(1); });

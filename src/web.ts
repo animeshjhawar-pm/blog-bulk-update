@@ -31,7 +31,7 @@ import { parse as csvParse } from "csv-parse/sync";
 import { uploadBlogImage } from "./s3.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
-const APP_TITLE = "Blog Image Update";
+const APP_TITLE = "Feeds Image Updater";
 
 interface RunState {
   id: string;
@@ -252,6 +252,15 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .toggle input { margin: 0; }
   .toggle.on { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
 
+  /* /import page-type chooser */
+  .pt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .pt-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border-strong); border-radius: 10px; cursor: pointer; transition: border-color .15s, background .15s; background: #fff; }
+  .pt-row:has(input:checked) { border-color: var(--brand); background: var(--accent-bg); }
+  .pt-row.disabled { opacity: .5; cursor: not-allowed; }
+  .pt-row input { width: 18px; height: 18px; }
+  .pt-meta .pt-label { font-weight: 500; font-size: 14px; color: var(--ink); }
+  .pt-meta .pt-count { font-size: 12px; color: var(--ink-muted); margin-top: 2px; }
+
   /* Page-type tabs (blog / service / category) */
   .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; }
   .page-tab:hover { color: var(--ink); border-color: var(--border-strong); text-decoration: none; }
@@ -451,13 +460,13 @@ async function homePage(res: ServerResponse) {
 
   sendHtml(res, 200, shell("Home", `
 <section class="card">
-  <h1>Blog Image Update</h1>
-  <div class="sub">Pick a client to open its workspace, review every published blog page, and regenerate images by cluster or by individual image.</div>
+  <h1>${esc(APP_TITLE)}</h1>
+  <div class="sub">Bulk-regenerate published-page images (blog · service · category) for any client in <code>gw_stormbreaker</code>. Pick a client, choose which page types to load, then review and apply image-by-image.</div>
 </section>
 
 <section class="card">
   <h2>Choose a client</h2>
-  <form id="import-form" onsubmit="goToWorkspace(event)" autocomplete="off">
+  <form id="import-form" onsubmit="goToImport(event)" autocomplete="off">
     <div class="row">
       <div style="flex:2">
         <label for="client-input">Client</label>
@@ -469,23 +478,27 @@ async function homePage(res: ServerResponse) {
         <input type="hidden" id="client-slug" name="client" required>
       </div>
       <div style="flex:0 0 auto">
-        <button class="primary" type="submit" id="import-btn" disabled>Import →</button>
+        <button class="primary" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
     </div>
   </form>
 </section>
 
 <section class="card">
-  <h2>How the workflow runs</h2>
+  <h2>How it works</h2>
   <ol class="sub" style="font-size:13px;color:var(--ink);line-height:1.7;padding-left:18px;margin:0">
-    <li>Choose a client → land in its workspace with every published blog cluster listed.</li>
-    <li>Search by topic or cluster_id; tick whole clusters or open a row to pick individual images.</li>
-    <li>(Optional) Add brand guidelines for that client — text gets injected into every prompt under <code>business_context.client_brand_guidelines</code>.</li>
-    <li>Click <strong>Dry run</strong> → live log streams on a dedicated run page; new images render once they're ready.</li>
-    <li>On the run page, each new image card has just two controls — <strong>↻ Regenerate</strong> (re-roll the image in place) and <strong>Apply to S3</strong> (push to <code>gw-content-store</code> at the canonical key). Prompts and aspect ratios stay in the background.</li>
+    <li>Pick a client → choose which page types to load (blog · service · category) — the workspace only shows clusters whose <code>page_status='PUBLISHED'</code>.</li>
+    <li>Search by topic or cluster_id; tick whole clusters or open a row to review individual images.</li>
+    <li>Click <strong>Dry run</strong> → log streams on a dedicated run page; new images render as they're ready.</li>
+    <li>Per-image: <strong>↻ Regenerate</strong> re-rolls in place, <strong>Apply to S3</strong> pushes the chosen image to <code>gw-content-store</code> at the canonical key keyed on <code>image_id</code>.</li>
   </ol>
 </section>
 `, `<script>
+function goToImport(e) {
+  e.preventDefault();
+  if (!hidden.value) return;
+  window.location.href = '/import?client=' + encodeURIComponent(hidden.value);
+}
 const CLIENTS = ${optsJson};
 const inp = document.getElementById('client-input');
 const hidden = document.getElementById('client-slug');
@@ -536,11 +549,6 @@ menu.addEventListener('mousedown', (e) => {
 document.addEventListener('mousedown', (e) => {
   if (!combo.contains(e.target)) combo.classList.remove('open');
 });
-function goToWorkspace(e) {
-  e.preventDefault();
-  if (!hidden.value) return;
-  window.location.href = '/workspace/' + encodeURIComponent(hidden.value);
-}
 render('');
 </script>`));
 }
@@ -566,7 +574,95 @@ interface ClusterPayload {
   }>;
 }
 
-async function workspacePage(res: ServerResponse, slug: string, pageType: PageType = "blog") {
+/**
+ * Page-type chooser shown immediately after the operator picks a client
+ * on the home page. Three checkboxes (blog / service / category) all
+ * default-checked; the page-type counts come from a single grouped
+ * query so the operator can see what the client actually has before
+ * committing to a load. Clicking Continue lands them in the workspace
+ * for the first selected page_type, with the others available as tabs.
+ */
+async function importPage(res: ServerResponse, slug: string) {
+  const entry = findClient(slug);
+  if (!entry) {
+    sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' is not in the CLIENTS allow-list.</div>`));
+    return;
+  }
+  try {
+    loadEnv();
+  } catch (err) {
+    sendHtml(res, 500, shell("Env error", `<div class="banner err">Env not configured: ${esc((err as Error).message)}</div>`));
+    return;
+  }
+
+  let project: ProjectRow | null = null;
+  let counts: Record<PageType, number> = { blog: 0, service: 0, category: 0 };
+  try {
+    project = await lookupProjectById(entry.projectId);
+    if (!project) {
+      sendHtml(res, 404, shell("Not found", `<div class="banner err">Project <code>${esc(entry.projectId)}</code> not found in DB.</div>`));
+      return;
+    }
+    counts = await publishedClusterCountsByPageType(entry.projectId);
+  } catch (err) {
+    sendHtml(res, 500, shell("DB error", `<div class="banner err">DB query failed: ${esc((err as Error).message)}</div>`));
+    return;
+  }
+
+  const row = (pt: PageType, label: string) => `
+<label class="pt-row${counts[pt] === 0 ? " disabled" : ""}">
+  <input type="checkbox" name="page_type" value="${pt}" ${counts[pt] > 0 ? "checked" : "disabled"}>
+  <div class="pt-meta">
+    <div class="pt-label">${label}</div>
+    <div class="pt-count">${counts[pt]} published cluster${counts[pt] === 1 ? "" : "s"}</div>
+  </div>
+</label>`;
+
+  sendHtml(res, 200, shell(`Choose page types · ${slug}`, `
+<section class="card">
+  <div class="sub" style="margin-bottom:6px"><a href="/" style="color:var(--ink-muted)">← Home</a></div>
+  <h1>${esc(project.name ?? slug)}</h1>
+  <div class="sub">Choose which page types to load. Only <code>page_status = 'PUBLISHED'</code> clusters are surfaced; counts below are live from the DB.</div>
+</section>
+
+<section class="card">
+  <h2>Page types</h2>
+  <form method="get" action="/workspace/${esc(slug)}" onsubmit="return go(event)">
+    <div class="pt-grid">
+      ${row("blog", "Blog pages")}
+      ${row("service", "Service pages")}
+      ${row("category", "Category pages")}
+    </div>
+    <div style="display:flex;gap:8px;margin-top:14px;align-items:center">
+      <button class="primary" type="submit">Continue →</button>
+      <a class="btn" href="/">Cancel</a>
+      <span id="warn" class="sub" style="color:var(--err)"></span>
+    </div>
+  </form>
+</section>
+`, `<script>
+function go(e) {
+  e.preventDefault();
+  const checks = Array.from(document.querySelectorAll('input[name=page_type]:checked')).map(c => c.value);
+  if (checks.length === 0) { document.getElementById('warn').textContent = 'pick at least one page type'; return false; }
+  // Workspace honours one page_type at a time today; stash the rest as a
+  // selected= URL param so the in-workspace tabs only show the chosen ones.
+  const first = checks[0];
+  const params = new URLSearchParams();
+  params.set('page_type', first);
+  if (checks.length > 1) params.set('selected', checks.join(','));
+  window.location.href = '/workspace/${esc(slug)}?' + params.toString();
+  return false;
+}
+</script>`));
+}
+
+async function workspacePage(
+  res: ServerResponse,
+  slug: string,
+  pageType: PageType = "blog",
+  selectedPageTypes?: Set<PageType>,
+) {
   const entry = findClient(slug);
   if (!entry) {
     sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' is not in the CLIENTS allow-list.</div>`));
@@ -715,7 +811,16 @@ async function workspacePage(res: ServerResponse, slug: string, pageType: PageTy
 </section>`;
 
   const effectiveLogo = overrides.logo_url || primaryLogo || "";
-  const tabHref = (pt: PageType) => `/workspace/${esc(slug)}?page_type=${pt}`;
+  // Workspace tabs reflect ONLY the page types the operator picked at
+  // /import. If they unchecked Service or Category there, those tabs
+  // don't render here. Default = show all three (legacy direct hits).
+  const visibleTabs: PageType[] = selectedPageTypes && selectedPageTypes.size > 0
+    ? (["blog", "service", "category"] as PageType[]).filter((pt) => selectedPageTypes.has(pt))
+    : ["blog", "service", "category"];
+  const selectedQs = selectedPageTypes && selectedPageTypes.size > 0
+    ? `&selected=${[...selectedPageTypes].join(",")}`
+    : "";
+  const tabHref = (pt: PageType) => `/workspace/${esc(slug)}?page_type=${pt}${selectedQs}`;
   const tabBtn = (pt: PageType, label: string) =>
     `<a class="page-tab${pageType === pt ? " active" : ""}" href="${tabHref(pt)}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
 
@@ -730,9 +835,8 @@ ${awsBanner}
         project_id <code>${esc(project.id)}</code> · ${clusters.length} published ${esc(pageType)} clusters · ${totalImages} images (${totalsBadges})
       </div>
       <div class="page-tabs" style="margin-top:10px;display:flex;gap:6px">
-        ${tabBtn("blog", "Blog")}
-        ${tabBtn("service", "Service")}
-        ${tabBtn("category", "Category")}
+        ${visibleTabs.map((pt) => tabBtn(pt, pt[0]!.toUpperCase() + pt.slice(1))).join("")}
+        <a class="page-tab" href="/import?client=${esc(slug)}" style="margin-left:auto;color:var(--ink-muted)">⇅ Change selection</a>
       </div>
     </div>
     <label class="toggle" id="test-run-toggle" style="flex:0 0 auto">
@@ -743,30 +847,32 @@ ${awsBanner}
 </section>
 
 <section class="card">
-  <h2>Project logo (used as image_input on every prompt)</h2>
-  <div class="sub" style="margin-bottom:8px">Override the URL the prompt sends to Replicate / fal as the logo reference. Leave blank to use the project's <code>logo_urls.primary_logo</code> from the DB.</div>
-  <form id="logo-form" onsubmit="saveLogo(event)" style="display:flex;gap:8px;align-items:center">
-    <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
-    ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="" style="width:36px;height:36px;border-radius:4px;object-fit:contain;background:#fff;border:1px solid var(--border)">` : ""}
-    <button class="primary" type="submit">Save</button>
-    <span id="logo-status" class="sub"></span>
-  </form>
-</section>
-
-<section class="card">
   <details>
     <summary><h2 style="display:inline">Client information</h2></summary>
-    <div class="sub" style="margin:8px 0 14px">Live values pulled from the <code>projects</code> row plus the saved <code>graphic-tokens/${esc(slug)}.json</code> if present. Read-only here — edit via the relevant CLI command.</div>
+    <div class="sub" style="margin:8px 0 14px">Live values from the <code>projects</code> row + the saved graphic_token. Most operators don't need to touch any of this — the workflow uses these values automatically.</div>
 
     <div class="info-grid">
       <div class="k">name</div>           <div class="v">${esc(project.name ?? "—")}</div>
       <div class="k">project_id</div>     <div class="v"><code>${esc(project.id)}</code></div>
       <div class="k">staging_subdomain</div><div class="v"><code>${esc(project.staging_subdomain ?? "—")}</code></div>
       <div class="k">homepage url</div>   <div class="v">${project.url ? `<a href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url)}</a>` : "—"}</div>
-      <div class="k">primary logo</div>   <div class="v">${primaryLogo ? `<a href="${esc(primaryLogo)}" target="_blank">${esc(primaryLogo)}</a>` : "—"}</div>
     </div>
 
+    <!-- Logo URL override lives inside Client info now (was a top-level
+         card; per spec it should be tucked away unless the operator
+         explicitly wants to override). -->
     <details style="margin-top:14px">
+      <summary><strong style="font-size:13px">Logo URL override</strong></summary>
+      <div class="sub" style="margin:6px 0 8px">Override the logo URL fed to image-gen prompts as <code>image_input</code>. Leave blank to fall back to <code>logo_urls.primary_logo</code> from the DB.</div>
+      <form id="logo-form" onsubmit="saveLogo(event)" style="display:flex;gap:8px;align-items:center">
+        <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
+        ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="" style="width:32px;height:32px;border-radius:4px;object-fit:contain;background:#fff;border:1px solid var(--border)">` : ""}
+        <button class="primary" type="submit">Save</button>
+        <span id="logo-status" class="sub"></span>
+      </form>
+    </details>
+
+    <details style="margin-top:8px">
       <summary><strong style="font-size:13px">company_info</strong></summary>
       <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(project.company_info))}</pre>
     </details>
@@ -778,7 +884,7 @@ ${awsBanner}
       <summary><strong style="font-size:13px">graphic_token (saved)</strong></summary>
       ${savedToken
         ? `<pre class="json-dump" style="margin-top:8px">${esc(fmtJson(savedToken))}</pre>`
-        : `<div class="sub" style="margin-top:8px">No saved graphic_token. Run <code>npm run extract-token -- --client ${esc(slug)}</code> to generate one (Firecrawl + Portkey call) and edit the JSON.</div>`}
+        : `<div class="sub" style="margin-top:8px">No saved graphic_token. Run <code>npm run extract-token -- --client ${esc(slug)}</code> to generate one.</div>`}
     </details>
     <details style="margin-top:8px">
       <summary><strong style="font-size:13px">logo_urls (raw)</strong></summary>
@@ -792,17 +898,19 @@ ${awsBanner}
 </section>
 
 <section class="card">
-  <details open>
+  <details>
     <summary><h2 style="display:inline">Brand guidelines (optional)</h2></summary>
     <div class="sub" style="margin:8px 0 10px">
-      Freeform text injected into every prompt under <code>business_context.client_brand_guidelines</code>.
-      Saved to <code>graphic-tokens/${esc(slug)}-brand.txt</code> (gitignored). Use for color preferences,
-      tone, things to avoid, mandatory taglines, etc. Prompts and aspect ratios are managed in the background.
+      Skip this if the saved <code>graphic_token</code> (under Client information above) already captures the brand.
+      Use this <em>only</em> when something specific is missing — color preferences not in the token, mandatory
+      taglines, things to avoid, etc. Free-form text gets injected into every prompt as
+      <code>business_context.client_brand_guidelines</code> and saved to
+      <code>graphic-tokens/${esc(slug)}-brand.txt</code> (gitignored).
     </div>
     <form id="brand-form" onsubmit="saveBrand(event)">
-      <textarea id="brand-text" placeholder="e.g. Use deep navy and gold accents only. Avoid stock-photo human subjects. Always include a small Sentinel mark in the footer.">${esc(brand)}</textarea>
+      <textarea id="brand-text" placeholder="(skip if graphic_token is enough) e.g. Use deep navy + gold only. No stock-photo people. Always include the Sentinel mark in the footer.">${esc(brand)}</textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-        <button type="submit" class="primary">Save brand guidelines</button>
+        <button type="submit" class="primary">Save</button>
         <span id="brand-status" class="sub"></span>
       </div>
     </form>
@@ -986,11 +1094,20 @@ function openDrawer(cid) {
       warnedComplexFlow = true;
     }
     const checked = set.has(img.id);
-    const previewSrc = img.preview_url || c.cover_url || '';
+    // Only cover / thumbnail have a real preview URL we can show right
+    // now (sourced from page_info.thumbnail). For inline / service /
+    // category images the per-image URL needs a UUID→S3-hash mapping
+    // table that we haven't fully wired up yet — show a clean
+    // placeholder that explains it, rather than reusing the cover and
+    // making every card look identical.
+    const previewSrc = img.preview_url || '';
     const captionAttr = JSON.stringify(img.asset + ' · ' + img.id).replace(/"/g, '&quot;');
+    const placeholderText = (img.asset === 'cover' || img.asset === 'thumbnail')
+      ? 'no preview'
+      : 'preview after generation';
     const previewHtml = previewSrc
       ? '<img src="' + previewSrc + '" alt="" loading="lazy" onclick="openLightbox(event, this.src, ' + captionAttr + ')">'
-      : '<div class="ph">no preview<br>(post-regen)</div>';
+      : '<div class="ph">' + placeholderText + '</div>';
     cardsHtml.push(
       '<label class="img-card' + (checked ? ' selected' : '') + '" data-img-id="' + img.id + '">' +
         '<input type="checkbox" class="img-toggle" ' + (checked ? 'checked' : '') + ' onchange="onImgToggle(this)">' +
@@ -1812,6 +1929,18 @@ export function startWebServer(port: number): void {
 
       if (method === "GET" && p === "/") return homePage(res);
 
+      // /import?client=<slug> — page-type chooser shown after the
+      // operator picks a client on the home page.
+      if (method === "GET" && p === "/import") {
+        const slug = url.searchParams.get("client") ?? "";
+        if (!slug) {
+          res.writeHead(302, { location: "/" });
+          res.end();
+          return;
+        }
+        return await importPage(res, decodeURIComponent(slug));
+      }
+
       const wsBrandMatch = /^\/workspace\/([^/]+)\/brand$/.exec(p);
       if (method === "POST" && wsBrandMatch && wsBrandMatch[1]) {
         return await saveBrandHandler(req, res, decodeURIComponent(wsBrandMatch[1]));
@@ -1824,7 +1953,17 @@ export function startWebServer(port: number): void {
       if (method === "GET" && wsMatch && wsMatch[1]) {
         const ptRaw = url.searchParams.get("page_type");
         const pageType: PageType = ptRaw === "service" || ptRaw === "category" ? ptRaw : "blog";
-        return await workspacePage(res, decodeURIComponent(wsMatch[1]), pageType);
+        const selectedRaw = url.searchParams.get("selected") ?? "";
+        const selected = new Set<PageType>();
+        for (const t of selectedRaw.split(",").map((s) => s.trim())) {
+          if (t === "blog" || t === "service" || t === "category") selected.add(t);
+        }
+        return await workspacePage(
+          res,
+          decodeURIComponent(wsMatch[1]),
+          pageType,
+          selected.size > 0 ? selected : undefined,
+        );
       }
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
