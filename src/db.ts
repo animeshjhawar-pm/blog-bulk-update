@@ -195,6 +195,29 @@ export async function searchProjects(query: string, limit = 20): Promise<Project
   return res.rows;
 }
 
+/**
+ * Bulk-fetch the slug + page_type for a set of cluster_ids — used by
+ * the runs page so each result-card can link to its "View current page"
+ * URL without round-tripping per-cluster.
+ */
+export interface ClusterSlugRow {
+  id: string;
+  slug: string | null;
+  page_type: PageType;
+}
+export async function lookupClusterSlugs(clusterIds: string[]): Promise<Map<string, ClusterSlugRow>> {
+  const out = new Map<string, ClusterSlugRow>();
+  if (clusterIds.length === 0) return out;
+  const sql = `
+    SELECT id::text AS id, slug, page_type
+    FROM clusters
+    WHERE id = ANY($1::uuid[])
+  `;
+  const r = await getPool().query<ClusterSlugRow>(sql, [clusterIds]);
+  for (const row of r.rows) out.set(row.id, row);
+  return out;
+}
+
 /** How many published clusters of each page_type does this project have? */
 export async function publishedClusterCountsByPageType(
   projectId: string,

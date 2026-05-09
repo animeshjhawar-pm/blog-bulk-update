@@ -11,6 +11,8 @@ import { CLIENTS, findClient } from "./clients.js";
 import {
   closePool,
   listPublishedClusters,
+  lookupClusterSlugs,
+  lookupImageUrls,
   publishedClusterCountsByPageType,
   lookupProjectById,
   searchProjects,
@@ -223,41 +225,36 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
   .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
 
-  /* How-it-works flowchart on the home page. Six numbered steps in a
-     responsive grid; arrows render as glyphs at desktop widths. */
-  .howto h2 { font-size: 16px; }
-  .howto .howto-steps {
+  /* How-it-works — compact single-line strip. Six chips separated by
+     arrow glyphs. Wraps on narrow viewports. Hover a chip for the
+     full explanation (HTML title tooltip). */
+  .howto { padding: 14px 18px; }
+  .howto-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  .howto-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-muted); margin: 0; }
+  .howto-head .sub { font-size: 12px; }
+  .howto-steps {
     list-style: none; padding: 0; margin: 0;
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-    gap: 12px;
-    counter-reset: howto;
+    display: flex; align-items: stretch; flex-wrap: wrap; gap: 6px;
   }
-  .howto .howto-steps li {
-    display: flex; gap: 12px; align-items: flex-start;
-    padding: 14px; background: #f8fafc; border-radius: 10px;
-    border: 1px solid var(--border);
-    position: relative;
+  .howto-steps li {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px 6px 6px; background: #f8fafc;
+    border: 1px solid var(--border); border-radius: 999px;
+    font-size: 12.5px; color: var(--ink); line-height: 1;
+    cursor: help; flex: 0 0 auto;
   }
-  .howto .howto-num {
-    flex: 0 0 28px; width: 28px; height: 28px;
+  .howto-steps li:hover { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
+  .howto-num {
+    flex: 0 0 22px; width: 22px; height: 22px;
     display: inline-flex; align-items: center; justify-content: center;
     background: linear-gradient(135deg, var(--brand) 0%, #6366f1 100%);
-    color: #fff; border-radius: 50%; font-weight: 600; font-size: 13px;
-    box-shadow: 0 2px 6px rgba(67,56,202,.3);
+    color: #fff; border-radius: 50%; font-weight: 600; font-size: 11px;
   }
-  .howto .howto-title { font-weight: 600; margin-bottom: 4px; font-size: 13.5px; color: var(--ink); }
-  .howto .howto-body { font-size: 12.5px; color: var(--ink-muted); line-height: 1.5; }
-  .howto .howto-body code { font-size: 11px; }
-  /* Arrow between consecutive steps on wide enough viewports. */
-  @media (min-width: 1100px) {
-    .howto .howto-steps li::after {
-      content: "→"; position: absolute;
-      right: -14px; top: 50%; transform: translateY(-50%);
-      color: var(--brand); font-size: 18px; font-weight: 600;
-      pointer-events: none;
-    }
-    .howto .howto-steps li:last-child::after,
-    .howto .howto-steps li:nth-child(3n)::after { content: ""; }
+  .howto-label { white-space: nowrap; font-weight: 500; }
+  /* Arrow between consecutive chips. */
+  .howto-steps li + li::before {
+    content: "→"; color: var(--ink-faint); font-weight: 600;
+    margin-right: 6px; align-self: center;
   }
 
   .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
@@ -589,6 +586,46 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   }
   .result-card.regenerating .rc-img img { filter: brightness(.85) saturate(.7); }
   .result-card.regenerating .btn-regen { background: var(--accent-bg); color: var(--brand); border-color: #c7d2fe; }
+
+  /* Per-card zoom + compare buttons. Zoom hovers in the top-right of
+     the image; compare lives in the action row next to Apply. */
+  .result-card .rc-img { position: relative; }
+  .rc-zoom {
+    position: absolute; top: 6px; right: 6px; z-index: 4;
+    background: rgba(15,23,42,.75); color: #fff; border: 0;
+    width: 26px; height: 26px; border-radius: 6px;
+    font-size: 14px; line-height: 1; cursor: pointer;
+    opacity: 0; transition: opacity .15s, background .15s;
+  }
+  .result-card:hover .rc-zoom { opacity: 1; }
+  .rc-zoom:hover { background: var(--brand); }
+  .btn-compare { font-size: 12px; padding: 5px 10px; }
+  .btn-compare:hover { color: var(--brand); border-color: var(--brand); }
+
+  /* Old-vs-new compare modal — two stacked or side-by-side panes. */
+  .cmp-overlay {
+    position: fixed; inset: 0; background: rgba(15,23,42,.78);
+    backdrop-filter: blur(4px); z-index: 90;
+    display: none; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .cmp-overlay.open { display: flex; }
+  .cmp-modal {
+    background: #fff; border-radius: 14px; box-shadow: var(--shadow-lg);
+    max-width: 1280px; width: 100%; max-height: 92vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .cmp-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .cmp-head strong { font-size: 14px; word-break: break-all; }
+  .cmp-head .sub { flex: 1; }
+  .cmp-x { background: transparent; border: 0; font-size: 22px; line-height: 1; cursor: pointer; color: var(--ink-muted); padding: 4px 10px; border-radius: 6px; }
+  .cmp-x:hover { background: #f1f5f9; color: var(--err); }
+  .cmp-body { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); flex: 1; overflow: hidden; }
+  .cmp-pane { background: #f8fafc; display: flex; flex-direction: column; min-height: 0; }
+  .cmp-pane-h { padding: 10px 14px; font-size: 12px; font-weight: 600; color: var(--ink-muted); text-transform: uppercase; letter-spacing: .05em; background: #fff; border-bottom: 1px solid var(--border); }
+  .cmp-pane-h.cmp-pane-h-new { color: var(--brand); }
+  .cmp-pane img { flex: 1; min-height: 0; width: 100%; object-fit: contain; padding: 12px; }
+  @media (max-width: 768px) { .cmp-body { grid-template-columns: 1fr; } }
 
   /* Cluster section header on run page */
   .cluster-section .cs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
@@ -933,53 +970,21 @@ ${recent.length > 0 ? `
   <div class="sub">No runs yet. Pick a client above to get started.</div>
 </section>`}
 
-<!-- How-to flowchart — visual walkthrough of the end-to-end loop. -->
+<!-- How-to flowchart — single-row visual walkthrough; six terse steps
+     with arrows between them. Tooltip on each gives the full
+     explanation if needed. -->
 <section class="card howto" style="margin-top:18px">
-  <h2 style="margin:0 0 6px">How it works</h2>
-  <div class="sub" style="margin-bottom:16px">A six-step loop from picking a client to live images on the site. Apply only writes when you click — nothing is automatic.</div>
+  <div class="howto-head">
+    <h2 style="margin:0">How it works</h2>
+    <span class="sub">Pick → Filter → Select → Generate → Review → Apply.</span>
+  </div>
   <ol class="howto-steps">
-    <li>
-      <span class="howto-num">1</span>
-      <div>
-        <div class="howto-title">Pick a client</div>
-        <div class="howto-body">Search by name, URL or <code>project_id</code>. Featured clients have their <code>graphic_token</code> pre-saved; everything else extracts on the fly.</div>
-      </div>
-    </li>
-    <li>
-      <span class="howto-num">2</span>
-      <div>
-        <div class="howto-title">Choose page types</div>
-        <div class="howto-body">Blog, service, category — any combination. Only published pages appear.</div>
-      </div>
-    </li>
-    <li>
-      <span class="howto-num">3</span>
-      <div>
-        <div class="howto-title">Pick clusters &amp; images</div>
-        <div class="howto-body">Click a cluster row to open its drawer; tick the images to regenerate. The master checkbox selects every image in a cluster; "select all" works across clusters.</div>
-      </div>
-    </li>
-    <li>
-      <span class="howto-num">4</span>
-      <div>
-        <div class="howto-title">Generate</div>
-        <div class="howto-body">Hit <strong>Generate →</strong>. The run page streams logs while Claude builds prompts and Replicate produces images. Roughly 30–60 seconds per image.</div>
-      </div>
-    </li>
-    <li>
-      <span class="howto-num">5</span>
-      <div>
-        <div class="howto-title">Review &amp; regenerate</div>
-        <div class="howto-body">Each result becomes a card you can click to enlarge. Don't like one? Hit <strong>↻ Regenerate</strong> on that card — it re-rolls just that image, in place.</div>
-      </div>
-    </li>
-    <li>
-      <span class="howto-num">6</span>
-      <div>
-        <div class="howto-title">Apply to S3</div>
-        <div class="howto-body">When you're happy, tick the cards and click <strong>Apply selected →</strong>. The new image is pushed to <code>gw-content-store</code> at the same key the live page reads, so it shows up on the site immediately.</div>
-      </div>
-    </li>
+    <li title="Search by name, URL or project_id. Featured clients load instantly."><span class="howto-num">1</span><span class="howto-label">Pick client</span></li>
+    <li title="Blog, service, category — any combination. Only published pages."><span class="howto-num">2</span><span class="howto-label">Page types</span></li>
+    <li title="Tick the clusters and the specific images you want to regenerate."><span class="howto-num">3</span><span class="howto-label">Select images</span></li>
+    <li title="Claude builds prompts; Replicate generates images. ~30–60s each."><span class="howto-num">4</span><span class="howto-label">Generate</span></li>
+    <li title="Zoom in, compare old vs new, regenerate any card you don't like."><span class="howto-num">5</span><span class="howto-label">Review</span></li>
+    <li title="Pushes to gw-content-store at the live key — visible on the site immediately."><span class="howto-num">6</span><span class="howto-label">Apply</span></li>
   </ol>
 </section>
 
@@ -2662,12 +2667,40 @@ async function runPage(res: ServerResponse, id: string) {
       const totalCompleted = rows.filter((r) => r.status === "completed").length;
       const totalFailed = rows.filter((r) => r.status === "failed").length;
 
+      // Enrich the publish view with three pieces of DB data, in
+      // parallel: project URL (for the per-cluster "View current
+      // page" link), cluster slug + page_type (URL pattern is
+      // <project_url>/feeds/<page_type>/<slug>), and the existing
+      // CDN URLs (so each card can show old-vs-new compare).
+      const projectId = rows[0]?.project_id ?? "";
+      const clusterIds = [...grouped.keys()];
+      const realImageIds = rows
+        .map((r) => r.image_id)
+        .filter((id) => !id.includes("/"));
+      const [projectForRun, clusterMeta, oldUrlsMap] = await Promise.all([
+        projectId ? lookupProjectById(projectId).catch(() => null) : Promise.resolve(null),
+        lookupClusterSlugs(clusterIds).catch(() => new Map()),
+        realImageIds.length > 0 ? lookupImageUrls(realImageIds).catch(() => new Map()) : Promise.resolve(new Map()),
+      ]);
+      const projectBaseUrl = (projectForRun?.url ?? "").replace(/\/+$/, "");
+      const publishedUrlOf = (clusterId: string): string | null => {
+        const m = clusterMeta.get(clusterId);
+        if (!m || !m.slug || !projectBaseUrl) return null;
+        return `${projectBaseUrl}/feeds/${m.page_type}/${m.slug}`;
+      };
+      const oldUrlOf = (imageId: string): string | null => {
+        const u = oldUrlsMap.get(imageId);
+        if (!u) return null;
+        return u["1080"] ?? u["720"] ?? u["360"] ?? null;
+      };
+
       // Inline cluster sections. Each card has just two controls:
       // Apply (S3 PutObject) and Regenerate (re-runs that single
       // image through the pipeline).
       const clusterSections = [...grouped.entries()].map(([clusterId, g]) => {
         const cards = g.rows
           .map((r) => {
+            const oldUrl = oldUrlOf(r.image_id);
             const previewHtml = r.image_url_new
               ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${jsAttr(r.asset_type + " · " + r.image_id)})">`
               : `<div class="ph">${esc(r.status)}</div>`;
@@ -2675,12 +2708,17 @@ async function runPage(res: ServerResponse, id: string) {
               ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
               : "";
             const synthetic = r.image_id.includes("/");
+            // Compare button is only useful when we have BOTH a new
+            // image and a known old image to put next to it.
+            const canCompare = !!r.image_url_new && !!oldUrl;
             return `
-<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}>
-  <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk Apply"}">
+<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
+  <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk actions (Apply / Regenerate)"}">
     <input type="checkbox" class="rc-pick-cb" ${synthetic ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
-  <div class="rc-img">${previewHtml}</div>
+  <div class="rc-img">${previewHtml}
+    <button class="rc-zoom" onclick="zoomCard('${esc(r.image_id)}', event)" title="Zoom in"><span aria-hidden="true">⤢</span></button>
+  </div>
   <div class="rc-body">
     <div class="rc-row">
       <span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span>
@@ -2692,12 +2730,14 @@ async function runPage(res: ServerResponse, id: string) {
     <div class="rc-status-line"></div>
     <div class="rc-actions">
       <button class="btn-regen" onclick="regenOne('${esc(r.image_id)}')" title="Regenerate this image">↻ Regenerate</button>
+      ${canCompare ? `<button class="btn-compare" onclick="openCompare('${esc(r.image_id)}')" title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
       <button class="btn-apply primary" onclick="applyOne('${esc(r.image_id)}')" ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
     </div>
   </div>
 </div>`;
           })
           .join("");
+        const publishedUrl = publishedUrlOf(clusterId);
         return `
 <section class="card cluster-section" id="cluster-${esc(clusterId)}" data-cluster-id="${esc(clusterId)}">
   <header class="cs-head">
@@ -2709,6 +2749,7 @@ async function runPage(res: ServerResponse, id: string) {
       <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
     </div>
     <div class="cs-actions">
+      ${publishedUrl ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Open the live page in a new tab">View current page →</a>` : ""}
       <button onclick="applyCluster('${esc(clusterId)}')">Apply all in this cluster</button>
     </div>
   </header>
@@ -2727,10 +2768,31 @@ async function runPage(res: ServerResponse, id: string) {
     <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
     <span class="sub" id="picked-count" style="margin-left:auto"></span>
   </div>
-  <div class="sub" style="margin-top:6px">Click any image to enlarge. Use the checkboxes to scope what <strong>Apply selected</strong> pushes — pick by image, by cluster, or all at once. <strong>Regenerate</strong> swaps the image in-place (keep clicking until you like the result). Cover / thumbnail rows with synthetic IDs are disabled for Apply.</div>
+  <div class="sub" style="margin-top:6px">Click <strong>⤢</strong> on any card to zoom, or <strong>⇄ Compare</strong> for an old-vs-new side-by-side. Use the checkboxes to scope <strong>Apply selected</strong> / <strong>Regenerate selected</strong> — pick by image, by cluster, or all at once.</div>
 </section>
 
 ${clusterSections}
+
+<!-- Compare modal — old (live) vs new (this run). Cross icon closes. -->
+<div class="cmp-overlay" id="cmp-overlay" onclick="closeCompareOnBackdrop(event)">
+  <div class="cmp-modal" role="dialog" aria-modal="true">
+    <header class="cmp-head">
+      <strong id="cmp-title">Compare</strong>
+      <span class="sub" id="cmp-meta"></span>
+      <button class="cmp-x" onclick="closeCompare()" aria-label="Close">×</button>
+    </header>
+    <div class="cmp-body">
+      <div class="cmp-pane">
+        <div class="cmp-pane-h">Current (live)</div>
+        <img id="cmp-old" alt="">
+      </div>
+      <div class="cmp-pane">
+        <div class="cmp-pane-h cmp-pane-h-new">New</div>
+        <img id="cmp-new" alt="">
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- Sticky bottom action bar -->
 <div class="action-bar">
@@ -2738,6 +2800,7 @@ ${clusterSections}
     <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending · <strong id="picked-count-bar">0</strong> selected
   </div>
   <div class="right">
+    <button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
     <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Apply selected →</button>
   </div>
 </div>
@@ -2939,14 +3002,18 @@ async function applyOne(imageId) {
 
 async function applyCluster(clusterId) {
   const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
+  const ids = [];
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
     const s = stateOf.get(id) ?? 'pending';
     if (s === 'applied' || s === 'applying') continue;
     if (card.dataset.synthetic === '1') continue;
-    await applyOne(id); // sequential to avoid hammering S3
+    ids.push(id);
   }
+  // Fan out — applies are independent S3 PUTs and the per-card UI
+  // already shows progress, so parallelism is safe and ~5× faster.
+  await Promise.all(ids.map((id) => applyOne(id)));
 }
 
 async function applyAll() {
@@ -3019,8 +3086,10 @@ function refreshPickedCount() {
     const el = document.getElementById(id);
     if (el) el.textContent = id === 'picked-count' ? (n + ' selected') : n;
   }
-  const btn = document.getElementById('apply-all-btn');
-  if (btn) btn.disabled = n === 0;
+  const apply = document.getElementById('apply-all-btn');
+  if (apply) apply.disabled = n === 0;
+  const regen = document.getElementById('regen-all-btn');
+  if (regen) regen.disabled = n === 0;
 }
 async function applyAllPicked() {
   const picked = [];
@@ -3033,7 +3102,61 @@ async function applyAllPicked() {
     if (s === 'applied' || s === 'applying') continue;
     picked.push(id);
   }
-  for (const id of picked) await applyOne(id); // sequential
+  await Promise.all(picked.map((id) => applyOne(id)));
+}
+async function regenAllPicked() {
+  const picked = [];
+  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+    const cb = card.querySelector('.rc-pick-cb');
+    if (!cb || cb.disabled || !cb.checked) continue;
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    picked.push(id);
+  }
+  if (picked.length === 0) return;
+  // Disable the button so a stray click doesn't double-fire while a
+  // batch is in flight.
+  const btn = document.getElementById('regen-all-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating ' + picked.length + '…'; }
+  try {
+    await Promise.all(picked.map((id) => regenOne(id)));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate selected'; }
+  }
+}
+
+// Per-card zoom button: opens the existing lightbox with the new image.
+function zoomCard(imageId, ev) {
+  if (ev) ev.stopPropagation();
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  const img = card.querySelector('.rc-img img');
+  const src = img ? img.src : '';
+  if (!src) return;
+  const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
+  lbOpen(null, src, (asset || '') + ' · ' + imageId);
+}
+
+// Compare modal: old (live CDN URL from media_registry) vs new (from CSV).
+function openCompare(imageId) {
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  const img = card.querySelector('.rc-img img');
+  const newSrc = img ? img.src : '';
+  const oldSrc = card.dataset.oldUrl || '';
+  if (!newSrc || !oldSrc) return;
+  document.getElementById('cmp-old').src = oldSrc;
+  document.getElementById('cmp-new').src = newSrc;
+  document.getElementById('cmp-title').textContent = 'Compare — ' + imageId;
+  const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
+  document.getElementById('cmp-meta').textContent = asset;
+  document.getElementById('cmp-overlay').classList.add('open');
+}
+function closeCompare() {
+  document.getElementById('cmp-overlay').classList.remove('open');
+}
+function closeCompareOnBackdrop(ev) {
+  if (ev.target === ev.currentTarget) closeCompare();
 }
 
 async function regenOne(imageId) {
@@ -3103,7 +3226,13 @@ function lbClose() {
   if (img) img.src = '';
 }
 function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') lbClose(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  // Close whichever modal is on top, in priority order.
+  const cmp = document.getElementById('cmp-overlay');
+  if (cmp && cmp.classList.contains('open')) { closeCompare(); return; }
+  lbClose();
+});
 
 if (document.getElementById('apply-all-btn')) refreshTotals();
 
