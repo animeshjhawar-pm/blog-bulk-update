@@ -1,44 +1,44 @@
 import { loadEnv } from "../src/env.js";
-import { Pool } from "pg";
+import { S3Client, ListObjectsV2Command } from "@aws-sdk/client-s3";
 
 loadEnv();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+const s3 = new S3Client({
+  region: process.env.AWS_REGION ?? "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
 });
 
-async function main() {
-  const placeholderIds = [
-    "1775738421995775_31f74865087649f8af51d8b",
-    "1775738421995823_b7e7d6c5fa7f4142859246d",
-    "1775738421995841_41b59ad41966486ba5e13b3",
-    "1775738421995855_0ba973b6a04347bfb5c06bc",
-  ];
-  for (const id of placeholderIds) {
-    const exact = await pool.query(
-      `SELECT key FROM media_registry WHERE key = $1`,
-      [`generated-images/${id}`],
-    );
-    const suffix = await pool.query(
-      `SELECT key FROM media_registry WHERE key LIKE $1 LIMIT 5`,
-      [`%/${id}`],
-    );
-    const partial = await pool.query(
-      `SELECT key FROM media_registry WHERE key LIKE $1 LIMIT 5`,
-      [`%${id.slice(0, 25)}%`],
-    );
-    console.log(`\nID ${id}:`);
-    console.log(`  exact "generated-images/${id}":`, exact.rows.length, "row(s)");
-    console.log(`  suffix "%/<id>":`, suffix.rows.map((r) => r.key).slice(0, 3));
-    console.log(`  partial start match (first 25 chars):`, partial.rows.map((r) => r.key).slice(0, 3));
-  }
-
-  // Sentinel cluster 4febee1f's S3 markdown — what tags actually exist?
-  const r = await pool.query(`SELECT page_info FROM clusters WHERE id = $1`, ["4febee1f-ce02-4270-ad8b-c9f441ca29fd"]);
-  const md = r.rows[0]?.page_info?.blog_text?.md ?? "";
-  const mdxIds: string[] = [];
-  for (const m of String(md).matchAll(/<Image\b[^/]*imageId\s*=\s*"([^"]+)"/g)) if (m[1]) mdxIds.push(m[1]);
-  console.log("\nMDX UUIDs in cluster 4febee1f:", mdxIds);
+async function listLogos(staging: string) {
+  const r = await s3.send(new ListObjectsV2Command({
+    Bucket: "gw-content-store",
+    Prefix: `website/${staging}/assets/logo/`,
+    MaxKeys: 30,
+  }));
+  return (r.Contents ?? []).map((k) => k.Key?.replace(`website/${staging}/assets/logo/`, "") ?? "");
 }
 
-main().then(() => pool.end()).catch(async (e) => { console.error(e); await pool.end(); process.exit(1); });
+async function main() {
+  const clients = [
+    "sentinelassetmanagementllc-lo1ayr",
+    "specgasinc-tiygg8",
+    "trussed-l05mo8",
+    "achengineering-6iwgqb",
+    "inzure-hqx5wx",
+    "unleashx-1r3z1u", // extra reference
+  ];
+  for (const sub of clients) {
+    console.log(`\n=== website/${sub}/assets/logo/ ===`);
+    try {
+      const items = await listLogos(sub);
+      for (const k of items) console.log(`  - ${k}`);
+      console.log(`  has logo.webp:`, items.includes("logo.webp"));
+      console.log(`  has logo.png:`, items.includes("logo.png"));
+      console.log(`  has logo.svg:`, items.includes("logo.svg"));
+    } catch (e) {
+      console.log(`  ERROR:`, (e as Error).message);
+    }
+  }
+}
+main().catch((e) => { console.error(e); process.exit(1); });

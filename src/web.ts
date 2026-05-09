@@ -18,7 +18,7 @@ import {
   type ProjectRow,
   type PageType,
 } from "./db.js";
-import { collectImageRecords, type ImageRecord } from "./pageInfo.js";
+import { collectImageRecords, prefetchBlogMarkdowns, type ImageRecord } from "./pageInfo.js";
 import { loadEnv } from "./env.js";
 import {
   loadBrandGuidelines,
@@ -66,6 +66,46 @@ interface RunState {
 }
 
 const RUNS = new Map<string, RunState>();
+
+// Server-process S3 markdown cache with a 60-second TTL. Without this
+// every workspace render re-fetches every blog cluster's
+// blog_with_image_placeholders.md, which dominates wall time. Repeated
+// loads of the same workspace within the TTL are sub-second.
+const S3_CACHE_TTL_MS = 60 * 1000;
+const GLOBAL_S3_CACHE = new Map<string, { body: string | null; expires: number }>();
+function cacheGet(key: string): string | null | undefined {
+  const e = GLOBAL_S3_CACHE.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.expires) { GLOBAL_S3_CACHE.delete(key); return undefined; }
+  return e.body;
+}
+function cacheSet(key: string, body: string | null): void {
+  GLOBAL_S3_CACHE.set(key, { body, expires: Date.now() + S3_CACHE_TTL_MS });
+}
+
+/**
+ * Pre-fill a per-request cache from the long-lived process cache and
+ * (after the prefetch runs) sync the freshly-fetched entries back
+ * into the global. Keys are prefixed with the staging_subdomain so
+ * the same cluster_id under different clients doesn't collide.
+ */
+function buildS3Cache(stagingSubdomain: string | null): Map<string, string | null> {
+  const m = new Map<string, string | null>();
+  if (!stagingSubdomain) return m;
+  for (const [k, v] of GLOBAL_S3_CACHE) {
+    if (Date.now() > v.expires) continue;
+    if (!k.startsWith(stagingSubdomain + ":")) continue;
+    m.set(k.slice(stagingSubdomain.length + 1), v.body);
+  }
+  return m;
+}
+function syncToGlobalCache(local: Map<string, string | null>, stagingSubdomain: string | null) {
+  if (!stagingSubdomain) return;
+  for (const [k, v] of local) {
+    cacheSet(`${stagingSubdomain}:${k}`, v);
+  }
+}
+void cacheGet;
 
 // ────────────────────────────────────────────────────────────────────────
 // HTML helpers
@@ -136,6 +176,30 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 
   main { max-width: 1320px; margin: 0 auto; padding: 20px 24px 100px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 18px; margin-bottom: 14px; }
+
+  /* Home hero — gradient frame + larger search prompt + tightened
+     typography. Quietly elevated; not a marketing page. */
+  .hero {
+    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 38%, #4338ca 100%);
+    border-radius: 14px;
+    padding: 36px 32px 28px;
+    color: #fff;
+    box-shadow: 0 12px 32px rgba(48,46,134,.18);
+    margin-bottom: 14px;
+  }
+  .hero-inner { max-width: 760px; margin: 0 auto; }
+  .hero-h { margin: 0 0 6px; font-size: 26px; font-weight: 600; letter-spacing: -.015em; }
+  .hero-sub { margin: 0 0 22px; font-size: 13.5px; line-height: 1.55; color: rgba(255,255,255,.78); max-width: 620px; }
+  .hero-search { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+  .hero-search .combobox { flex: 1; min-width: 280px; }
+  .hero-search .combobox input { font-size: 15px; padding: 12px 38px 12px 14px; border-radius: 8px; border-color: transparent; box-shadow: 0 4px 12px rgba(0,0,0,.06); }
+  .hero-search .combobox input:focus { outline: 2px solid rgba(255,255,255,.5); }
+  .hero-btn { padding: 12px 22px; border-radius: 8px; font-size: 14px; }
+  .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
+  .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
+
+  .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .recent-row td { padding: 11px 14px; font-size: 13px; }
   .card.compact { padding: 14px 18px; }
   .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-muted); margin: 0 0 10px; font-weight: 600; }
   .card h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -.005em; }
@@ -273,6 +337,16 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   /* Combobox section headers + featured pill */
   .combobox .menu .opt-header { padding: 6px 12px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-muted); background: #f8fafc; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1; }
   .featured-pill { color: #b45309; font-size: 10px; vertical-align: middle; margin-left: 4px; }
+
+  /* Flows page */
+  .flow-card { padding-top: 14px; }
+  .flow-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .flow-meta { font-size: 12.5px; }
+  .flow-prompt {
+    background: #0f172a; color: #e2e8f0; padding: 12px 14px; border-radius: 8px;
+    font: 11.5px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace;
+    white-space: pre-wrap; max-height: 420px; overflow: auto; margin-top: 8px;
+  }
 
   /* Per-cluster page_type pill (tiny, neutral) */
   .pill.pt-blog     { background: #dbeafe; color: #1e40af; padding: 0 6px; font-size: 10px; }
@@ -423,6 +497,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   </a>${crumb ? `<span class="crumb">/ ${crumb}</span>` : ""}
   <nav>
     <a href="/">Home</a>
+    <a href="/flows" target="_blank">Flows ↗</a>
     <a href="/runs">Runs</a>
   </nav>
 </header>
@@ -580,16 +655,12 @@ async function homePage(res: ServerResponse) {
     .join("");
 
   sendHtml(res, 200, shell("Home", `
-<section class="card">
-  <h1 style="margin-bottom:0">${esc(APP_TITLE)}</h1>
-</section>
-
-<section class="card">
-  <h2 style="margin-bottom:8px">Search a client</h2>
-  <div class="sub" style="margin-bottom:10px">A handful of featured clients have their <code>graphic_token</code> pre-saved (loads instantly). For any other project, the token is extracted on the fly the first time you click Continue — it adds ~30 seconds to that one-time import.</div>
-  <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
-    <div class="row">
-      <div style="flex:2">
+<section class="hero">
+  <div class="hero-inner">
+    <h1 class="hero-h">${esc(APP_TITLE)}</h1>
+    <p class="hero-sub">Bulk-generate replacement images for any published page — blog, service, or category. Pick a client, choose page types, choose images, generate, review, apply.</p>
+    <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
+      <div class="hero-search">
         <div class="combobox" id="combo">
           <input type="text" id="client-input" placeholder="Search a client — name, URL, or project_id" autocomplete="off">
           <span class="arrow">▾</span>
@@ -597,19 +668,24 @@ async function homePage(res: ServerResponse) {
         </div>
         <input type="hidden" id="client-slug">
         <input type="hidden" id="client-project-id">
+        <button class="primary hero-btn" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
-      <div style="flex:0 0 auto">
-        <button class="primary" type="submit" id="import-btn" disabled>Continue →</button>
-      </div>
-    </div>
-  </form>
+      <p class="hero-hint">A handful of featured clients have their <code>graphic_token</code> pre-saved (loads instantly). Any other project is extracted on the fly — adds ~30 seconds to the one-time import.</p>
+    </form>
+  </div>
 </section>
 
 ${recent.length > 0 ? `
-<section class="card" style="padding:0">
-  <div style="padding:12px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center"><h2 style="margin:0">Recent runs</h2></div>
+<section class="card" style="padding:0;margin-top:18px">
+  <div class="recent-head">
+    <h2 style="margin:0">Recent runs</h2>
+    <span class="sub" style="margin-left:auto">click a row to open</span>
+  </div>
   <table class="cluster-list"><tbody>${recentRows}</tbody></table>
-</section>` : ""}
+</section>` : `
+<section class="card" style="margin-top:18px;text-align:center;padding:32px">
+  <div class="sub">No runs yet. Pick a client above to get started.</div>
+</section>`}
 
 <!-- Page-type chooser modal (opens on Continue) -->
 <div class="drawer-overlay" id="pt-overlay" onclick="closePtModal(event)" style="z-index:80"></div>
@@ -955,21 +1031,32 @@ async function workspacePage(
   const env = loadEnv();
   const hasAwsCreds = Boolean(env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY);
 
-  // Parallel S3 fetches for inline-image counts.
-  const s3Cache = new Map<string, string | null>();
+  // Two-phase render for speed:
+  //   1) Pre-fetch every blog cluster's S3 markdown in parallel
+  //      (fills the shared cache so the parser is purely synchronous).
+  //   2) ONE collectImageRecords call across all clusters — the
+  //      media_registry batch lookup runs ONCE for the whole workspace
+  //      instead of per-cluster.
+  // For Sentinel (57 blog clusters), this drops workspace render from
+  //  ~57 sequential SQL queries down to 1, and S3 fetches from
+  //  serialised-by-worker to 12-way parallel.
   const stagingSubdomain = hasAwsCreds ? project.staging_subdomain : null;
+  const s3Cache = buildS3Cache(stagingSubdomain);
+  const t0 = Date.now();
+  const cacheHits = s3Cache.size;
+  await prefetchBlogMarkdowns(clusters, stagingSubdomain, s3Cache);
+  syncToGlobalCache(s3Cache, stagingSubdomain);
+  const tPrefetch = Date.now();
+  const allRecords = await collectImageRecords(clusters, { stagingSubdomain, s3Cache });
+  process.stderr.write(
+    `workspace: render-data for ${clusters.length} clusters in ${Date.now() - t0}ms ` +
+      `(prefetch ${tPrefetch - t0}ms, cache hits ${cacheHits}/${clusters.length})\n`,
+  );
   const recordsByCluster: Record<string, ImageRecord[]> = {};
-  const CONCURRENCY = 8;
-  let cursor = 0;
-  async function worker() {
-    while (cursor < clusters.length) {
-      const i = cursor++;
-      const c = clusters[i]!;
-      const recs = await collectImageRecords([c], { stagingSubdomain, s3Cache });
-      recordsByCluster[c.id] = recs;
-    }
+  for (const r of allRecords) {
+    if (!recordsByCluster[r.cluster.id]) recordsByCluster[r.cluster.id] = [];
+    recordsByCluster[r.cluster.id]!.push(r);
   }
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
   const payload: ClusterPayload[] = clusters.map((c) => {
     const recs = recordsByCluster[c.id] ?? [];
@@ -1841,6 +1928,169 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
   res.end();
 }
 
+/**
+ * /flows — read-only documentation page that shows, for every asset
+ * type the regen pipeline knows about, exactly which system prompt +
+ * user template + aspect ratio gets used, and where each prompt is
+ * sourced. Useful for operators reviewing what's actually being sent
+ * to Replicate per image. Opens in a new tab from the header nav.
+ */
+async function flowsPage(res: ServerResponse) {
+  // Lazy-import so we don't pay the ~30 KB prompt-string load on
+  // every request that doesn't need it.
+  const [
+    { GENERATE_INFOGRAPHIC_SYSTEM_PROMPT_NEW, GENERATE_INFOGRAPHIC_USER_TEMPLATE_NEW },
+    { BLOG_COVER_SYSTEM_PROMPT_NEW, BLOG_COVER_USER_TEMPLATE_NEW },
+    { INTERNAL_SYSTEM_PROMPT, INTERNAL_USER_TEMPLATE },
+    { EXTRACT_GRAPHIC_TOKEN_SYSTEM_PROMPT, EXTRACT_GRAPHIC_TOKEN_USER_TEMPLATE },
+  ] = await Promise.all([
+    import("./prompts/infographic.js"),
+    import("./prompts/cover.js"),
+    import("./prompts/internal.js"),
+    import("./prompts/extract.js"),
+  ]);
+
+  interface FlowEntry {
+    asset: string;
+    page_type: string;
+    aspect: string;
+    source: string;
+    notes: string;
+    system: string;
+    user: string;
+  }
+  const flows: FlowEntry[] = [
+    {
+      asset: "cover",
+      page_type: "blog",
+      aspect: "16:9",
+      source: "synthesised from cluster.topic; OR 1st MDX <Image> for Sentinel-style",
+      notes: "Same prompt as thumbnail (the Blog v2 cover_thumbnail flow drives both renders).",
+      system: BLOG_COVER_SYSTEM_PROMPT_NEW,
+      user: BLOG_COVER_USER_TEMPLATE_NEW,
+    },
+    {
+      asset: "thumbnail",
+      page_type: "blog",
+      aspect: "3:2",
+      source: "synthesised from cluster.topic; preview from page_info.thumbnail",
+      notes: "Used in feeds + related-blogs widgets. Same prompt as cover, different aspect.",
+      system: BLOG_COVER_SYSTEM_PROMPT_NEW,
+      user: BLOG_COVER_USER_TEMPLATE_NEW,
+    },
+    {
+      asset: "infographic",
+      page_type: "blog",
+      aspect: "16:9",
+      source: "<image_requirement type=\"infographic\"> in S3 markdown",
+      notes: "Each tag's id is the canonical image_id; description comes from the inner text.",
+      system: GENERATE_INFOGRAPHIC_SYSTEM_PROMPT_NEW,
+      user: GENERATE_INFOGRAPHIC_USER_TEMPLATE_NEW,
+    },
+    {
+      asset: "internal · external · generic",
+      page_type: "blog",
+      aspect: "image's context (default 16:9)",
+      source: "<image_requirement type=\"internal|external|generic\"> in S3 markdown",
+      notes: "All three asset types route to the generic page-image prompt. Aspect honours the tag's context attr.",
+      system: INTERNAL_SYSTEM_PROMPT,
+      user: INTERNAL_USER_TEMPLATE,
+    },
+    {
+      asset: "service_h1",
+      page_type: "service",
+      aspect: "1:1",
+      source: "page_info.images[0]",
+      notes: "Header image of a service page. Description comes from the image object.",
+      system: INTERNAL_SYSTEM_PROMPT,
+      user: INTERNAL_USER_TEMPLATE,
+    },
+    {
+      asset: "service_body",
+      page_type: "service",
+      aspect: "1:1",
+      source: "page_info.fold_data.service_steps.images[0]",
+      notes: "Mid-page body image. Skipped for clients whose service pages don't carry the service_steps fold.",
+      system: INTERNAL_SYSTEM_PROMPT,
+      user: INTERNAL_USER_TEMPLATE,
+    },
+    {
+      asset: "category_industry",
+      page_type: "category",
+      aspect: "1:1 (overridable per item.context)",
+      source: "page_info.fold_data.industries.items[*].image",
+      notes: "One record per item in the industries-served list.",
+      system: INTERNAL_SYSTEM_PROMPT,
+      user: INTERNAL_USER_TEMPLATE,
+    },
+    {
+      asset: "(extract_graphic_token)",
+      page_type: "—",
+      aspect: "—",
+      source: "Firecrawl scrape (markdown + branding) → Claude Sonnet 4.6 via Portkey",
+      notes: "Run once per client (or auto-extracted on first regen). Stores graphic-tokens/<slug>.json.",
+      system: EXTRACT_GRAPHIC_TOKEN_SYSTEM_PROMPT,
+      user: EXTRACT_GRAPHIC_TOKEN_USER_TEMPLATE,
+    },
+  ];
+
+  const sections = flows.map((f, i) => `
+<section class="card flow-card" id="flow-${i}">
+  <header class="flow-head">
+    <div>
+      <h2 style="margin:0;font-size:16px">
+        <span class="pill ${esc((f.asset.split(" ")[0] ?? "").trim())}">${esc(f.asset)}</span>
+        <span style="color:var(--ink-muted);font-weight:400;font-size:13px;margin-left:8px">${esc(f.page_type)}${f.aspect !== "—" ? " · " + esc(f.aspect) : ""}</span>
+      </h2>
+    </div>
+  </header>
+  <div class="flow-meta">
+    <div class="info-grid">
+      <div class="k">source</div>      <div class="v"><code>${esc(f.source)}</code></div>
+      <div class="k">aspect ratio</div><div class="v"><code>${esc(f.aspect)}</code></div>
+      <div class="k">prompt routing</div><div class="v">system + user templates below</div>
+    </div>
+    <div class="sub" style="margin-top:8px">${esc(f.notes)}</div>
+  </div>
+  <details style="margin-top:12px">
+    <summary><strong style="font-size:13px">System prompt</strong> <span class="sub">(${f.system.length.toLocaleString()} chars)</span></summary>
+    <pre class="flow-prompt">${esc(f.system)}</pre>
+  </details>
+  <details style="margin-top:8px">
+    <summary><strong style="font-size:13px">User template</strong> <span class="sub">(${f.user.length.toLocaleString()} chars; <code>{{placeholder}}</code> tokens get interpolated at run time)</span></summary>
+    <pre class="flow-prompt">${esc(f.user)}</pre>
+  </details>
+</section>`).join("");
+
+  sendHtml(res, 200, shell("Flows", `
+<section class="card">
+  <h1>Image flows</h1>
+  <div class="sub">Per-asset-type breakdown of which system prompt, user template, and aspect ratio the regen pipeline sends to Replicate. Source files: <code>src/prompts/*.ts</code> + the routing switch in <code>src/buildPrompt.ts</code>.</div>
+</section>
+
+<section class="card">
+  <h2 style="margin-bottom:8px">Routing table</h2>
+  <table class="cluster-list">
+    <thead><tr>
+      <th>asset_type</th><th>page_type</th><th>aspect</th><th>source</th><th>system prompt</th>
+    </tr></thead>
+    <tbody>
+      ${flows.map((f, i) => `
+        <tr style="cursor:pointer" onclick="document.getElementById('flow-${i}').scrollIntoView({behavior:'smooth',block:'start'})">
+          <td><span class="pill ${esc((f.asset.split(" ")[0] ?? "").trim())}">${esc(f.asset)}</span></td>
+          <td>${esc(f.page_type)}</td>
+          <td><code>${esc(f.aspect)}</code></td>
+          <td class="sub">${esc(f.source)}</td>
+          <td class="sub" style="font-size:11px">${esc(f.system.slice(0, 30))}…</td>
+        </tr>`).join("")}
+    </tbody>
+  </table>
+</section>
+
+${sections}
+`));
+}
+
 function runListPage(res: ServerResponse) {
   const items = [...RUNS.values()]
     .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
@@ -2372,6 +2622,7 @@ export function startWebServer(port: number): void {
           return sendJson(res, 500, { error: (err as Error).message });
         }
       }
+      if (method === "GET" && p === "/flows") return await flowsPage(res);
       if (method === "GET" && p === "/runs") return runListPage(res);
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {

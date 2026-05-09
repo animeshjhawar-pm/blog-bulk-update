@@ -514,6 +514,43 @@ export interface CollectOptions {
   s3Cache?: Map<string, string | null>;
 }
 
+/**
+ * Warm the per-cluster S3 markdown cache in parallel BEFORE
+ * collectImageRecords runs. The cache map is keyed by cluster.id and
+ * holds either the markdown body string or null (404 / unreachable).
+ * inlineRecordsForCluster checks the cache before issuing its own
+ * fetch, so warming it up front converts a sequential workload into
+ * a parallel one — workspace-level wall time drops from O(N) to
+ * O(N / concurrency).
+ */
+export async function prefetchBlogMarkdowns(
+  clusters: ClusterRow[],
+  stagingSubdomain: string | null,
+  cache: Map<string, string | null>,
+  concurrency = 24,
+): Promise<void> {
+  if (!stagingSubdomain) return;
+  const targets = clusters.filter(
+    (c) => (c.page_type ?? "blog") === "blog" && !cache.has(c.id),
+  );
+  if (targets.length === 0) return;
+
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < targets.length) {
+      const i = cursor++;
+      const c = targets[i]!;
+      try {
+        const r = await fetchBlogPlaceholders(stagingSubdomain!, c.id);
+        cache.set(c.id, r.body);
+      } catch {
+        cache.set(c.id, null);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
+}
+
 async function recordsForClusterByType(
   cluster: ClusterRow,
   pageType: PageType,
@@ -575,39 +612,43 @@ export async function collectImageRecords(
     }
   }
 
-  // Fallback for clusters whose S3 markdown carries placeholder ids
-  // that haven't been re-keyed into media_registry yet (e.g., Sentinel
-  // template). The MDX `<Image imageId="<UUID>"/>` tags in
-  // page_info.blog_text.md DO map to media_registry, so pair them with
-  // the still-null records by document-order index.
-  // The id we surface to the receiving PM stays the original (from S3
-  // markdown / Shape A / Shape B) — only the previewUrl borrows the
-  // MDX-resolved CDN URL.
+  // MDX fallback for clusters whose S3 markdown ids didn't resolve in
+  // media_registry (e.g., Sentinel placeholders). Group missing
+  // records by cluster, scan each cluster's MDX <Image imageId="…"/>
+  // tags, and do ONE big media_registry batch across every cluster's
+  // MDX UUIDs. Then pair by document-order index per cluster.
   const stillMissing = records.filter((r) => !r.previewUrl && !r.imageId.includes("/"));
   if (stillMissing.length > 0) {
-    // Group by cluster.
     const byCluster = new Map<string, ImageRecord[]>();
     for (const r of stillMissing) {
       if (!byCluster.has(r.cluster.id)) byCluster.set(r.cluster.id, []);
       byCluster.get(r.cluster.id)!.push(r);
     }
-    for (const [, missingForCluster] of byCluster) {
-      const cluster = missingForCluster[0]!.cluster;
+
+    // Build the per-cluster MDX tag arrays + the global UUID list.
+    const mdxByCluster = new Map<string, MdxImageTag[]>();
+    const allMdxIds: string[] = [];
+    for (const [cid, missing] of byCluster) {
+      const cluster = missing[0]!.cluster;
       const md = blogTextMd(cluster.page_info ?? {});
       if (!md) continue;
-      const mdxTags = scanMdxImageTags(md);
-      if (mdxTags.length === 0) continue;
-      const mdxUrls = await lookupImageUrls(mdxTags.map((t) => t.imageId));
-      const orderedMdxRecords = mdxTags.map((t) => mdxUrls.get(t.imageId));
-      // Pair by document-order index: missingForCluster[i] borrows the
-      // URL from orderedMdxRecords[i]. If counts differ, we just stop
-      // at the shorter array — better some previews than none.
-      const len = Math.min(missingForCluster.length, orderedMdxRecords.length);
-      for (let i = 0; i < len; i++) {
-        const urls = orderedMdxRecords[i];
-        if (!urls) continue;
-        missingForCluster[i]!.previewUrl =
-          urls["720"] ?? urls["1080"] ?? urls["360"] ?? undefined;
+      const tags = scanMdxImageTags(md);
+      if (tags.length === 0) continue;
+      mdxByCluster.set(cid, tags);
+      for (const t of tags) allMdxIds.push(t.imageId);
+    }
+    if (allMdxIds.length > 0) {
+      const mdxUrls = await lookupImageUrls(allMdxIds);
+      for (const [cid, missing] of byCluster) {
+        const tags = mdxByCluster.get(cid);
+        if (!tags) continue;
+        const len = Math.min(missing.length, tags.length);
+        for (let i = 0; i < len; i++) {
+          const urls = mdxUrls.get(tags[i]!.imageId);
+          if (!urls) continue;
+          missing[i]!.previewUrl =
+            urls["720"] ?? urls["1080"] ?? urls["360"] ?? undefined;
+        }
       }
     }
   }
