@@ -144,6 +144,10 @@ program
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
   )
   .option("--concurrency <n>", "parallel image generations", "5")
+  .option(
+    "--prompt-override-file <path>",
+    "use the literal text in this file as the image-gen prompt instead of calling Portkey (used by the web UI's Regenerate button to skip the prompt-build step)",
+  )
   .action(
     async (opts: {
       client: string;
@@ -157,6 +161,7 @@ program
       mock?: boolean;
       provider?: Provider;
       concurrency: string;
+      promptOverrideFile?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
@@ -164,6 +169,12 @@ program
         const clusterIds = parseClusterIds(opts.clusterIds);
         const imageIds = parseClusterIds(opts.imageIds); // same comma-split semantics
         const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 5);
+
+        let promptOverride: string | undefined;
+        if (opts.promptOverrideFile) {
+          const fs = await import("node:fs/promises");
+          promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
+        }
 
         await runRegen({
           client: opts.client,
@@ -177,6 +188,7 @@ program
           mock: Boolean(opts.mock),
           provider: opts.provider,
           concurrency,
+          promptOverride,
         });
       } catch (err) {
         process.stderr.write(

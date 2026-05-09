@@ -46,6 +46,13 @@ export interface RegenOptions {
    * without spending API budget.
    */
   mock?: boolean;
+  /**
+   * When set, every record skips the buildImagePrompt (Portkey) call
+   * and uses this literal text as the image-gen prompt. The web UI's
+   * single-image Regenerate button uses this to reuse the parent
+   * run's prompt — saves ~5–10s per regeneration.
+   */
+  promptOverride?: string;
 }
 
 function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
@@ -179,16 +186,26 @@ async function processOne(args: {
 
   let promptUsed = "";
   try {
-    const built = await buildImagePrompt({
-      asset: record.asset,
-      imageDescription: record.description,
-      businessContext: mergeBusinessContext(project.additional_info, brandGuidelines),
-      companyInfo: project.company_info,
-      graphicToken,
-      clientHomepageUrl: project.url ?? "",
-      projectId: project.id,
-    });
-    promptUsed = built.finalPrompt;
+    if (options.promptOverride && options.promptOverride.trim().length > 0) {
+      // Skip Portkey: reuse the parent run's prompt verbatim. Used by
+      // the web UI's single-image Regenerate flow to shave the
+      // prompt-building round trip.
+      promptUsed = options.promptOverride;
+      process.stderr.write(
+        `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override\n`,
+      );
+    } else {
+      const built = await buildImagePrompt({
+        asset: record.asset,
+        imageDescription: record.description,
+        businessContext: mergeBusinessContext(project.additional_info, brandGuidelines),
+        companyInfo: project.company_info,
+        graphicToken,
+        clientHomepageUrl: project.url ?? "",
+        projectId: project.id,
+      });
+      promptUsed = built.finalPrompt;
+    }
 
     if (options.dryRun) {
       process.stderr.write(

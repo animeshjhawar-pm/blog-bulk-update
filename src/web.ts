@@ -225,6 +225,11 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 
   .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
   .recent-row td { padding: 11px 14px; font-size: 13px; }
+  .recent-row a.recent-link { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 8px; }
+  .recent-row a.recent-link:hover { text-decoration: none; }
+  .fav { width: 16px; height: 16px; border-radius: 3px; object-fit: contain; flex: 0 0 16px; background: #f1f5f9; }
+  .combobox .opt-name { display: flex; align-items: center; gap: 8px; }
+  .combobox .opt-name strong { font-weight: 500; }
   .card.compact { padding: 14px 18px; }
   .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-muted); margin: 0 0 10px; font-weight: 600; }
   .card h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -.005em; }
@@ -344,6 +349,27 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   details > summary::before { content: "▸"; display: inline-block; margin-right: 6px; transition: transform .15s; color: var(--ink-faint); }
   details[open] > summary::before { transform: rotate(90deg); }
   details > summary h2 { display: inline; }
+
+  /* "View current page" CTA on each cluster row — single-line, compact. */
+  .btn-published { white-space: nowrap; padding: 5px 10px; font-size: 12px; line-height: 1.2; }
+
+  /* Workspace client logo — bigger preview, hover-grow, click-to-expand. */
+  .logo-preview-wrap { position: relative; width: 120px; flex: 0 0 120px; }
+  .logo-preview {
+    width: 120px; height: 120px; border-radius: 12px;
+    object-fit: contain; background: #fff;
+    border: 1px solid var(--border); padding: 10px;
+    display: block; cursor: zoom-in;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s;
+    box-shadow: var(--shadow);
+  }
+  .logo-preview:hover { transform: scale(1.06); box-shadow: var(--shadow-lg); border-color: var(--brand); }
+  .logo-preview.no-logo {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-faint); font-size: 12px; cursor: default;
+    background: #f8fafc; border-style: dashed;
+  }
+  .logo-preview.no-logo:hover { transform: none; box-shadow: var(--shadow); border-color: var(--border-strong); }
 
   /* Client info card — nested details for graphic_token / company_info / etc. */
   .info-grid { display: grid; grid-template-columns: 200px 1fr; gap: 8px 16px; align-items: start; font-size: 13px; }
@@ -488,6 +514,38 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .state-pill.state-applied  { background: var(--ok); color: #fff; }
   .result-card .state-pill.state-failed   { background: var(--err-bg); color: var(--err); }
   .result-card .state-pill.state-pending  { display: none; }
+  /* Per-image / per-cluster / all-image picks on the Publish (runs) page. */
+  .rc-pick { position: absolute; top: 8px; left: 8px; z-index: 3;
+    background: rgba(255,255,255,.85); backdrop-filter: blur(4px);
+    border-radius: 6px; padding: 3px 4px 1px; box-shadow: var(--shadow);
+    cursor: pointer; line-height: 1; }
+  .rc-pick-cb { width: 16px; height: 16px; cursor: pointer; }
+  .result-card { position: relative; }
+  .cluster-section .cs-head { gap: 10px; }
+  .cs-pick { display: inline-flex; align-items: center; cursor: pointer; flex: 0 0 auto; }
+  .cs-pick-cb { width: 16px; height: 16px; cursor: pointer; }
+  .all-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; cursor: pointer; }
+  .all-pick input { width: 16px; height: 16px; cursor: pointer; margin: 0; }
+  /* Themed loader spinner — used by Regenerate (and any other long button). */
+  @keyframes spinkey { to { transform: rotate(360deg); } }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; vertical-align: -2px;
+    animation: spinkey .7s linear infinite;
+  }
+  /* Regenerating shimmer over the existing image — matches the brand
+     accent so it reads as "in flight". */
+  @keyframes shimmerkey { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+  .result-card.regenerating .rc-img { position: relative; overflow: hidden; }
+  .result-card.regenerating .rc-img::before {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(110deg, transparent 0%, rgba(99,102,241,.18) 45%, rgba(99,102,241,.32) 50%, rgba(99,102,241,.18) 55%, transparent 100%);
+    animation: shimmerkey 1.4s ease-in-out infinite;
+    z-index: 2; pointer-events: none;
+  }
+  .result-card.regenerating .rc-img img { filter: brightness(.85) saturate(.7); }
+  .result-card.regenerating .btn-regen { background: var(--accent-bg); color: var(--brand); border-color: #c7d2fe; }
 
   /* Cluster section header on run page */
   .cluster-section .cs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
@@ -577,7 +635,29 @@ interface ClientPickerEntry {
   slug: string;
   projectId: string;
   name: string;
+  url: string | null;
 }
+
+/**
+ * Universal favicon URL via Google's s2 service. Works for any public
+ * domain without needing per-site /favicon.ico probing. Falls back to
+ * a tiny inline SVG dot when the URL is unparseable.
+ */
+function faviconFor(rawUrl: string | null | undefined): string {
+  const u = (rawUrl ?? "").trim();
+  if (!u) return FAVICON_FALLBACK;
+  try {
+    const host = new URL(u).host || u;
+    return `https://www.google.com/s2/favicons?sz=32&domain=${encodeURIComponent(host)}`;
+  } catch {
+    return FAVICON_FALLBACK;
+  }
+}
+const FAVICON_FALLBACK =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%23cbd5e1'/></svg>`,
+  );
 
 // In-process cache for the featured-client name lookup. The names rarely
 // change and the projects.id query was the dominant cost on home (5
@@ -595,9 +675,9 @@ async function loadClientPickerEntries(): Promise<ClientPickerEntry[]> {
     CLIENTS.map(async (c) => {
       try {
         const p = await lookupProjectById(c.projectId);
-        return { slug: c.slug, projectId: c.projectId, name: p?.name ?? c.slug };
+        return { slug: c.slug, projectId: c.projectId, name: p?.name ?? c.slug, url: p?.url ?? null };
       } catch {
-        return { slug: c.slug, projectId: c.projectId, name: c.slug };
+        return { slug: c.slug, projectId: c.projectId, name: c.slug, url: null };
       }
     }),
   );
@@ -610,6 +690,8 @@ interface RecentRunSummary {
   client: string;
   client_name: string | null;
   project_id: string;
+  /** Live project URL (for the favicon). Best-effort; null when DB lookup fails. */
+  client_url: string | null;
   started_at: string;
   finished_at: string | null;
   ok: number;
@@ -637,14 +719,12 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
       const j = JSON.parse(raw);
       const csvPath = typeof j.csv === "string" ? j.csv : null;
       const htmlPath = typeof j.html === "string" ? j.html : null;
-      // run_id is the in-memory token; not in manifest, but the CSV
-      // filename embeds <slug>-<utc-stamp>. Map that back to a stable id
-      // — operators usually want the most recent run summary regardless.
       out.push({
         manifest: n,
         client: j.client ?? "",
         client_name: j.client_name ?? null,
         project_id: j.project_id ?? "",
+        client_url: typeof j.client_url === "string" ? j.client_url : null,
         started_at: j.started_at ?? "",
         finished_at: j.finished_at ?? null,
         ok: j.summary?.ok ?? 0,
@@ -657,7 +737,36 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
       /* skip corrupt manifest */
     }
   }
+  // Backfill missing client_url from the projects table — capped to a
+  // single batch DB call. Cached so repeat home renders pay nothing.
+  await backfillRecentRunUrls(out);
   return out;
+}
+
+const RECENT_URL_CACHE = new Map<string, string | null>();
+async function backfillRecentRunUrls(rows: RecentRunSummary[]): Promise<void> {
+  const need = rows.filter((r) => !r.client_url && r.project_id && !RECENT_URL_CACHE.has(r.project_id));
+  if (need.length === 0) {
+    for (const r of rows) {
+      if (!r.client_url && RECENT_URL_CACHE.has(r.project_id)) r.client_url = RECENT_URL_CACHE.get(r.project_id) ?? null;
+    }
+    return;
+  }
+  await Promise.all(
+    need.map(async (r) => {
+      try {
+        const p = await lookupProjectById(r.project_id);
+        const url = p?.url ?? null;
+        RECENT_URL_CACHE.set(r.project_id, url);
+        r.client_url = url;
+      } catch {
+        RECENT_URL_CACHE.set(r.project_id, null);
+      }
+    }),
+  );
+  for (const r of rows) {
+    if (!r.client_url && RECENT_URL_CACHE.has(r.project_id)) r.client_url = RECENT_URL_CACHE.get(r.project_id) ?? null;
+  }
 }
 
 async function homePage(res: ServerResponse) {
@@ -684,17 +793,24 @@ async function homePage(res: ServerResponse) {
         : r.failed > 0
           ? `<span class="pill external">${r.failed} failed</span>`
           : `<span class="pill internal">${r.ok} ok</span>`;
-      const linkable = r.run_id;
-      const cellOpen = linkable
-        ? `<a href="/runs/${esc(r.run_id!)}" style="display:contents;text-decoration:none;color:inherit">`
-        : "";
-      const cellClose = linkable ? `</a>` : "";
+      // Recent runs are now navigation-only: every column is wrapped in
+      // the run link, no duplicate "open run / CSV" cell. Rows missing a
+      // run_id (very old manifests) just render unlinked.
+      const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
+      const nameCell = `${fav}<span>${esc(r.client_name ?? r.client)}</span>`;
+      if (r.run_id) {
+        return `
+<tr class="recent-row" onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer">
+  <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${nameCell}</a></td>
+  <td><a href="/runs/${esc(r.run_id)}" class="recent-link"><code style="font-size:11px">${esc(started)}</code></a></td>
+  <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${status}</a></td>
+</tr>`;
+      }
       return `
-<tr class="recent-row" ${linkable ? `onclick="location='/runs/${esc(r.run_id!)}'" style="cursor:pointer"` : ""}>
-  <td>${cellOpen}${esc(r.client_name ?? r.client)}${cellClose}</td>
-  <td>${cellOpen}<code style="font-size:11px">${esc(started)}</code>${cellClose}</td>
-  <td>${cellOpen}${status}${cellClose}</td>
-  <td style="text-align:right">${linkable ? `<a href="/runs/${esc(r.run_id!)}">open run ↗</a>` : `${r.csv ? `<a href="/files?p=${encodeURIComponent(r.csv)}">CSV</a>` : ""}`}</td>
+<tr class="recent-row">
+  <td>${nameCell}</td>
+  <td><code style="font-size:11px">${esc(started)}</code></td>
+  <td>${status}</td>
 </tr>`;
     })
     .join("");
@@ -768,6 +884,14 @@ async function onContinue(e) {
   await openPtModal(hidden.value, hiddenPid.value, hiddenName.value || hidden.value);
 }
 const FEATURED = ${featuredJson};
+function faviconUrlForUi(rawUrl) {
+  const u = (rawUrl || '').trim();
+  if (!u) return ${JSON.stringify(FAVICON_FALLBACK)};
+  try {
+    const host = new URL(u).host || u;
+    return 'https://www.google.com/s2/favicons?sz=32&domain=' + encodeURIComponent(host);
+  } catch { return ${JSON.stringify(FAVICON_FALLBACK)}; }
+}
 const inp = document.getElementById('client-input');
 const hidden = document.getElementById('client-slug');
 const hiddenPid = document.getElementById('client-project-id');
@@ -782,7 +906,7 @@ function renderMenu(featured, dbHits, q) {
   const items = [];
   if (featured.length > 0) {
     items.push({ kind: 'header', label: 'Featured (graphic_token pre-fetched)' });
-    for (const c of featured) items.push({ kind: 'opt', name: c.name, slug: c.slug, projectId: c.projectId, featured: true });
+    for (const c of featured) items.push({ kind: 'opt', name: c.name, slug: c.slug, projectId: c.projectId, url: c.url, featured: true });
   }
   if (dbHits.length > 0) {
     items.push({ kind: 'header', label: q ? 'Search results' : 'All projects' });
@@ -800,8 +924,10 @@ function renderMenu(featured, dbHits, q) {
       html += '<div class="opt-header">' + it.label + '</div>';
     } else {
       const idx = optI++;
+      const fav = faviconUrlForUi(it.url);
       html += '<div class="opt' + (idx === activeIdx ? ' active' : '') + '" data-i="' + idx + '">' +
-        '<div><strong>' + (it.name || '(no name)') + '</strong>' + (it.featured ? ' <span class="featured-pill">★</span>' : '') + '</div>' +
+        '<div class="opt-name"><img class="fav" src="' + fav + '" alt="" loading="lazy">' +
+          '<strong>' + (it.name || '(no name)') + '</strong>' + (it.featured ? ' <span class="featured-pill">★</span>' : '') + '</div>' +
         '<div class="pid">' + (it.slug ? it.slug + ' · ' : '') + it.projectId + (it.url ? ' · ' + it.url : '') + '</div>' +
       '</div>';
     }
@@ -1177,7 +1303,7 @@ async function workspacePage(
   <td class="types"><div class="pills-wrap">${pills}</div></td>
   <td style="text-align:right" onclick="event.stopPropagation()">
     ${publishedUrl
-      ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View Published Page →</a>`
+      ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View current page →</a>`
       : `<span class="sub" style="font-size:11px">no slug</span>`}
   </td>
 </tr>`;
@@ -1280,14 +1406,14 @@ ${awsBanner}
 
     <!-- Logo: real preview + URL override + Save (auto-refreshes the
          preview on success so the operator sees the override take). -->
-    <div style="display:flex;gap:14px;align-items:center;margin-bottom:14px">
-      <div id="logo-preview-wrap">
+    <div style="display:flex;gap:18px;align-items:center;margin-bottom:14px">
+      <div id="logo-preview-wrap" class="logo-preview-wrap">
         ${effectiveLogo
-          ? `<img id="logo-preview" src="${esc(effectiveLogo)}" alt="logo" style="width:72px;height:72px;border-radius:8px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:6px">`
-          : `<div id="logo-preview" style="width:72px;height:72px;border-radius:8px;background:#f8fafc;border:1px dashed var(--border-strong);display:flex;align-items:center;justify-content:center;color:var(--ink-faint);font-size:11px">no logo</div>`}
+          ? `<img id="logo-preview" class="logo-preview" src="${esc(effectiveLogo)}" alt="logo" onclick="openLogoLightbox(this.src)" title="Click to expand">`
+          : `<div id="logo-preview" class="logo-preview no-logo">no logo</div>`}
       </div>
       <form id="logo-form" onsubmit="saveLogo(event)" style="flex:1">
-        <label style="font-size:12px;color:var(--ink-muted)">Logo URL (overrides the project's primary_logo)</label>
+        <label style="font-size:12px;color:var(--ink-muted)">Logo URL (overrides the project's primary_logo) — image-gen reads this exact URL.</label>
         <div style="display:flex;gap:8px;margin-top:4px">
           <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
           <button class="primary" type="submit">Save</button>
@@ -1615,6 +1741,10 @@ function closeLightboxOnBackdrop(ev) {
   // Close only if user clicked backdrop, not the image itself.
   if (ev.target === ev.currentTarget) closeLightbox();
 }
+function openLogoLightbox(src) {
+  if (!src) return;
+  openLightbox(null, src, 'logo · click anywhere or press Esc to close');
+}
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (document.getElementById('lightbox').classList.contains('open')) { closeLightbox(); return; }
@@ -1639,9 +1769,10 @@ async function saveLogo(e) {
     const wrap = document.getElementById('logo-preview-wrap');
     const newSrc = j.effective_logo || '';
     if (newSrc) {
-      wrap.innerHTML = '<img id="logo-preview" src="' + newSrc + '?_=' + Date.now() + '" alt="logo" style="width:72px;height:72px;border-radius:8px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:6px">';
+      const cacheBuster = newSrc + (newSrc.includes('?') ? '&' : '?') + '_=' + Date.now();
+      wrap.innerHTML = '<img id="logo-preview" class="logo-preview" src="' + cacheBuster + '" alt="logo" onclick="openLogoLightbox(this.src)" title="Click to expand">';
     } else {
-      wrap.innerHTML = '<div id="logo-preview" style="width:72px;height:72px;border-radius:8px;background:#f8fafc;border:1px dashed var(--border-strong);display:flex;align-items:center;justify-content:center;color:var(--ink-faint);font-size:11px">no logo</div>';
+      wrap.innerHTML = '<div id="logo-preview" class="logo-preview no-logo">no logo</div>';
     }
     status.textContent = url ? 'saved ✓ override active' : 'saved ✓ (using project default)';
     setTimeout(() => { status.textContent = ''; }, 2200);
@@ -1803,6 +1934,21 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   }
   if (!clusterId) return sendJson(res, 400, { error: "cluster_id required (and not found in parent CSV)" });
 
+  // Speed up: reuse the parent's prompt for this image_id, skipping the
+  // Portkey round-trip in the child run. Saves ~5–10s. Falls through to
+  // a normal Portkey build if the parent CSV doesn't carry a prompt.
+  let promptOverrideFile: string | undefined;
+  if (parent.csvPath) {
+    const rows = await readRunCsv(parent.csvPath);
+    const row = rows.find((r) => r.image_id === imageId);
+    if (row && row.prompt_used && row.prompt_used.trim().length > 0) {
+      const tmpDir = path.resolve(process.cwd(), "out");
+      const fname = `prompt-override-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
+      promptOverrideFile = path.join(tmpDir, fname);
+      await fs.writeFile(promptOverrideFile, row.prompt_used, "utf8");
+    }
+  }
+
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
   // We reuse the parent's client/page_type so the subprocess loads the
   // identical graphic_token + project context.
@@ -1815,6 +1961,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     useSavedToken: true,
     pageType: extractPageTypeFromArgs(parent.args),
     provider: extractProviderFromArgs(parent.args),
+    promptOverrideFile,
   });
 
   // Wait for the subprocess to finish, then read its CSV for the new URL.
@@ -1968,6 +2115,7 @@ function startRegen(opts: {
   assetTypes?: string;
   pageType?: PageType;
   provider?: string;
+  promptOverrideFile?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
   const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client, "--run-id", id];
@@ -1979,6 +2127,7 @@ function startRegen(opts: {
   if (opts.imageIds.length) args.push("--image-ids", opts.imageIds.join(","));
   if (opts.assetTypes) args.push("--asset-types", opts.assetTypes);
   if (opts.provider) args.push("--provider", opts.provider);
+  if (opts.promptOverrideFile) args.push("--prompt-override-file", opts.promptOverrideFile);
 
   const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
 
@@ -2355,6 +2504,9 @@ async function runPage(res: ServerResponse, id: string) {
             const synthetic = r.image_id.includes("/");
             return `
 <div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}>
+  <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk Apply"}">
+    <input type="checkbox" class="rc-pick-cb" ${synthetic ? "disabled" : "checked"} onchange="onCardPick(this)">
+  </label>
   <div class="rc-img">${previewHtml}</div>
   <div class="rc-body">
     <div class="rc-row">
@@ -2374,9 +2526,12 @@ async function runPage(res: ServerResponse, id: string) {
           })
           .join("");
         return `
-<section class="card cluster-section" id="cluster-${esc(clusterId)}">
+<section class="card cluster-section" id="cluster-${esc(clusterId)}" data-cluster-id="${esc(clusterId)}">
   <header class="cs-head">
-    <div>
+    <label class="cs-pick" title="Select / deselect every image in this cluster">
+      <input type="checkbox" class="cs-pick-cb" checked onchange="onClusterPick(this, '${esc(clusterId)}')">
+    </label>
+    <div style="flex:1">
       <div style="font-weight:600;font-size:14px">${esc(g.topic || "(no topic)")}</div>
       <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
     </div>
@@ -2391,10 +2546,15 @@ async function runPage(res: ServerResponse, id: string) {
       resultsHtml = `
 <section class="card" id="results-summary">
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <label class="all-pick" title="Select / deselect everything">
+      <input type="checkbox" id="all-pick-cb" checked onchange="onAllPick(this)">
+      <span>All</span>
+    </label>
     <h2 style="margin:0">Publish — verify and push to S3</h2>
     <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
+    <span class="sub" id="picked-count" style="margin-left:auto"></span>
   </div>
-  <div class="sub" style="margin-top:6px">Click any image to enlarge. <strong>Regenerate</strong> swaps the image in-place (so you can keep clicking until you like the result). <strong>Apply to S3</strong> downloads the new image and PUTs it to <code>gw-content-store</code> at the canonical key the rendering pipeline reads from. Cover / thumbnail rows are disabled for now (synthetic IDs need cover/thumbnail wiring next iteration).</div>
+  <div class="sub" style="margin-top:6px">Click any image to enlarge. Use the checkboxes to scope what <strong>Apply selected</strong> pushes — pick by image, by cluster, or all at once. <strong>Regenerate</strong> swaps the image in-place (keep clicking until you like the result). Cover / thumbnail rows with synthetic IDs are disabled for Apply.</div>
 </section>
 
 ${clusterSections}
@@ -2402,10 +2562,10 @@ ${clusterSections}
 <!-- Sticky bottom action bar -->
 <div class="action-bar">
   <div class="stats">
-    <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending
+    <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending · <strong id="picked-count-bar">0</strong> selected
   </div>
   <div class="right">
-    <button class="primary" id="apply-all-btn" onclick="applyAll()">Apply all pending →</button>
+    <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Apply selected →</button>
   </div>
 </div>
 `;
@@ -2536,11 +2696,92 @@ async function applyAll() {
   }
 }
 
+// Per-image / per-cluster / all checkbox tree on the runs page. Synthetic
+// cards have their checkbox disabled, but they still count toward
+// cluster/all "checked" rendering — we filter them at apply time.
+function onCardPick(cb) {
+  const card = cb.closest('.result-card');
+  if (!card) return;
+  syncClusterPickFor(card.dataset.clusterId);
+  syncAllPick();
+  refreshPickedCount();
+}
+function onClusterPick(cb, clusterId) {
+  const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
+  for (const c of cards) {
+    const x = c.querySelector('.rc-pick-cb');
+    if (!x || x.disabled) continue;
+    x.checked = cb.checked;
+  }
+  syncAllPick();
+  refreshPickedCount();
+}
+function onAllPick(cb) {
+  for (const x of document.querySelectorAll('.rc-pick-cb')) {
+    if (!x.disabled) x.checked = cb.checked;
+  }
+  for (const x of document.querySelectorAll('.cs-pick-cb')) {
+    x.checked = cb.checked;
+    x.indeterminate = false;
+  }
+  refreshPickedCount();
+}
+function syncClusterPickFor(clusterId) {
+  if (!clusterId) return;
+  const cb = document.querySelector('.cluster-section[data-cluster-id="' + CSS.escape(clusterId) + '"] .cs-pick-cb');
+  if (!cb) return;
+  const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"] .rc-pick-cb:not(:disabled)');
+  let total = 0, checked = 0;
+  for (const x of cards) { total++; if (x.checked) checked++; }
+  cb.checked = total > 0 && checked === total;
+  cb.indeterminate = checked > 0 && checked < total;
+}
+function syncAllPick() {
+  const cb = document.getElementById('all-pick-cb');
+  if (!cb) return;
+  const cards = document.querySelectorAll('.rc-pick-cb:not(:disabled)');
+  let total = 0, checked = 0;
+  for (const x of cards) { total++; if (x.checked) checked++; }
+  cb.checked = total > 0 && checked === total;
+  cb.indeterminate = checked > 0 && checked < total;
+}
+function refreshPickedCount() {
+  let n = 0;
+  for (const x of document.querySelectorAll('.rc-pick-cb:not(:disabled)')) {
+    if (x.checked) n++;
+  }
+  for (const id of ['picked-count', 'picked-count-bar']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = id === 'picked-count' ? (n + ' selected') : n;
+  }
+  const btn = document.getElementById('apply-all-btn');
+  if (btn) btn.disabled = n === 0;
+}
+async function applyAllPicked() {
+  const picked = [];
+  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+    const cb = card.querySelector('.rc-pick-cb');
+    if (!cb || cb.disabled || !cb.checked) continue;
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    const s = stateOf.get(id) ?? 'pending';
+    if (s === 'applied' || s === 'applying') continue;
+    picked.push(id);
+  }
+  for (const id of picked) await applyOne(id); // sequential
+}
+
 async function regenOne(imageId) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
   const btn = card.querySelector('.btn-regen');
-  if (btn) { btn.textContent = '…'; btn.disabled = true; }
+  if (btn) {
+    btn.innerHTML = '<span class="spinner"></span> Regenerating…';
+    btn.disabled = true;
+  }
+  // Drop a themed shimmer over the existing image so the operator
+  // sees something is in flight (the actual call can take 30–60s).
+  card.classList.add('regenerating');
   try {
     const r = await fetch('/api/regen-one', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -2558,7 +2799,8 @@ async function regenOne(imageId) {
     stateOf.set(imageId, 'failed');
     paintCard(imageId, { error: 'regenerate failed: ' + err.message });
   } finally {
-    if (btn) { btn.textContent = '↻ Regenerate'; btn.disabled = false; }
+    card.classList.remove('regenerating');
+    if (btn) { btn.innerHTML = '↻ Regenerate'; btn.disabled = false; }
   }
   refreshTotals();
 }
@@ -2578,8 +2820,8 @@ function refreshTotals() {
   setText('applied-count', applied);
   setText('failed-count', failed);
   setText('pending-count', pending);
-  const btn = document.getElementById('apply-all-btn');
-  if (btn) btn.disabled = pending === 0;
+  // Bulk button now respects the checkbox tree, not just pending count.
+  refreshPickedCount();
 }
 
 // Lightbox (full-screen image viewer)

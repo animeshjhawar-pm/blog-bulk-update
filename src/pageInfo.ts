@@ -24,10 +24,12 @@ export type ImageSource =
   | "page_info.cover.image_id"
   | "page_info.thumbnail_image_id"
   | "page_info.thumbnail.image_id"
+  | "page_info.thumbnail"
   | "synthetic-cover"
   | "synthetic-thumbnail"
   | "page_info.images[0]"
   | "page_info.fold_data.service_steps.images[0]"
+  | "page_info.fold_data.service_description.images[0]"
   | "page_info.fold_data.industries.items[]"
   | "page_info.blog_text.md<Image>[0]";
 
@@ -213,6 +215,31 @@ function thumbnailUrlOf(pi: ClusterPageInfo): string | undefined {
   return undefined;
 }
 
+/**
+ * Extract the underlying image-hash id from a thumbnail/CDN URL such as
+ *   …/blog-images/<cluster_id>/<timestamp>_<hex32>/1080.webp
+ *   …/blog-images/<cluster_id>/<timestamp>_<hex32>.webp
+ * The hash segment is what `apply` needs to write against in S3 — it is
+ * the same shape that media_registry stores under
+ * `blog-images/<cluster_id>/<hash>` so lookupImageUrls also resolves it
+ * back to the existing CDN urls.
+ */
+function imageIdFromThumbnailUrl(url: string | undefined): string | null {
+  if (!url) return null;
+  // Strip any query/fragment, then take the last 2 path segments.
+  let clean = url.split("#")[0];
+  clean = clean!.split("?")[0]!;
+  const parts = clean.split("/").filter(Boolean);
+  // Walk backward looking for a `<digits>_<hex>` segment.
+  const idRe = /^\d+_[0-9a-f]{16,}$/i;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const seg = parts[i]!;
+    const stripped = seg.replace(/\.(webp|png|jpe?g)$/i, "");
+    if (idRe.test(stripped)) return stripped;
+  }
+  return null;
+}
+
 function coverRecord(cluster: ClusterRow): ImageRecord {
   const pi = cluster.page_info ?? {};
   const description = descriptionFor(cluster);
@@ -268,6 +295,13 @@ function thumbnailRecord(cluster: ClusterRow): ImageRecord {
     if (typeof inner === "string" && inner.length > 0) {
       return { cluster, asset: "thumbnail", imageId: inner, description, aspectRatio: aspect, source: "page_info.thumbnail.image_id", previewUrl };
     }
+  }
+  // Best-effort: parse the hash id out of the thumbnail URL itself —
+  // every featured client's templates encode the real S3 image id in
+  // the path, e.g. `…/blog-images/<cluster>/<timestamp>_<hex>/1080.webp`.
+  const fromUrl = imageIdFromThumbnailUrl(previewUrl);
+  if (fromUrl) {
+    return { cluster, asset: "thumbnail", imageId: fromUrl, description, aspectRatio: aspect, source: "page_info.thumbnail", previewUrl };
   }
   return { cluster, asset: "thumbnail", imageId: `thumbnail-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-thumbnail", previewUrl };
 }
@@ -440,25 +474,31 @@ function serviceRecords(cluster: ClusterRow): ImageRecord[] {
     }
   }
 
-  // Body: page_info.fold_data.service_steps.images[0]
+  // Body: lives at one of two paths depending on the page template —
+  //   fold_data.service_steps.images[0]        (ACH, Inzure)
+  //   fold_data.service_description.images[0]  (Sentinel, SpecGas, Trussed)
+  // Probe both, in order, and take the first hit.
+  const bodySources: Array<{ key: string; src: ImageSource }> = [
+    { key: "service_steps", src: "page_info.fold_data.service_steps.images[0]" },
+    { key: "service_description", src: "page_info.fold_data.service_description.images[0]" },
+  ];
   const fold = pi.fold_data;
   if (fold && typeof fold === "object") {
-    const steps = (fold as Record<string, unknown>).service_steps;
-    if (steps && typeof steps === "object") {
-      const stepsImgs = (steps as { images?: unknown }).images;
-      if (Array.isArray(stepsImgs) && stepsImgs[0]) {
-        const obj = imageFromObject(stepsImgs[0]);
-        if (obj) {
-          const r = recordFromImageObject({
-            cluster,
-            asset: "service_body",
-            obj,
-            source: "page_info.fold_data.service_steps.images[0]",
-            fallbackDescription: cluster.topic ?? "",
-          });
-          if (r) out.push(r);
-        }
-      }
+    for (const { key, src } of bodySources) {
+      const node = (fold as Record<string, unknown>)[key];
+      if (!node || typeof node !== "object") continue;
+      const imgs = (node as { images?: unknown }).images;
+      if (!Array.isArray(imgs) || !imgs[0]) continue;
+      const obj = imageFromObject(imgs[0]);
+      if (!obj) continue;
+      const r = recordFromImageObject({
+        cluster,
+        asset: "service_body",
+        obj,
+        source: src,
+        fallbackDescription: cluster.topic ?? "",
+      });
+      if (r) { out.push(r); break; }
     }
   }
 
