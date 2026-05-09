@@ -29,6 +29,13 @@ function templatesFor(asset: AssetType): { system: string; user: string } {
       return { system: EXTERNAL_SYSTEM_PROMPT, user: EXTERNAL_USER_TEMPLATE };
     case "generic":
       return { system: GENERIC_SYSTEM_PROMPT, user: GENERIC_USER_TEMPLATE };
+    // Service + category assets all route to the generic page-image
+    // prompt pair — same shape as `internal`. The asset_type is still
+    // preserved in the CSV for downstream observability.
+    case "service_h1":
+    case "service_body":
+    case "category_industry":
+      return { system: INTERNAL_SYSTEM_PROMPT, user: INTERNAL_USER_TEMPLATE };
   }
 }
 

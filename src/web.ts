@@ -10,14 +10,22 @@ import { randomUUID } from "node:crypto";
 import { CLIENTS, findClient } from "./clients.js";
 import {
   closePool,
-  listPublishedBlogClusters,
+  listPublishedClusters,
+  publishedClusterCountsByPageType,
   lookupProjectById,
   type ClusterRow,
   type ProjectRow,
+  type PageType,
 } from "./db.js";
 import { collectImageRecords, type ImageRecord } from "./pageInfo.js";
 import { loadEnv } from "./env.js";
-import { loadBrandGuidelines, saveBrandGuidelines, loadToken } from "./tokens.js";
+import {
+  loadBrandGuidelines,
+  saveBrandGuidelines,
+  loadToken,
+  loadProjectOverrides,
+  saveProjectOverrides,
+} from "./tokens.js";
 import { promises as fs } from "node:fs";
 import { parse as csvParse } from "csv-parse/sync";
 import { uploadBlogImage } from "./s3.js";
@@ -243,6 +251,13 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-muted); padding: 6px 10px; border: 1px solid var(--border); border-radius: 999px; background: #fff; }
   .toggle input { margin: 0; }
   .toggle.on { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
+
+  /* Page-type tabs (blog / service / category) */
+  .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; }
+  .page-tab:hover { color: var(--ink); border-color: var(--border-strong); text-decoration: none; }
+  .page-tab.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .page-tab .ct { font-size: 11px; opacity: .7; }
+  .page-tab.active .ct { color: #cbd5e1; opacity: 1; }
 
   /* Lightbox (image viewer) */
   .lightbox-overlay {
@@ -551,7 +566,7 @@ interface ClusterPayload {
   }>;
 }
 
-async function workspacePage(res: ServerResponse, slug: string) {
+async function workspacePage(res: ServerResponse, slug: string, pageType: PageType = "blog") {
   const entry = findClient(slug);
   if (!entry) {
     sendHtml(res, 400, shell("Error", `<div class="banner err">'${esc(slug)}' is not in the CLIENTS allow-list.</div>`));
@@ -566,13 +581,17 @@ async function workspacePage(res: ServerResponse, slug: string) {
 
   let project: ProjectRow | null;
   let clusters: ClusterRow[];
+  let pageTypeCounts: Record<PageType, number> = { blog: 0, service: 0, category: 0 };
   try {
     project = await lookupProjectById(entry.projectId);
     if (!project) {
       sendHtml(res, 404, shell("Not found", `<div class="banner err">Project <code>${esc(entry.projectId)}</code> not found in DB.</div>`));
       return;
     }
-    clusters = await listPublishedBlogClusters(entry.projectId);
+    [clusters, pageTypeCounts] = await Promise.all([
+      listPublishedClusters(entry.projectId, pageType),
+      publishedClusterCountsByPageType(entry.projectId),
+    ]);
   } catch (err) {
     sendHtml(res, 500, shell("DB error", `<div class="banner err">DB query failed: ${esc((err as Error).message)}</div>`));
     return;
@@ -580,6 +599,7 @@ async function workspacePage(res: ServerResponse, slug: string) {
 
   const brand = (await loadBrandGuidelines(slug)) ?? "";
   const savedToken = await loadToken(slug);
+  const overrides = await loadProjectOverrides(slug);
 
   // If AWS creds aren't set on this deployment we can't fetch the
   // blog_with_image_placeholders.md from S3 — the parser would throw
@@ -694,15 +714,25 @@ async function workspacePage(res: ServerResponse, slug: string) {
   </div>
 </section>`;
 
+  const effectiveLogo = overrides.logo_url || primaryLogo || "";
+  const tabHref = (pt: PageType) => `/workspace/${esc(slug)}?page_type=${pt}`;
+  const tabBtn = (pt: PageType, label: string) =>
+    `<a class="page-tab${pageType === pt ? " active" : ""}" href="${tabHref(pt)}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
+
   const body = `
 ${awsBanner}
 <section class="card">
   <div style="display:flex;align-items:start;gap:16px">
-    ${primaryLogo ? `<img src="${esc(primaryLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
+    ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="logo" style="width:48px;height:48px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px;flex:0 0 auto">` : ""}
     <div style="flex:1">
       <h1>${esc(project.name ?? slug)} <span style="color:var(--ink-faint);font-weight:400;font-size:14px">/ ${esc(slug)}</span></h1>
       <div class="sub">
-        project_id <code>${esc(project.id)}</code> · ${clusters.length} published blog clusters · ${totalImages} images (${totalsBadges})
+        project_id <code>${esc(project.id)}</code> · ${clusters.length} published ${esc(pageType)} clusters · ${totalImages} images (${totalsBadges})
+      </div>
+      <div class="page-tabs" style="margin-top:10px;display:flex;gap:6px">
+        ${tabBtn("blog", "Blog")}
+        ${tabBtn("service", "Service")}
+        ${tabBtn("category", "Category")}
       </div>
     </div>
     <label class="toggle" id="test-run-toggle" style="flex:0 0 auto">
@@ -710,6 +740,17 @@ ${awsBanner}
       Test run mode (3 clusters)
     </label>
   </div>
+</section>
+
+<section class="card">
+  <h2>Project logo (used as image_input on every prompt)</h2>
+  <div class="sub" style="margin-bottom:8px">Override the URL the prompt sends to Replicate / fal as the logo reference. Leave blank to use the project's <code>logo_urls.primary_logo</code> from the DB.</div>
+  <form id="logo-form" onsubmit="saveLogo(event)" style="display:flex;gap:8px;align-items:center">
+    <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
+    ${effectiveLogo ? `<img src="${esc(effectiveLogo)}" alt="" style="width:36px;height:36px;border-radius:4px;object-fit:contain;background:#fff;border:1px solid var(--border)">` : ""}
+    <button class="primary" type="submit">Save</button>
+    <span id="logo-status" class="sub"></span>
+  </form>
 </section>
 
 <section class="card">
@@ -833,6 +874,7 @@ ${awsBanner}
 
   const scripts = `<script>
 const SLUG = ${JSON.stringify(slug)};
+const PAGE_TYPE = ${JSON.stringify(pageType)};
 const CLUSTERS = ${JSON.stringify(payload)};
 const TEST_RUN_LIMIT = 3;
 // Per-cluster set of selected image IDs. Empty set = nothing selected.
@@ -1035,6 +1077,25 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// ── Logo URL override ──
+async function saveLogo(e) {
+  e.preventDefault();
+  const url = document.getElementById('logo-url-input').value.trim();
+  const status = document.getElementById('logo-status');
+  status.textContent = 'saving…';
+  try {
+    const r = await fetch('/workspace/' + encodeURIComponent(SLUG) + '/logo', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ logo_url: url })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    status.textContent = 'saved ✓ (reload to see preview)';
+    setTimeout(() => { status.textContent = ''; }, 2200);
+  } catch (err) {
+    status.textContent = 'error: ' + err.message;
+  }
+}
+
 // ── Brand guidelines ──
 async function saveBrand(e) {
   e.preventDefault();
@@ -1067,6 +1128,7 @@ async function runRegen(_unused) {
 
   const fd = new FormData();
   fd.set('client', SLUG);
+  fd.set('page_type', PAGE_TYPE);
   for (const it of items) {
     fd.append('cluster_id', it.cluster_id);
     for (const id of it.image_ids) fd.append('image_id', id);
@@ -1195,6 +1257,24 @@ async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug:
   sendJson(res, 200, { ok: true, path: target, length: text.length });
 }
 
+async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
+  if (!findClient(slug)) return sendJson(res, 400, { error: "unknown client" });
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let logo_url = "";
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { logo_url?: unknown };
+    logo_url = typeof body.logo_url === "string" ? body.logo_url.trim() : "";
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON body" });
+  }
+  if (logo_url && !/^https?:\/\//.test(logo_url)) {
+    return sendJson(res, 400, { error: "logo_url must start with http(s)://" });
+  }
+  const target = await saveProjectOverrides(slug, { logo_url: logo_url || undefined });
+  sendJson(res, 200, { ok: true, path: target, logo_url });
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Regen subprocess + SSE — reused by both legacy /regen POST and run pages
 // ────────────────────────────────────────────────────────────────────────
@@ -1240,6 +1320,7 @@ function startRegen(opts: {
   mock: boolean;
   useSavedToken: boolean;
   assetTypes?: string;
+  pageType?: PageType;
   provider?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
@@ -1247,6 +1328,7 @@ function startRegen(opts: {
   if (opts.mock) args.push("--mock");
   if (opts.dryRun) args.push("--dry-run");
   if (opts.useSavedToken) args.push("--use-saved-token");
+  if (opts.pageType && opts.pageType !== "blog") args.push("--page-type", opts.pageType);
   if (opts.clusterIds.length) args.push("--cluster-ids", opts.clusterIds.join(","));
   if (opts.imageIds.length) args.push("--image-ids", opts.imageIds.join(","));
   if (opts.assetTypes) args.push("--asset-types", opts.assetTypes);
@@ -1296,6 +1378,8 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     sendHtml(res, 400, shell("Error", `<div class="banner err">No images selected.</div>`));
     return;
   }
+  const ptRaw = body.get("page_type");
+  const pageType: PageType = ptRaw === "service" || ptRaw === "category" ? ptRaw : "blog";
   const state = startRegen({
     client,
     clusterIds,
@@ -1304,6 +1388,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     mock: body.get("mock") === "on",
     useSavedToken: body.get("use_saved_token") === "on",
     assetTypes: body.get("asset_types") || undefined,
+    pageType,
     provider: body.get("provider") || undefined,
   });
   res.writeHead(303, { location: `/runs/${state.id}` });
@@ -1731,9 +1816,15 @@ export function startWebServer(port: number): void {
       if (method === "POST" && wsBrandMatch && wsBrandMatch[1]) {
         return await saveBrandHandler(req, res, decodeURIComponent(wsBrandMatch[1]));
       }
+      const wsLogoMatch = /^\/workspace\/([^/]+)\/logo$/.exec(p);
+      if (method === "POST" && wsLogoMatch && wsLogoMatch[1]) {
+        return await saveLogoHandler(req, res, decodeURIComponent(wsLogoMatch[1]));
+      }
       const wsMatch = /^\/workspace\/([^/]+)\/?$/.exec(p);
       if (method === "GET" && wsMatch && wsMatch[1]) {
-        return await workspacePage(res, decodeURIComponent(wsMatch[1]));
+        const ptRaw = url.searchParams.get("page_type");
+        const pageType: PageType = ptRaw === "service" || ptRaw === "category" ? ptRaw : "blog";
+        return await workspacePage(res, decodeURIComponent(wsMatch[1]), pageType);
       }
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);

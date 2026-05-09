@@ -7,7 +7,13 @@ export type AssetType =
   | "infographic"
   | "internal"
   | "external"
-  | "generic";
+  | "generic"
+  | "service_h1"
+  | "service_body"
+  | "category_industry";
+
+/** Page kinds we know how to scope. Anything else is treated as blog. */
+export type PageType = "blog" | "service" | "category";
 
 export type ImageSource =
   | "s3-shape-A"
@@ -18,7 +24,10 @@ export type ImageSource =
   | "page_info.thumbnail_image_id"
   | "page_info.thumbnail.image_id"
   | "synthetic-cover"
-  | "synthetic-thumbnail";
+  | "synthetic-thumbnail"
+  | "page_info.images[0]"
+  | "page_info.fold_data.service_steps.images[0]"
+  | "page_info.fold_data.industries.items[]";
 
 export interface ImageRecord {
   cluster: ClusterRow;
@@ -43,17 +52,22 @@ export interface ImageRecord {
   previewUrl?: string;
 }
 
-// Aspect ratios are fixed per asset type (per product spec, 2026-05-07).
-// To change them, edit this map — the prompts/templates are background
-// concerns, but the aspect ratio is what's actually sent to the image
-// generator and surfaced in the UI.
+// Aspect ratios are fixed per asset type (per product spec, 2026-05-08):
+//   cover     16:9 (the wide hero at the top of a blog page)
+//   thumbnail 3:2  (used in feeds + related-blogs widgets)
+//   inline blog: the image's own `context` (default 16:9)
+//   service H1 / body: 1:1 default (or per-image context)
+//   category industry: 1:1 default (or per-image context)
 const DEFAULT_ASPECT: Record<AssetType, string> = {
-  cover: "1:1",
-  thumbnail: "16:9",
+  cover: "16:9",
+  thumbnail: "3:2",
   infographic: "16:9",
   internal: "16:9",
   external: "16:9",
   generic: "16:9",
+  service_h1: "1:1",
+  service_body: "1:1",
+  category_industry: "1:1",
 };
 
 export function normalizeImageType(raw: string | undefined): AssetType {
@@ -281,10 +295,140 @@ async function inlineRecordsForCluster(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Service page extractors
+// ────────────────────────────────────────────────────────────────────────
+
+interface DataImage {
+  image_id?: unknown;
+  description?: unknown;
+  alt_text?: unknown;
+  context?: unknown;
+}
+
+function imageFromObject(obj: unknown): DataImage | null {
+  if (!obj || typeof obj !== "object") return null;
+  const o = obj as DataImage;
+  return o;
+}
+
+function recordFromImageObject(args: {
+  cluster: ClusterRow;
+  asset: AssetType;
+  obj: DataImage;
+  source: ImageSource;
+  fallbackDescription?: string;
+}): ImageRecord | null {
+  const id = typeof args.obj.image_id === "string" ? args.obj.image_id : null;
+  if (!id) return null;
+  const desc =
+    typeof args.obj.description === "string"
+      ? (args.obj.description as string)
+      : typeof args.obj.alt_text === "string"
+        ? (args.obj.alt_text as string)
+        : (args.fallbackDescription ?? "");
+  const ctx = typeof args.obj.context === "string" ? args.obj.context : undefined;
+  return {
+    cluster: args.cluster,
+    asset: args.asset,
+    imageId: id,
+    description: desc.trim(),
+    aspectRatio: parseAspectRatio(ctx) ?? DEFAULT_ASPECT[args.asset],
+    source: args.source,
+  };
+}
+
+function serviceRecords(cluster: ClusterRow): ImageRecord[] {
+  const pi = cluster.page_info ?? {};
+  const out: ImageRecord[] = [];
+
+  // H1: page_info.images[0]
+  const imagesArr = Array.isArray(pi.images) ? (pi.images as unknown[]) : null;
+  if (imagesArr && imagesArr[0]) {
+    const obj = imageFromObject(imagesArr[0]);
+    if (obj) {
+      const r = recordFromImageObject({
+        cluster,
+        asset: "service_h1",
+        obj,
+        source: "page_info.images[0]",
+        fallbackDescription: cluster.topic ?? "",
+      });
+      if (r) out.push(r);
+    }
+  }
+
+  // Body: page_info.fold_data.service_steps.images[0]
+  const fold = pi.fold_data;
+  if (fold && typeof fold === "object") {
+    const steps = (fold as Record<string, unknown>).service_steps;
+    if (steps && typeof steps === "object") {
+      const stepsImgs = (steps as { images?: unknown }).images;
+      if (Array.isArray(stepsImgs) && stepsImgs[0]) {
+        const obj = imageFromObject(stepsImgs[0]);
+        if (obj) {
+          const r = recordFromImageObject({
+            cluster,
+            asset: "service_body",
+            obj,
+            source: "page_info.fold_data.service_steps.images[0]",
+            fallbackDescription: cluster.topic ?? "",
+          });
+          if (r) out.push(r);
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Category page extractor
+// ────────────────────────────────────────────────────────────────────────
+
+function categoryRecords(cluster: ClusterRow): ImageRecord[] {
+  const pi = cluster.page_info ?? {};
+  const fold = pi.fold_data;
+  if (!fold || typeof fold !== "object") return [];
+
+  const industries = (fold as Record<string, unknown>).industries;
+  if (!industries || typeof industries !== "object") return [];
+
+  const items = (industries as { items?: unknown }).items;
+  if (!Array.isArray(items)) return [];
+
+  const out: ImageRecord[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const it = item as { image?: unknown; name?: unknown };
+
+    // Per spec: each item's image lives at item.image (description on the
+    // image object). Some templates nest under item.images[0] instead —
+    // tolerate both shapes.
+    const imgCandidate = it.image ?? (Array.isArray((it as { images?: unknown[] }).images) ? (it as { images: unknown[] }).images[0] : null);
+    const obj = imageFromObject(imgCandidate);
+    if (!obj) continue;
+
+    const fallback = typeof it.name === "string" ? (it.name as string) : (cluster.topic ?? "");
+    const r = recordFromImageObject({
+      cluster,
+      asset: "category_industry",
+      obj,
+      source: "page_info.fold_data.industries.items[]",
+      fallbackDescription: fallback,
+    });
+    if (r) out.push(r);
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Top-level collector
 // ────────────────────────────────────────────────────────────────────────
 
 export interface CollectOptions {
+  /** Defaults to "blog" for backward compatibility. */
+  pageType?: PageType;
   clusterIds?: Set<string>;
   /**
    * When set, only records whose `imageId` is in the set are kept. The
@@ -294,10 +438,23 @@ export interface CollectOptions {
    */
   imageIds?: Set<string>;
   assetTypes?: Set<AssetType>;
-  /** Required to enable S3 fetching for inline images. */
+  /** Required to enable S3 fetching for inline images on blog pages. */
   stagingSubdomain?: string | null;
   /** Optional cross-call cache to avoid duplicate S3 GETs. */
   s3Cache?: Map<string, string | null>;
+}
+
+async function recordsForClusterByType(
+  cluster: ClusterRow,
+  pageType: PageType,
+  stagingSubdomain: string | null,
+  cache: Map<string, string | null>,
+): Promise<ImageRecord[]> {
+  if (pageType === "service") return serviceRecords(cluster);
+  if (pageType === "category") return categoryRecords(cluster);
+  // Default = blog: cover + thumbnail (synthesized) + Shape-A inline.
+  const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
+  return [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
 }
 
 export async function collectImageRecords(
@@ -306,13 +463,12 @@ export async function collectImageRecords(
 ): Promise<ImageRecord[]> {
   const cache = options.s3Cache ?? new Map<string, string | null>();
   const stagingSubdomain = options.stagingSubdomain ?? null;
+  const pageType: PageType = options.pageType ?? "blog";
 
   const records: ImageRecord[] = [];
   for (const cluster of clusters) {
     if (options.clusterIds && !options.clusterIds.has(cluster.id)) continue;
-
-    const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
-    const rows: ImageRecord[] = [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
+    const rows = await recordsForClusterByType(cluster, pageType, stagingSubdomain, cache);
     for (const r of rows) {
       if (options.assetTypes && !options.assetTypes.has(r.asset)) continue;
       if (options.imageIds && !options.imageIds.has(r.imageId)) continue;

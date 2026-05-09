@@ -1,10 +1,11 @@
 import { Pool } from "pg";
 import {
   closePool,
-  listPublishedBlogClusters,
+  listPublishedClusters,
   lookupProjectById,
   type ClusterRow,
   type ProjectRow,
+  type PageType,
 } from "./db.js";
 import { findClient } from "./clients.js";
 import { loadEnv } from "./env.js";
@@ -222,6 +223,7 @@ async function printClusterReport(cluster: ClusterRow, stagingSubdomain: string 
 export async function runInspectPageInfo(params: {
   project: ProjectRow;
   limit: number;
+  pageType?: PageType;
 }): Promise<void> {
   loadEnv();
   const env = process.env;
@@ -243,7 +245,7 @@ export async function runInspectPageInfo(params: {
     await pool.end();
   }
 
-  const clusters = await listPublishedBlogClusters(params.project.id);
+  const clusters = await listPublishedClusters(params.project.id, params.pageType ?? "blog");
   process.stderr.write(
     `\ninspect-page-info: ${clusters.length} published blog clusters in DB; printing first ${Math.min(params.limit, clusters.length)}\n`,
   );
@@ -258,7 +260,11 @@ export async function runInspectPageInfo(params: {
   );
 }
 
-export async function inspectForSlug(slug: string, limit: number): Promise<void> {
+export async function inspectForSlug(
+  slug: string,
+  limit: number,
+  pageType: PageType = "blog",
+): Promise<void> {
   const entry = findClient(slug);
   if (!entry) {
     process.stderr.write(`error: '${slug}' is not in the CLIENTS allow-list\n`);
@@ -274,5 +280,5 @@ export async function inspectForSlug(slug: string, limit: number): Promise<void>
   process.stderr.write(
     `inspect-page-info: client='${project.name ?? slug}' project_id=${project.id} staging_subdomain=${project.staging_subdomain}\n`,
   );
-  await runInspectPageInfo({ project, limit });
+  await runInspectPageInfo({ project, limit, pageType });
 }

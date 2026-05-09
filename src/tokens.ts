@@ -54,3 +54,44 @@ export async function saveBrandGuidelines(slug: string, text: string): Promise<s
   await fs.writeFile(target, (text ?? "").trim() + "\n", "utf8");
   return target;
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Per-client overrides (e.g. operator-edited logo URL). Lives at
+// graphic-tokens/<slug>-overrides.json so it persists across runs and is
+// merged into the regen pipeline's project-info inputs.
+// ────────────────────────────────────────────────────────────────────────
+
+export interface ProjectOverrides {
+  /** When set, overrides projects.logo_urls.primary_logo for prompts + UI. */
+  logo_url?: string;
+}
+
+export function overridesPath(slug: string): string {
+  return path.join(TOKEN_DIR, `${slug}-overrides.json`);
+}
+
+export async function loadProjectOverrides(slug: string): Promise<ProjectOverrides> {
+  try {
+    const raw = await fs.readFile(overridesPath(slug), "utf8");
+    return JSON.parse(raw) as ProjectOverrides;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw err;
+  }
+}
+
+export async function saveProjectOverrides(
+  slug: string,
+  patch: Partial<ProjectOverrides>,
+): Promise<string> {
+  await fs.mkdir(TOKEN_DIR, { recursive: true });
+  const cur = await loadProjectOverrides(slug);
+  const next = { ...cur, ...patch };
+  // Drop empty-string values so saving "" actually clears the override.
+  for (const k of Object.keys(next) as (keyof ProjectOverrides)[]) {
+    if (typeof next[k] === "string" && (next[k] as string).trim() === "") delete next[k];
+  }
+  const target = overridesPath(slug);
+  await fs.writeFile(target, JSON.stringify(next, null, 2) + "\n", "utf8");
+  return target;
+}

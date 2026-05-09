@@ -3,12 +3,13 @@ import path from "node:path";
 import { loadEnv } from "./env.js";
 import {
   closePool,
-  listPublishedBlogClusters,
+  listPublishedClusters,
   lookupProjectById,
   type ProjectRow,
+  type PageType,
 } from "./db.js";
 import { resolveGraphicToken, type TokenSource } from "./extractToken.js";
-import { loadBrandGuidelines } from "./tokens.js";
+import { loadBrandGuidelines, loadProjectOverrides } from "./tokens.js";
 import { buildImagePrompt } from "./buildPrompt.js";
 import { generate, type Provider } from "./generate.js";
 import { downloadImage } from "./rehost.js";
@@ -30,6 +31,8 @@ export interface RegenOptions {
   clusterIds?: Set<string>;
   /** When set, only records whose `imageId` is in the set are regenerated. */
   imageIds?: Set<string>;
+  /** Defaults to "blog". */
+  pageType?: PageType;
   provider?: Provider;
   concurrency: number;
   /**
@@ -42,7 +45,11 @@ export interface RegenOptions {
   mock?: boolean;
 }
 
-function pickLogoUrl(project: ProjectRow): string | null {
+function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
+  // Operator-edited override always wins. Saved at
+  // graphic-tokens/<slug>-overrides.json by the workspace UI.
+  if (override && override.startsWith("http")) return override;
+
   const lu = project.logo_urls as Record<string, unknown> | null;
   if (!lu || typeof lu !== "object") return null;
   for (const k of ["primary_logo", "logo", "primaryLogo"]) {
@@ -264,6 +271,13 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     );
   }
 
+  const overrides = await loadProjectOverrides(slug);
+  if (overrides.logo_url) {
+    process.stderr.write(
+      `regen: logo_url=overridden by graphic-tokens/${slug}-overrides.json (${overrides.logo_url.slice(0, 60)}…)\n`,
+    );
+  }
+
   let graphicToken: unknown = null;
   let tokenSource: TokenSource = "live";
   if (options.mock) {
@@ -287,10 +301,12 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     }
   }
 
-  const clusters = await listPublishedBlogClusters(project.id);
-  process.stderr.write(`regen: ${clusters.length} published blog clusters\n`);
+  const pageType: PageType = options.pageType ?? "blog";
+  const clusters = await listPublishedClusters(project.id, pageType);
+  process.stderr.write(`regen: ${clusters.length} published ${pageType} clusters\n`);
 
   const records = await collectImageRecords(clusters, {
+    pageType,
     assetTypes: options.assetTypes,
     clusterIds: options.clusterIds,
     imageIds: options.imageIds,
@@ -338,7 +354,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   };
   await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
 
-  const logoUrl = pickLogoUrl(project);
+  const logoUrl = pickLogoUrl(project, overrides.logo_url ?? null);
   if (!logoUrl) {
     process.stderr.write(
       `regen: warning — no primary_logo URL found in projects.logo_urls; image_input will be empty\n`,

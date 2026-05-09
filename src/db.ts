@@ -63,17 +63,48 @@ export interface ClusterRow {
   updated_at: Date;
 }
 
-export async function listPublishedBlogClusters(projectId: string): Promise<ClusterRow[]> {
-  // Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
-  // (uppercase), clusters.u_at (not updated_at).
+export type PageType = "blog" | "service" | "category";
+
+/**
+ * Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
+ * (uppercase), clusters.u_at (not updated_at). Page-status filter is enforced
+ * for every page_type — we never surface unpublished clusters in the UI.
+ */
+export async function listPublishedClusters(
+  projectId: string,
+  pageType: PageType = "blog",
+): Promise<ClusterRow[]> {
   const sql = `
     SELECT id, topic, page_info, u_at AS updated_at
     FROM clusters
     WHERE p_id = $1::uuid
-      AND page_type = 'blog'
+      AND page_type = $2
       AND page_status = 'PUBLISHED'
     ORDER BY u_at DESC
   `;
-  const res = await getPool().query<ClusterRow>(sql, [projectId]);
+  const res = await getPool().query<ClusterRow>(sql, [projectId, pageType]);
   return res.rows;
+}
+
+/** Backwards-compat alias — existing call sites that only deal with blogs. */
+export async function listPublishedBlogClusters(projectId: string): Promise<ClusterRow[]> {
+  return listPublishedClusters(projectId, "blog");
+}
+
+/** How many published clusters of each page_type does this project have? */
+export async function publishedClusterCountsByPageType(
+  projectId: string,
+): Promise<Record<PageType, number>> {
+  const sql = `
+    SELECT page_type, count(*)::int AS n
+    FROM clusters
+    WHERE p_id = $1::uuid
+      AND page_status = 'PUBLISHED'
+      AND page_type IN ('blog', 'service', 'category')
+    GROUP BY 1
+  `;
+  const res = await getPool().query<{ page_type: PageType; n: number }>(sql, [projectId]);
+  const out: Record<PageType, number> = { blog: 0, service: 0, category: 0 };
+  for (const r of res.rows) out[r.page_type] = r.n;
+  return out;
 }

@@ -59,15 +59,18 @@ program
 
 program
   .command("inspect-page-info")
-  .description("Print the page_info JSON shape of a few real clusters to figure out cover/thumbnail extraction.")
+  .description("Print the page_info JSON shape of a few real clusters to figure out image extraction.")
   .requiredOption("--client <slug>", `client slug (allow-list: ${clientSlugList().join(", ") || "<empty>"})`)
   .option("--limit <n>", "number of clusters to dump", "1")
-  .action(async (opts: { client: string; limit: string }) => {
+  .addOption(
+    new Option("--page-type <type>", "page_type to inspect").choices(["blog", "service", "category"]).default("blog"),
+  )
+  .action(async (opts: { client: string; limit: string; pageType: "blog" | "service" | "category" }) => {
     requireKnownClient(opts.client);
     try {
       loadEnvOrExit();
       const limit = Math.max(1, Number.parseInt(opts.limit, 10) || 1);
-      await inspectForSlug(opts.client, limit);
+      await inspectForSlug(opts.client, limit, opts.pageType);
     } catch (err) {
       process.stderr.write(
         `inspect-page-info failed: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -123,6 +126,9 @@ program
   )
   .option("--cluster-ids <list>", "comma-separated cluster UUIDs to restrict to")
   .option("--image-ids <list>", "comma-separated image_id values to restrict to (per-image scoping; the web UI uses this)")
+  .addOption(
+    new Option("--page-type <type>", "which page_type to regen for the client").choices(["blog", "service", "category"]).default("blog"),
+  )
   .option("--mock", "skip Portkey + image generation; emit synthetic prompts and picsum.photos URLs (UX validation, no API spend)", false)
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
@@ -136,6 +142,7 @@ program
       assetTypes?: string;
       clusterIds?: string;
       imageIds?: string;
+      pageType?: "blog" | "service" | "category";
       mock?: boolean;
       provider?: Provider;
       concurrency: string;
@@ -154,6 +161,7 @@ program
           assetTypes,
           clusterIds,
           imageIds,
+          pageType: opts.pageType ?? "blog",
           mock: Boolean(opts.mock),
           provider: opts.provider,
           concurrency,
