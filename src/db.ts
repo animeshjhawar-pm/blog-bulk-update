@@ -63,9 +63,11 @@ export interface ClusterRow {
   topic: string | null;
   page_info: ClusterPageInfo | null;
   updated_at: Date;
-  /** Which page_type this cluster belongs to (carried so the combined
-   * multi-page-type list can render a per-row pill without a refetch). */
+  /** Which page_type this cluster belongs to. */
   page_type: PageType;
+  /** clusters.slug — used to construct the published-page URL on the
+   * cluster row's "View Published Page →" CTA. */
+  slug: string | null;
 }
 
 /**
@@ -83,7 +85,7 @@ export async function listPublishedClusters(
   const types = Array.isArray(pageType) ? pageType : [pageType];
   if (types.length === 0) return [];
   const sql = `
-    SELECT id, topic, page_info, u_at AS updated_at, page_type
+    SELECT id, topic, page_info, u_at AS updated_at, page_type, slug
     FROM clusters
     WHERE p_id = $1::uuid
       AND page_type = ANY($2::text[])

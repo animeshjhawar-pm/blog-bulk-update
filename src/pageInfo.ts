@@ -28,7 +28,8 @@ export type ImageSource =
   | "synthetic-thumbnail"
   | "page_info.images[0]"
   | "page_info.fold_data.service_steps.images[0]"
-  | "page_info.fold_data.industries.items[]";
+  | "page_info.fold_data.industries.items[]"
+  | "page_info.blog_text.md<Image>[0]";
 
 export interface ImageRecord {
   cluster: ClusterRow;
@@ -216,18 +217,39 @@ function coverRecord(cluster: ClusterRow): ImageRecord {
   const pi = cluster.page_info ?? {};
   const description = descriptionFor(cluster);
   const aspect = DEFAULT_ASPECT.cover;
-  const previewUrl = thumbnailUrlOf(pi);
+
+  // Per spec: the cover image's UUID is the 1st <Image imageId="…"/>
+  // tag in page_info.blog_text.md. Use that UUID as the canonical
+  // imageId so (a) media_registry resolves a real previewUrl and (b)
+  // the apply step writes against the actual S3 key.
+  const md = blogTextMd(pi);
+  if (md) {
+    const tags = scanMdxImageTags(md);
+    if (tags[0]?.imageId) {
+      return {
+        cluster,
+        asset: "cover",
+        imageId: tags[0].imageId,
+        description,
+        aspectRatio: aspect,
+        source: "page_info.blog_text.md<Image>[0]",
+      };
+    }
+  }
 
   if (typeof pi.cover_image_id === "string" && (pi.cover_image_id as string).length > 0) {
-    return { cluster, asset: "cover", imageId: pi.cover_image_id as string, description, aspectRatio: aspect, source: "page_info.cover_image_id", previewUrl };
+    return { cluster, asset: "cover", imageId: pi.cover_image_id as string, description, aspectRatio: aspect, source: "page_info.cover_image_id" };
   }
   const coverObj = pi.cover;
   if (coverObj && typeof coverObj === "object") {
     const inner = (coverObj as { image_id?: unknown }).image_id;
     if (typeof inner === "string" && inner.length > 0) {
-      return { cluster, asset: "cover", imageId: inner, description, aspectRatio: aspect, source: "page_info.cover.image_id", previewUrl };
+      return { cluster, asset: "cover", imageId: inner, description, aspectRatio: aspect, source: "page_info.cover.image_id" };
     }
   }
+  // Last-resort synthetic cover; previewUrl defaults to thumbnail URL
+  // so the operator at least sees the page hero.
+  const previewUrl = thumbnailUrlOf(pi);
   return { cluster, asset: "cover", imageId: `cover-images/${cluster.id}`, description, aspectRatio: aspect, source: "synthetic-cover", previewUrl };
 }
 
@@ -288,29 +310,20 @@ function blogTextMd(pi: ClusterPageInfo): string | null {
 }
 
 /**
- * Convert MDX <Image> tags to ImageRecords. Convention (per the user's
- * spec for Sentinel-style blogs):
- *   1st tag → cover
- *   subsequent tags → infographic
- * (page_info.thumbnail is handled separately by thumbnailRecord.)
+ * Convert MDX <Image> tags to ImageRecords. Per the user's spec for
+ * Sentinel-style blogs, the 1st tag is consumed by coverRecord, so
+ * here we only emit the 2nd-onwards as inline infographics.
+ * page_info.thumbnail is handled by thumbnailRecord.
  */
 function mdxToRecords(cluster: ClusterRow, tags: MdxImageTag[]): ImageRecord[] {
-  const out: ImageRecord[] = [];
-  tags.forEach((t, i) => {
-    const asset: AssetType = i === 0 ? "cover" : "infographic";
-    out.push({
-      cluster,
-      asset,
-      imageId: t.imageId,
-      description: t.alt,
-      aspectRatio: DEFAULT_ASPECT[asset],
-      // Reuse the s3-shape-A enum for now — these aren't <image_requirement>
-      // tags but they share the same downstream shape (image-id keyed
-      // record from page_info content).
-      source: "s3-shape-A",
-    });
-  });
-  return out;
+  return tags.slice(1).map((t) => ({
+    cluster,
+    asset: "infographic" as AssetType,
+    imageId: t.imageId,
+    description: t.alt,
+    aspectRatio: DEFAULT_ASPECT.infographic,
+    source: "page_info.blog_text.md<Image>[0]" as ImageSource,
+  }));
 }
 
 async function inlineRecordsForCluster(
@@ -560,17 +573,12 @@ async function recordsForClusterByType(
   if (pageType === "service") return serviceRecords(cluster);
   if (pageType === "category") return categoryRecords(cluster);
 
-  // Blog: page_info.thumbnail is the thumbnail (synthesized record); the
-  // inline parser may already supply a real "cover" (Sentinel-style MDX
-  // 1st-image convention). When it does, drop the synthetic cover so we
-  // don't render two covers per cluster.
+  // Blog: cover comes from coverRecord (which prefers the 1st MDX
+  // <Image> UUID, falling back to synthetic). thumbnail is always
+  // synthesised from page_info.thumbnail. inline images come from
+  // S3 markdown / DB Shape A / MDX (2nd+) / Shape B in that order.
   const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
-  const inlineProvidesCover = inline.some((r) => r.asset === "cover");
-  const out: ImageRecord[] = [];
-  if (!inlineProvidesCover) out.push(coverRecord(cluster));
-  out.push(thumbnailRecord(cluster));
-  out.push(...inline);
-  return out;
+  return [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
 }
 
 export async function collectImageRecords(

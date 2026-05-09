@@ -34,6 +34,24 @@ import { uploadBlogImage } from "./s3.js";
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
 
+// Inline-SVG favicon — purple gradient circle with a refresh-arrow
+// over a stylised image frame. Encoded as a data URI so we don't ship
+// a separate file.
+const FAVICON_DATA_URI = (() => {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
+  <defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>
+    <stop offset='0' stop-color='%231e1b4b'/><stop offset='1' stop-color='%234338ca'/>
+  </linearGradient></defs>
+  <rect width='64' height='64' rx='14' fill='url(%23g)'/>
+  <rect x='14' y='17' width='30' height='22' rx='3' fill='none' stroke='%23fff' stroke-width='3'/>
+  <circle cx='22' cy='25' r='3' fill='%23fff'/>
+  <path d='M14 35 l8-8 6 6 4-4 8 8' fill='none' stroke='%23fff' stroke-width='3' stroke-linejoin='round'/>
+  <path d='M44 36 a8 8 0 1 1 -2 -7' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round'/>
+  <polygon points='42,28 50,28 46,21' fill='%23fff'/>
+</svg>`.replace(/\s+/g, " ").trim();
+  return `data:image/svg+xml;utf8,${svg}`;
+})();
+
 /**
  * Resolve a workspace URL "slug" to a `{ slug, projectId }` pair. The
  * slug is usually one of the allow-listed entries (e.g. `specgas`),
@@ -121,13 +139,16 @@ function esc(s: string): string {
 }
 
 function shell(title: string, body: string, scripts = "", crumb = ""): string {
+  // Browser tab title is always "Feeds Image Updater" (the per-page
+  // crumb appears in the in-app header instead).
+  void title;
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} · ${esc(APP_TITLE)}</title>
-<link rel="icon" type="image/svg+xml" href="${esc(LOGO_URL)}">
+<title>${esc(APP_TITLE)}</title>
+<link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <style>
   :root {
     --bg: #f6f7f9;
@@ -194,7 +215,11 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-search .combobox { flex: 1; min-width: 280px; }
   .hero-search .combobox input { font-size: 15px; padding: 12px 38px 12px 14px; border-radius: 8px; border-color: transparent; box-shadow: 0 4px 12px rgba(0,0,0,.06); }
   .hero-search .combobox input:focus { outline: 2px solid rgba(255,255,255,.5); }
-  .hero-btn { padding: 12px 22px; border-radius: 8px; font-size: 14px; }
+  .hero-btn { padding: 12px 22px; border-radius: 8px; font-size: 14px; font-weight: 600; }
+  /* Hero CTA: white fill + indigo text — readable contrast against the dark gradient. */
+  button.primary.hero-btn, .btn.primary.hero-btn { background: #fff; color: var(--brand); border-color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.18); }
+  button.primary.hero-btn:hover, .btn.primary.hero-btn:hover { background: #f5f3ff; color: var(--brand-hover); border-color: #f5f3ff; }
+  button.primary.hero-btn:disabled { background: rgba(255,255,255,.55); color: rgba(67,56,202,.55); border-color: transparent; box-shadow: none; }
   .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
   .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
 
@@ -248,6 +273,10 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .pill.internal { background: #d1fae5; color: #065f46; }
   .pill.external { background: #fce7f3; color: #9d174d; }
   .pill.generic { background: #e5e7eb; color: #374151; }
+  /* Service / category asset pills — same visual language as cover/thumbnail. */
+  .pill.service_h1 { background: #cffafe; color: #155e75; }
+  .pill.service_body { background: #e0f2fe; color: #075985; }
+  .pill.category_industry { background: #ffedd5; color: #9a3412; }
 
   /* Toolbar */
   .toolbar { display: flex; gap: 10px; align-items: center; padding: 12px 18px; flex-wrap: wrap; }
@@ -476,8 +505,9 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     display: none;
   }
   .combobox.open .menu { display: block; }
-  .combobox .menu .opt { padding: 8px 12px; cursor: pointer; font-size: 13px; }
+  .combobox .menu .opt { padding: 8px 12px; cursor: pointer; font-size: 13px; color: var(--ink); background: #fff; }
   .combobox .menu .opt:hover, .combobox .menu .opt.active { background: var(--accent-bg); color: var(--brand); }
+  .combobox .menu .opt strong { color: inherit; }
   .combobox .menu .opt .pid { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
 
   .log { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
@@ -549,10 +579,18 @@ interface ClientPickerEntry {
   name: string;
 }
 
+// In-process cache for the featured-client name lookup. The names rarely
+// change and the projects.id query was the dominant cost on home (5
+// round trips × ~150ms = 750ms). 10-minute TTL is plenty for an
+// internal tool; a process restart re-warms it in one query each.
+let CLIENT_PICKER_CACHE: { entries: ClientPickerEntry[]; expiresAt: number } | null = null;
+const CLIENT_PICKER_TTL_MS = 10 * 60 * 1000;
+
 async function loadClientPickerEntries(): Promise<ClientPickerEntry[]> {
-  // Fetch the project name for every allow-listed entry so the combobox
-  // can search by name as well as slug / project_id. Done in parallel;
-  // fast for any reasonable allow-list size.
+  const now = Date.now();
+  if (CLIENT_PICKER_CACHE && CLIENT_PICKER_CACHE.expiresAt > now) {
+    return CLIENT_PICKER_CACHE.entries;
+  }
   const out = await Promise.all(
     CLIENTS.map(async (c) => {
       try {
@@ -563,6 +601,7 @@ async function loadClientPickerEntries(): Promise<ClientPickerEntry[]> {
       }
     }),
   );
+  CLIENT_PICKER_CACHE = { entries: out, expiresAt: now + CLIENT_PICKER_TTL_MS };
   return out;
 }
 
@@ -628,9 +667,15 @@ async function homePage(res: ServerResponse) {
   } catch {
     envOk = false;
   }
-  const featured = envOk ? await loadClientPickerEntries() : CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }));
+  // Run the (sometimes-slow) project-name lookup and the recent-runs
+  // disk read in parallel — they're independent.
+  const [featured, recent] = await Promise.all([
+    envOk
+      ? loadClientPickerEntries()
+      : Promise.resolve(CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }))),
+    envOk ? loadRecentRuns(6) : Promise.resolve([] as RecentRunSummary[]),
+  ]);
   const featuredJson = JSON.stringify(featured);
-  const recent = envOk ? await loadRecentRuns(6) : [];
   const recentRows = recent
     .map((r) => {
       const started = (r.started_at ?? "").slice(0, 19).replace("T", " ");
@@ -878,6 +923,8 @@ interface ClusterPayload {
   id: string;
   page_type: PageType;
   topic: string;
+  slug: string | null;
+  published_url: string | null;
   updated_at: string | null;
   cover_url: string | null;
   total: number;
@@ -1063,10 +1110,15 @@ async function workspacePage(
     const counts: Record<string, number> = {};
     for (const r of recs) counts[r.asset] = (counts[r.asset] ?? 0) + 1;
     const cover = recs.find((r) => r.asset === "cover" || r.asset === "service_h1" || r.asset === "category_industry");
+    const publishedUrl = c.slug && project!.url
+      ? `${project!.url.replace(/\/+$/, "")}/feeds/${c.page_type}/${c.slug}`
+      : null;
     return {
       id: c.id,
       page_type: c.page_type,
       topic: c.topic ?? "(no topic)",
+      slug: c.slug,
+      published_url: publishedUrl,
       updated_at: c.updated_at ? c.updated_at.toISOString().slice(0, 10) : null,
       cover_url: cover?.previewUrl ?? null,
       total: recs.length,
@@ -1103,6 +1155,17 @@ async function workspacePage(
       const pills = Object.entries(c.by_asset)
         .map(([k, v]) => `<span class="pill ${esc(k)}">${esc(k)}: ${v}</span>`)
         .join(" ");
+      // Build the published-page URL from project root_domain +
+      // page_type + slug. Pattern (per spec):
+      //   https://<root_domain>/feeds/<page_type>/<slug>
+      // Falls back gracefully when slug isn't set on the cluster row.
+      const publishedUrl = (() => {
+        if (!c.slug) return null;
+        // Prefer projects.url (always populated) over root_domain.
+        const base = (project!.url ?? "").replace(/\/+$/, "");
+        if (!base) return null;
+        return `${base}/feeds/${c.page_type}/${c.slug}`;
+      })();
       return `
 <tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-page-type="${esc(c.page_type)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
   <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onclick="onClusterCheck('${esc(c.id)}', this.checked, event)"></td>
@@ -1112,7 +1175,11 @@ async function workspacePage(
   </td>
   <td class="preview">${cover}</td>
   <td class="types"><div class="pills-wrap">${pills}</div></td>
-  <td style="text-align:right;color:var(--ink-faint);font-size:11px">click to open ↗</td>
+  <td style="text-align:right" onclick="event.stopPropagation()">
+    ${publishedUrl
+      ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View Published Page →</a>`
+      : `<span class="sub" style="font-size:11px">no slug</span>`}
+  </td>
 </tr>`;
     })
     .join("");
@@ -1307,19 +1374,15 @@ ${awsBanner}
   <div class="caption" id="lightbox-cap"></div>
 </div>
 
-<!-- Sticky bottom action bar.
-     Live "Generate selected" is intentionally hidden during platform
-     verification; the only available action is the Dry run, which
-     mocks the full pipeline (no Portkey / Replicate spend) and
-     produces dummy outputs so the publish flow can be validated. -->
+<!-- Sticky bottom action bar — Generate runs the live pipeline
+     (Portkey + Replicate). No dry-run / mock path. -->
 <div class="action-bar">
   <div class="stats">
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
     <span id="bar-test-mode" style="display:none;color:var(--brand);margin-left:10px;font-size:12px">· test-run mode active (3 clusters)</span>
-    <span style="color:var(--ink-faint);margin-left:10px;font-size:12px">· live generation disabled while platform is in verification</span>
   </div>
   <div class="right">
-    <button class="primary" id="bar-dry-run-btn" onclick="runRegen(true)" disabled title="Mock the whole pipeline: skips Portkey + Replicate, emits synthetic prompts and picsum.photos URLs so the publish flow can be reviewed in seconds.">Dry run →</button>
+    <button class="primary" id="bar-generate-btn" onclick="runRegen()" disabled title="Generate replacement images for the selected items via Portkey + Replicate.">Generate →</button>
   </div>
 </div>
 `;
@@ -1417,7 +1480,7 @@ function refreshTotals() {
   }
   document.getElementById('bar-img-count').textContent = imgs;
   document.getElementById('bar-cluster-count').textContent = cls;
-  document.getElementById('bar-dry-run-btn').disabled = imgs === 0;
+  document.getElementById('bar-generate-btn').disabled = imgs === 0;
   for (const tr of allRows()) {
     const cid = tr.dataset.clusterId;
     if (!cid) continue;
@@ -1606,10 +1669,10 @@ async function saveBrand(e) {
   }
 }
 
-// Dry-run today is a full mock: skips Portkey + Replicate, emits
-// synthetic prompts + picsum.photos URLs. Live generation is wired in
-// the CLI but disabled in the UI until the platform is verified.
-async function runRegen(_unused) {
+// Live generation: posts the selected items to /regen, which spawns a
+// real CLI subprocess (Portkey + Replicate). Server redirects to the
+// /runs/<id> page so the operator can stream logs and review results.
+async function runRegen() {
   const items = [];
   for (const [cid, set] of selection.entries()) {
     if (set.size === 0) continue;
@@ -1624,7 +1687,6 @@ async function runRegen(_unused) {
     fd.append('cluster_id', it.cluster_id);
     for (const id of it.image_ids) fd.append('image_id', id);
   }
-  fd.set('mock', 'on');
   fd.set('provider', 'replicate');
   const r = await fetch('/regen', { method: 'POST', body: fd });
   if (r.redirected) { window.location.href = r.url; return; }
@@ -1716,21 +1778,72 @@ async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  let imageId = "", clusterId = "";
+  let runId = "", imageId = "", clusterId = "";
   try {
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { image_id?: string; cluster_id?: string };
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+      run_id?: string; image_id?: string; cluster_id?: string;
+    };
+    runId = body.run_id ?? "";
     imageId = body.image_id ?? "";
     clusterId = body.cluster_id ?? "";
   } catch {
     return sendJson(res, 400, { error: "invalid JSON body" });
   }
   if (!imageId) return sendJson(res, 400, { error: "image_id required" });
-  // Mock: rotate the picsum seed so the operator sees a different
-  // image after Regenerate. The live wiring would kick off a single-
-  // image CLI subprocess and return its image_url_new from the CSV.
-  const seed = (imageId + "-" + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40);
-  const url = `https://picsum.photos/seed/${seed}/800/450`;
-  sendJson(res, 200, { image_url_new: url, mock: true, image_id: imageId, cluster_id: clusterId });
+  if (!runId) return sendJson(res, 400, { error: "run_id required" });
+
+  const parent = RUNS.get(runId);
+  if (!parent) return sendJson(res, 404, { error: `run ${runId} not found` });
+
+  // If we don't have a cluster_id, recover it from the parent run's CSV.
+  if (!clusterId && parent.csvPath) {
+    const rows = await readRunCsv(parent.csvPath);
+    const row = rows.find((r) => r.image_id === imageId);
+    if (row) clusterId = row.cluster_id;
+  }
+  if (!clusterId) return sendJson(res, 400, { error: "cluster_id required (and not found in parent CSV)" });
+
+  // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
+  // We reuse the parent's client/page_type so the subprocess loads the
+  // identical graphic_token + project context.
+  const child = startRegen({
+    client: parent.client,
+    clusterIds: [clusterId],
+    imageIds: [imageId],
+    dryRun: false,
+    mock: false,
+    useSavedToken: true,
+    pageType: extractPageTypeFromArgs(parent.args),
+    provider: extractProviderFromArgs(parent.args),
+  });
+
+  // Wait for the subprocess to finish, then read its CSV for the new URL.
+  await new Promise<void>((resolve) => {
+    if (child.done) return resolve();
+    const onClose = () => resolve();
+    child.proc?.once("close", onClose);
+  });
+
+  if (child.exitCode !== 0 || !child.csvPath) {
+    return sendJson(res, 500, { error: `regen subprocess failed (exit ${child.exitCode})`, run_id: child.id });
+  }
+  const rows = await readRunCsv(child.csvPath);
+  const row = rows.find((r) => r.image_id === imageId);
+  if (!row || !row.image_url_new) {
+    return sendJson(res, 500, { error: `no new image URL produced for ${imageId}`, run_id: child.id });
+  }
+  sendJson(res, 200, { image_url_new: row.image_url_new, image_id: imageId, cluster_id: clusterId, run_id: child.id });
+}
+
+function extractPageTypeFromArgs(args: string[]): PageType | undefined {
+  const i = args.indexOf("--page-type");
+  if (i < 0) return undefined;
+  const v = args[i + 1];
+  return v === "service" || v === "category" || v === "blog" ? v : undefined;
+}
+function extractProviderFromArgs(args: string[]): string | undefined {
+  const i = args.indexOf("--provider");
+  return i >= 0 ? args[i + 1] : undefined;
 }
 
 async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
@@ -2431,7 +2544,7 @@ async function regenOne(imageId) {
   try {
     const r = await fetch('/api/regen-one', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ image_id: imageId, cluster_id: card.dataset.clusterId })
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_id: card.dataset.clusterId })
     });
     if (!r.ok) throw new Error(await r.text());
     const j = await r.json();
@@ -2654,6 +2767,9 @@ export function startWebServer(port: number): void {
 
   server.listen(port, () => {
     process.stdout.write(`web: listening on http://localhost:${port}\n`);
+    // Warm the featured-client cache so the very first home page render
+    // doesn't pay the projects.id round-trip cost.
+    loadClientPickerEntries().catch(() => { /* ignore — env may not be ready yet */ });
   });
 
   process.on("SIGINT", async () => {

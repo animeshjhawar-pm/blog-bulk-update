@@ -39,6 +39,14 @@ function templatesFor(asset: AssetType): { system: string; user: string } {
   }
 }
 
+function extractAdditionalInstructions(token: unknown): string | null {
+  if (!token || typeof token !== "object") return null;
+  const v = (token as Record<string, unknown>).additional_instructions;
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  return trimmed ? trimmed : null;
+}
+
 function safeJsonStringify(v: unknown): string {
   if (v == null) return "{}";
   if (typeof v === "string") return v;
@@ -88,6 +96,16 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
   const { asset } = params;
   const { system, user } = templatesFor(asset);
 
+  // If the operator saved brand guidelines via the workspace UI, they
+  // were appended to graphic_token.additional_instructions. Surface
+  // that string explicitly to the prompt-builder LLM so it gets pasted
+  // verbatim into the final image-gen prompt — not paraphrased and not
+  // dropped.
+  const additionalInstructions = extractAdditionalInstructions(params.graphicToken);
+  const systemWithDirective = additionalInstructions
+    ? `${system}\n\nADDITIONAL_INSTRUCTIONS_DIRECTIVE: The graphic_token contains a key \`additional_instructions\`. You MUST include the value of that key VERBATIM and unedited inside the final image-generation prompt as a dedicated "Additional brand instructions" block. Do not paraphrase, summarize, or omit any part of it. The current value (for reference) is:\n<<<\n${additionalInstructions}\n>>>`
+    : system;
+
   const userPrompt = interpolate(user, {
     placeholder_description: params.imageDescription ?? "",
     business_context: safeJsonStringify(params.businessContext),
@@ -96,11 +114,12 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
     client_homepage_url: params.clientHomepageUrl ?? "",
     subtitle: params.subtitle ?? "",
     category_label: params.categoryLabel ?? "",
+    additional_instructions: additionalInstructions ?? "",
   });
 
   const result = await callPortkey({
     model: "claude-sonnet-4-6",
-    systemPrompt: system,
+    systemPrompt: systemWithDirective,
     userPrompt,
     maxTokens: 64000,
     metadata: {
