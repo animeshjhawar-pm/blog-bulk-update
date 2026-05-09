@@ -107,6 +107,7 @@ function buildBaseRow(args: {
   | "generated_at_utc"
   | "client_slug"
   | "project_id"
+  | "previous_image_url"
 > {
   return {
     image_id: args.record.imageId,
@@ -118,6 +119,7 @@ function buildBaseRow(args: {
     generated_at_utc: args.generatedAt,
     client_slug: args.slug,
     project_id: args.project.id,
+    previous_image_url: args.record.previewUrl ?? "",
   };
 }
 

@@ -17,6 +17,11 @@ export const CSV_HEADER = [
   "error",
   "client_slug",
   "project_id",
+  // The CDN URL of the IMAGE THIS RUN IS REPLACING — captured at the
+  // moment the run starts (from media_registry / page_info.thumbnail
+  // / MDX fallback). Lets the runs-page Compare modal show old-vs-new
+  // without a separate DB round-trip.
+  "previous_image_url",
 ] as const;
 
 export type CsvHeader = (typeof CSV_HEADER)[number];

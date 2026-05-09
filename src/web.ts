@@ -225,38 +225,36 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
   .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
 
-  /* How-it-works — single horizontal strip with title + one-liner
-     under each step. Wraps to two lines on narrow viewports. */
+  /* How-it-works — single horizontal strip with a title + one-liner
+     under each step. Cards adjust their height to fit text; on narrow
+     viewports the strip wraps onto multiple rows so nothing overflows. */
   .howto { padding: 14px 18px; }
   .howto-head { margin-bottom: 10px; }
   .howto-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-muted); margin: 0; }
   .howto-steps {
     list-style: none; padding: 0; margin: 0;
-    display: flex; align-items: stretch; gap: 6px; flex-wrap: nowrap;
-    overflow-x: auto;
+    display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap;
   }
   .howto-steps li {
-    display: inline-flex; align-items: center; gap: 10px;
-    padding: 8px 14px; background: #f8fafc;
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 12px; background: #f8fafc;
     border: 1px solid var(--border); border-radius: 10px;
-    flex: 1 1 0; min-width: 0;
+    flex: 1 1 180px; min-width: 0;
   }
+  .howto-steps li > div { min-width: 0; flex: 1; }
   .howto-num {
     flex: 0 0 22px; width: 22px; height: 22px;
     display: inline-flex; align-items: center; justify-content: center;
     background: linear-gradient(135deg, var(--brand) 0%, #6366f1 100%);
     color: #fff; border-radius: 50%; font-weight: 600; font-size: 11px;
+    margin-top: 1px;
   }
-  .howto-label { font-size: 12.5px; font-weight: 600; color: var(--ink); white-space: nowrap; }
-  .howto-sub { font-size: 11.5px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  /* Arrow between consecutive chips. */
+  .howto-label { font-size: 12.5px; font-weight: 600; color: var(--ink); line-height: 1.3; word-wrap: break-word; }
+  .howto-sub { font-size: 11.5px; color: var(--ink-muted); line-height: 1.4; margin-top: 2px; word-wrap: break-word; }
+  /* Arrow between consecutive chips — vertically centered on the card. */
   .howto-steps li + li::before {
     content: "→"; color: var(--ink-faint); font-weight: 600;
-    align-self: center; margin: 0 -2px 0 -2px;
-  }
-  @media (max-width: 1100px) {
-    .howto-steps { flex-wrap: wrap; }
-    .howto-steps li { flex: 1 1 200px; }
+    align-self: center; margin: 0 -2px 0 -2px; flex: 0 0 auto;
   }
 
   .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
@@ -2740,6 +2738,11 @@ interface CsvRowParsed {
   error: string;
   client_slug: string;
   project_id: string;
+  /** CDN URL of the image this run is replacing. Captured at run-start
+   * from page_info / media_registry. Older CSVs from before this
+   * column existed will have it undefined; we fall back to a
+   * media_registry batch lookup in that case. */
+  previous_image_url?: string;
 }
 
 async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
@@ -2838,9 +2841,18 @@ async function runPage(res: ServerResponse, id: string) {
       // CDN URLs (so each card can show old-vs-new compare).
       const projectId = rows[0]?.project_id ?? "";
       const clusterIds = [...grouped.keys()];
+      // Index the CSV-recorded previous_image_url first; fall back to
+      // a media_registry batch lookup only for image_ids that don't
+      // have one (older CSVs written before the column existed).
+      const csvOldUrls = new Map<string, string>();
+      for (const r of rows) {
+        if (r.previous_image_url && r.previous_image_url.trim().length > 0) {
+          csvOldUrls.set(r.image_id, r.previous_image_url);
+        }
+      }
       const realImageIds = rows
         .map((r) => r.image_id)
-        .filter((id) => !id.includes("/"));
+        .filter((id) => !id.includes("/") && !csvOldUrls.has(id));
       const [projectForRun, clusterMeta, oldUrlsMap] = await Promise.all([
         projectId ? lookupProjectById(projectId).catch(() => null) : Promise.resolve(null),
         lookupClusterSlugs(clusterIds).catch(() => new Map()),
@@ -2852,6 +2864,10 @@ async function runPage(res: ServerResponse, id: string) {
         return buildPublishedUrl(projectForRun, m.page_type, m.slug);
       };
       const oldUrlOf = (imageId: string): string | null => {
+        // Primary source: the CSV column we now write at run start.
+        const fromCsv = csvOldUrls.get(imageId);
+        if (fromCsv) return fromCsv;
+        // Fallback for older runs: live media_registry lookup.
         const u = oldUrlsMap.get(imageId);
         if (!u) return null;
         return u["1080"] ?? u["720"] ?? u["360"] ?? null;
@@ -2875,10 +2891,12 @@ async function runPage(res: ServerResponse, id: string) {
               ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
               : "";
             const synthetic = r.image_id.includes("/");
-            // Compare button always renders when there's a new image —
-            // the modal handles "no old image found" with a placeholder
-            // so the operator gets feedback either way.
-            const canCompare = !!r.image_url_new;
+            // Compare button gate: BOTH a new image AND a known old
+            // image. With the previous_image_url CSV column populated
+            // at run-start, every workspace-visible image carries its
+            // CDN URL through to here, so this is true for every card
+            // on any run created after that change shipped.
+            const canCompare = !!r.image_url_new && !!oldUrl;
             return `
 <div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk actions (Apply / Regenerate)"}">
@@ -2954,8 +2972,7 @@ ${clusterSections}
         <div class="cmp-pane-h">Current (live)</div>
         <img id="cmp-old" alt="">
         <div id="cmp-old-ph" class="cmp-ph" style="display:none">
-          <div>No live image found in media_registry.</div>
-          <div class="sub" style="font-size:11.5px;margin-top:4px">This image_id has no recorded CDN url, so we can only show the new image on the right.</div>
+          <div class="sub">Loading current image…</div>
         </div>
       </div>
       <div class="cmp-pane">
