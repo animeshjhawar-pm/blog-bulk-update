@@ -215,8 +215,8 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-sub { margin: 0 0 22px; font-size: 13.5px; line-height: 1.55; color: rgba(255,255,255,.78); max-width: 620px; }
   .hero-search { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
   .hero-search .combobox { flex: 1; min-width: 280px; }
-  .hero-search .combobox input { font-size: 15px; padding: 12px 38px 12px 14px; border-radius: 8px; border-color: transparent; box-shadow: 0 4px 12px rgba(0,0,0,.06); }
-  .hero-search .combobox input:focus { outline: 2px solid rgba(255,255,255,.5); }
+  .hero-search .combo-field { padding: 6px; border-radius: 8px; }
+  .hero-search .combo-field:focus-within { outline: 2px solid rgba(255,255,255,.5); }
   .hero-btn { padding: 12px 22px; border-radius: 8px; font-size: 14px; font-weight: 600; }
   /* Hero CTA: white fill + indigo text — readable contrast against the dark gradient. */
   button.primary.hero-btn, .btn.primary.hero-btn { background: #fff; color: var(--brand); border-color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.18); }
@@ -225,36 +225,38 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .hero-hint { margin: 14px 0 0; font-size: 12px; color: rgba(255,255,255,.62); }
   .hero-hint code { background: rgba(255,255,255,.12); color: #fff; }
 
-  /* How-it-works — compact single-line strip. Six chips separated by
-     arrow glyphs. Wraps on narrow viewports. Hover a chip for the
-     full explanation (HTML title tooltip). */
+  /* How-it-works — single horizontal strip with title + one-liner
+     under each step. Wraps to two lines on narrow viewports. */
   .howto { padding: 14px 18px; }
-  .howto-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  .howto-head { margin-bottom: 10px; }
   .howto-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-muted); margin: 0; }
-  .howto-head .sub { font-size: 12px; }
   .howto-steps {
     list-style: none; padding: 0; margin: 0;
-    display: flex; align-items: stretch; flex-wrap: wrap; gap: 6px;
+    display: flex; align-items: stretch; gap: 6px; flex-wrap: nowrap;
+    overflow-x: auto;
   }
   .howto-steps li {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 6px 12px 6px 6px; background: #f8fafc;
-    border: 1px solid var(--border); border-radius: 999px;
-    font-size: 12.5px; color: var(--ink); line-height: 1;
-    cursor: help; flex: 0 0 auto;
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 8px 14px; background: #f8fafc;
+    border: 1px solid var(--border); border-radius: 10px;
+    flex: 1 1 0; min-width: 0;
   }
-  .howto-steps li:hover { border-color: var(--brand); background: var(--accent-bg); color: var(--brand); }
   .howto-num {
     flex: 0 0 22px; width: 22px; height: 22px;
     display: inline-flex; align-items: center; justify-content: center;
     background: linear-gradient(135deg, var(--brand) 0%, #6366f1 100%);
     color: #fff; border-radius: 50%; font-weight: 600; font-size: 11px;
   }
-  .howto-label { white-space: nowrap; font-weight: 500; }
+  .howto-label { font-size: 12.5px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+  .howto-sub { font-size: 11.5px; color: var(--ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* Arrow between consecutive chips. */
   .howto-steps li + li::before {
     content: "→"; color: var(--ink-faint); font-weight: 600;
-    margin-right: 6px; align-self: center;
+    align-self: center; margin: 0 -2px 0 -2px;
+  }
+  @media (max-width: 1100px) {
+    .howto-steps { flex-wrap: wrap; }
+    .howto-steps li { flex: 1 1 200px; }
   }
 
   .recent-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
@@ -416,6 +418,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .info-grid .k { color: var(--ink-muted); font-size: 12px; }
   .info-grid .v { word-break: break-word; }
   .json-dump { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font: 11.5px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; max-height: 320px; overflow: auto; color: #334155; }
+  .json-edit { font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace; background: #f8fafc; color: #334155; min-height: 280px; }
 
   /* Whole-row clickable cluster table */
   table.cluster-list tr.cluster-row { cursor: pointer; }
@@ -459,6 +462,11 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .pt-modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
   .pt-modal .body { overflow-y: auto; flex: 1; }
 
+  .pt-loading {
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 4px; color: var(--ink-muted); font-size: 13px;
+  }
+
   /* /import page-type chooser (legacy fallback page) */
   .pt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
   .pt-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border-strong); border-radius: 10px; cursor: pointer; transition: border-color .15s, background .15s; background: #fff; }
@@ -469,16 +477,21 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .pt-meta .pt-count { font-size: 12px; color: var(--ink-muted); margin-top: 2px; }
 
   /* Page-type tabs (blog / service / category) */
-  .page-tab-wrap { display: inline-flex; align-items: center; }
-  .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px 0 0 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; }
-  .page-tab:not(:has(+ .page-tab-x)) { border-radius: 999px; }
-  .page-tab-wrap:not(:has(.page-tab-x)) .page-tab { border-radius: 999px; }
+  /* Page-type pills (blog / service / category). Tri-state:
+       active     — currently shown in the table (filled, dark)
+       selected   — included in the workspace but not the active view
+       unselected — not in the workspace at all (muted/dashed)
+     Single click toggles the click target through the rules in tabBtn. */
+  .page-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--ink-muted); background: #fff; text-decoration: none; cursor: pointer; transition: background .12s, color .12s, border-color .12s; }
   .page-tab:hover { color: var(--ink); border-color: var(--border-strong); text-decoration: none; }
   .page-tab.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .page-tab.active:hover { background: #1e293b; color: #fff; }
+  .page-tab.selected { background: var(--accent-bg); color: var(--brand); border-color: #c7d2fe; }
+  .page-tab.selected:hover { background: #e0e7ff; color: var(--brand); border-color: var(--brand); }
+  .page-tab.unselected { background: #fff; color: var(--ink-faint); border-style: dashed; }
+  .page-tab.unselected:hover { color: var(--ink); border-style: solid; }
   .page-tab .ct { font-size: 11px; opacity: .7; }
   .page-tab.active .ct { color: #cbd5e1; opacity: 1; }
-  .page-tab-x { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 1px solid var(--border); border-left: none; border-radius: 0 999px 999px 0; color: var(--ink-faint); font-size: 14px; text-decoration: none; background: #fff; }
-  .page-tab-x:hover { color: var(--err); border-color: #fca5a5; text-decoration: none; }
 
   /* Lightbox (image viewer) */
   .lightbox-overlay {
@@ -593,12 +606,14 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .rc-zoom {
     position: absolute; top: 6px; right: 6px; z-index: 4;
     background: rgba(15,23,42,.75); color: #fff; border: 0;
-    width: 26px; height: 26px; border-radius: 6px;
-    font-size: 14px; line-height: 1; cursor: pointer;
-    opacity: 0; transition: opacity .15s, background .15s;
+    width: 28px; height: 28px; border-radius: 6px;
+    font-size: 15px; line-height: 1; cursor: pointer;
+    opacity: .7; transition: opacity .15s, background .15s;
   }
   .result-card:hover .rc-zoom { opacity: 1; }
-  .rc-zoom:hover { background: var(--brand); }
+  .rc-zoom:hover { background: var(--brand); opacity: 1; }
+  /* Image inside the result card is also clickable (delegated). */
+  .rc-img .rc-preview-img { cursor: zoom-in; }
   .btn-compare { font-size: 12px; padding: 5px 10px; }
   .btn-compare:hover { color: var(--brand); border-color: var(--brand); }
 
@@ -625,6 +640,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .cmp-pane-h { padding: 10px 14px; font-size: 12px; font-weight: 600; color: var(--ink-muted); text-transform: uppercase; letter-spacing: .05em; background: #fff; border-bottom: 1px solid var(--border); }
   .cmp-pane-h.cmp-pane-h-new { color: var(--brand); }
   .cmp-pane img { flex: 1; min-height: 0; width: 100%; object-fit: contain; padding: 12px; }
+  .cmp-ph { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: var(--ink-muted); padding: 24px; text-align: center; }
   @media (max-width: 768px) { .cmp-body { grid-template-columns: 1fr; } }
 
   /* Cluster section header on run page */
@@ -633,7 +649,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 
   /* Combobox */
   .combobox { position: relative; }
-  .combobox input { padding-right: 36px; }
+  .combobox .combo-field input { padding-right: 36px; }
   .combobox .arrow { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--ink-faint); pointer-events: none; }
   .combobox .menu {
     position: absolute; top: calc(100% + 4px); left: 0; right: 0;
@@ -643,45 +659,87 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     display: none;
   }
   .combobox.open .menu { display: block; }
-  /* Picked-state chip — replaces the input text so the selection
-     reads as a chosen entity. Lives inside .combobox absolutely so
-     it visually overlays the input control. */
+  /* Combobox input wrapper — the input control itself never disappears.
+     When a client is picked, an inline chip appears INSIDE this
+     wrapper, alongside the (now disabled) input. The × on the chip
+     is the only way to clear. */
+  .combo-field {
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--border-strong); border-radius: 8px;
+    background: #fff; padding: 4px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.06);
+  }
+  .combo-field:focus-within { outline: 2px solid var(--accent-bg); border-color: var(--brand); }
+  .combo-field input {
+    flex: 1; min-width: 80px;
+    border: 0; outline: 0; padding: 8px 4px;
+    background: transparent; box-shadow: none; font-size: 15px;
+  }
+  .hero-search .combo-field input { font-size: 15px; padding: 8px 6px; }
+  .hero-search .combo-field input:disabled { cursor: default; background: transparent; }
+  /* Error banner under the field when the user attempts a 2nd pick. */
+  .combo-error {
+    color: var(--err); background: var(--err-bg);
+    border: 1px solid #fca5a5; border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; margin: 8px 0 0;
+  }
+  .combo-error[hidden] { display: none; }
+
+  /* Inline picked chip. Lives in-flow inside .combo-field. */
   .combo-chip {
-    display: inline-flex; align-items: center; gap: 8px;
-    background: #fff; border: 1px solid var(--border-strong);
-    border-radius: 6px; padding: 6px 8px 6px 10px; max-width: 100%;
-    box-shadow: var(--shadow);
-    font-size: 14px; color: var(--ink);
+    display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto;
+    background: var(--accent-bg); border: 1px solid #c7d2fe;
+    border-radius: 6px; padding: 4px 4px 4px 10px;
+    font-size: 13.5px; color: var(--brand); font-weight: 500;
   }
   .combo-chip[hidden] { display: none; }
-  .combo-chip .fav { width: 18px; height: 18px; flex: 0 0 18px; }
-  .combo-chip span { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .combo-chip .fav { width: 16px; height: 16px; flex: 0 0 16px; border-radius: 3px; background: #fff; }
+  .combo-chip span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
   .combo-chip-x {
-    margin-left: 4px; padding: 0 6px; font-size: 16px; line-height: 1;
-    background: transparent; border: 0; color: var(--ink-faint);
-    cursor: pointer; border-radius: 4px;
+    margin-left: 2px; padding: 0 8px; font-size: 16px; line-height: 1;
+    background: transparent; border: 0; color: var(--brand);
+    cursor: pointer; border-radius: 4px; opacity: .7;
   }
-  .combo-chip-x:hover { color: var(--err); background: #fef2f2; }
-  .hero-search .combo-chip { font-size: 15px; padding: 10px 10px 10px 14px; }
-  .hero-search .combo-chip .fav { width: 22px; height: 22px; flex: 0 0 22px; }
+  .combo-chip-x:hover { opacity: 1; color: var(--err); background: #fff; }
+  .hero-search .combo-chip { font-size: 14px; padding: 6px 4px 6px 12px; }
+  .hero-search .combo-chip .fav { width: 18px; height: 18px; flex: 0 0 18px; }
+  /* Shake animation when a 2nd pick is attempted. */
+  @keyframes shake-key { 10%,90% { transform: translateX(-1px); } 20%,80% { transform: translateX(2px); } 30%,50%,70% { transform: translateX(-3px); } 40%,60% { transform: translateX(3px); } }
+  .combo-chip-shake { animation: shake-key .35s ease-in-out; border-color: var(--err); }
   .combobox .menu .opt { padding: 8px 12px; cursor: pointer; font-size: 13px; color: var(--ink); background: #fff; }
   .combobox .menu .opt:hover, .combobox .menu .opt.active { background: var(--accent-bg); color: var(--brand); }
   .combobox .menu .opt strong { color: inherit; }
   .combobox .menu .opt .pid { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
 
   .log { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
-  /* Friendly activity feed — plain-English alternative to the raw log. */
-  .log-friendly { display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow-y: auto; padding: 4px 2px; }
-  .friendly-row { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-radius: 6px; font-size: 13px; line-height: 1.4; border: 1px solid transparent; }
-  .friendly-row code { font-size: 11px; }
-  .friendly-info { background: #f8fafc; color: var(--ink); border-color: var(--border); }
-  .friendly-ok   { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
-  .friendly-err  { background: var(--err-bg); color: var(--err); border-color: #fca5a5; }
-  .friendly-verbose { background: transparent; color: var(--ink-faint); font-size: 11.5px; padding: 2px 8px; }
-  .friendly-row .fr-step { background: var(--accent-bg); color: var(--brand); padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; flex: 0 0 auto; }
-  .friendly-row .fr-asset { background: #fff; border: 1px solid var(--border); padding: 0 8px; border-radius: 999px; font-size: 11px; flex: 0 0 auto; }
-  .friendly-row .fr-cluster { color: var(--ink-muted); font-size: 11px; flex: 0 0 auto; }
-  .friendly-row .fr-state { margin-left: auto; font-weight: 500; }
+
+  /* Running hero — shown only while a run is in flight. Big spinner +
+     auto-rotating tips + elapsed timer. Replaces the old "streaming…"
+     banner with something the operator can actually look at. */
+  .running-hero {
+    display: flex; align-items: center; gap: 18px;
+    padding: 22px 24px;
+    background: linear-gradient(135deg, #1e1b4b 0%, #4338ca 100%);
+    color: #fff; border: none;
+  }
+  .running-spinner-wrap { flex: 0 0 auto; }
+  .running-spinner {
+    display: inline-block; width: 32px; height: 32px;
+    border: 3px solid rgba(255,255,255,.4); border-top-color: #fff;
+    border-radius: 50%;
+    animation: spinkey .9s linear infinite;
+  }
+  .running-text { flex: 1; min-width: 0; }
+  .running-stage { font-size: 17px; font-weight: 600; letter-spacing: -.005em; }
+  .running-stage::after {
+    content: ""; display: inline-block; width: 1.6em;
+    text-align: left; animation: dotskey 1.4s steps(4, end) infinite;
+  }
+  @keyframes dotskey { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } 100% { content: ""; } }
+  .running-tip { margin-top: 4px; font-size: 13px; color: rgba(255,255,255,.78); transition: opacity .3s; }
+  .running-meta { flex: 0 0 auto; text-align: right; }
+  .running-elapsed { font-size: 12px; opacity: .8; font-variant-numeric: tabular-nums; }
+  .running-count { font-size: 13px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
 
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
   .row > * { flex: 1; min-width: 160px; }
@@ -756,6 +814,26 @@ interface ClientPickerEntry {
  * domain without needing per-site /favicon.ico probing. Falls back to
  * a tiny inline SVG dot when the URL is unparseable.
  */
+/**
+ * Build the live "View current page" URL. The pattern is always
+ *   `<canonical_url>/<page_type>/<slug>`
+ * with `canonical_url` coming straight from `projects.canonical_url`
+ * (it bakes in any per-client subdomain, e.g. feeds.trussed.ai vs
+ * achengineering.com/feeds). Falls back to `<projects.url>/feeds`
+ * for legacy rows that don't have canonical_url populated.
+ */
+function buildPublishedUrl(project: ProjectRow, pageType: string, slug: string | null): string | null {
+  if (!slug) return null;
+  let base = (project.canonical_url ?? "").trim();
+  if (!base) {
+    const fallback = (project.url ?? "").replace(/\/+$/, "");
+    if (!fallback) return null;
+    base = `${fallback}/feeds`;
+  }
+  base = base.replace(/\/+$/, "");
+  return `${base}/${pageType}/${slug}`;
+}
+
 function faviconFor(rawUrl: string | null | undefined): string {
   const u = (rawUrl ?? "").trim();
   if (!u) return FAVICON_FALLBACK;
@@ -936,15 +1014,17 @@ async function homePage(res: ServerResponse) {
     <form id="import-form" onsubmit="onContinue(event)" autocomplete="off">
       <div class="hero-search">
         <div class="combobox" id="combo">
-          <!-- Picked-state chip (favicon + name + ×); replaces the input
-               when an item is selected so the choice doesn't read as
-               plain typed text. Clicking × clears the selection. -->
-          <div class="combo-chip" id="combo-chip" hidden>
-            <img class="fav" id="combo-chip-fav" alt="">
-            <span id="combo-chip-name"></span>
-            <button type="button" class="combo-chip-x" onclick="clearComboPick(event)" title="Clear selection" aria-label="Clear">×</button>
+          <!-- Single field: the picked card (when present) renders
+               INSIDE this wrapper next to the input so the search bar
+               itself never disappears. The × on the card clears it. -->
+          <div class="combo-field">
+            <div class="combo-chip" id="combo-chip" hidden>
+              <img class="fav" id="combo-chip-fav" alt="">
+              <span id="combo-chip-name"></span>
+              <button type="button" class="combo-chip-x" onclick="clearComboPick(event)" title="Clear selection" aria-label="Clear">×</button>
+            </div>
+            <input type="text" id="client-input" placeholder="Search a client — name, URL, or project_id" autocomplete="off">
           </div>
-          <input type="text" id="client-input" placeholder="Search a client — name, URL, or project_id" autocomplete="off">
           <span class="arrow">▾</span>
           <div class="menu" id="combo-menu"></div>
         </div>
@@ -953,6 +1033,7 @@ async function homePage(res: ServerResponse) {
         <input type="hidden" id="client-url">
         <button class="primary hero-btn" type="submit" id="import-btn" disabled>Continue →</button>
       </div>
+      <p class="combo-error" id="combo-error" hidden>Only one client can be selected. Clear the current one first.</p>
       <p class="hero-hint">A handful of featured clients have their <code>graphic_token</code> pre-saved (loads instantly). Any other project is extracted on the fly — adds ~30 seconds to the one-time import.</p>
     </form>
   </div>
@@ -970,21 +1051,20 @@ ${recent.length > 0 ? `
   <div class="sub">No runs yet. Pick a client above to get started.</div>
 </section>`}
 
-<!-- How-to flowchart — single-row visual walkthrough; six terse steps
-     with arrows between them. Tooltip on each gives the full
-     explanation if needed. -->
+<!-- How-to flowchart — single horizontal row. Each step is a chip
+     with a short title + one-line description so the strip is
+     self-explanatory without needing a tooltip. -->
 <section class="card howto" style="margin-top:18px">
   <div class="howto-head">
     <h2 style="margin:0">How it works</h2>
-    <span class="sub">Pick → Filter → Select → Generate → Review → Apply.</span>
   </div>
   <ol class="howto-steps">
-    <li title="Search by name, URL or project_id. Featured clients load instantly."><span class="howto-num">1</span><span class="howto-label">Pick client</span></li>
-    <li title="Blog, service, category — any combination. Only published pages."><span class="howto-num">2</span><span class="howto-label">Page types</span></li>
-    <li title="Tick the clusters and the specific images you want to regenerate."><span class="howto-num">3</span><span class="howto-label">Select images</span></li>
-    <li title="Claude builds prompts; Replicate generates images. ~30–60s each."><span class="howto-num">4</span><span class="howto-label">Generate</span></li>
-    <li title="Zoom in, compare old vs new, regenerate any card you don't like."><span class="howto-num">5</span><span class="howto-label">Review</span></li>
-    <li title="Pushes to gw-content-store at the live key — visible on the site immediately."><span class="howto-num">6</span><span class="howto-label">Apply</span></li>
+    <li><span class="howto-num">1</span><div><div class="howto-label">Pick client</div><div class="howto-sub">Search by name or URL.</div></div></li>
+    <li><span class="howto-num">2</span><div><div class="howto-label">Page types</div><div class="howto-sub">Blog, service, or category.</div></div></li>
+    <li><span class="howto-num">3</span><div><div class="howto-label">Select images</div><div class="howto-sub">Tick clusters and images.</div></div></li>
+    <li><span class="howto-num">4</span><div><div class="howto-label">Generate</div><div class="howto-sub">Claude + Replicate produce them.</div></div></li>
+    <li><span class="howto-num">5</span><div><div class="howto-label">Review</div><div class="howto-sub">Zoom, compare, or regenerate.</div></div></li>
+    <li><span class="howto-num">6</span><div><div class="howto-label">Apply</div><div class="howto-sub">Pushes the new image live.</div></div></li>
   </ol>
 </section>
 
@@ -997,7 +1077,7 @@ ${recent.length > 0 ? `
   </header>
   <div class="body" style="padding:18px 20px">
     <div class="sub" style="margin-bottom:12px">Only published pages are loaded. Pick the types you want to work on; you can change this later.</div>
-    <div id="pt-loading" class="sub">loading counts…</div>
+    <div id="pt-loading" class="pt-loading"><span class="spinner"></span> Counting published pages…</div>
     <div id="pt-grid" class="pt-grid" style="display:none"></div>
   </div>
   <footer style="padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center">
@@ -1077,14 +1157,15 @@ function renderMenu(featured, dbHits, q) {
 }
 function pick(i) {
   if (i < 0 || i >= visible.length) return;
+  // Single-select rule: if a pick is already in place, flash the
+  // error banner instead of swapping. The user has to clear with × first.
+  if (hiddenPid.value) { showComboError(); return; }
   const c = visible[i];
   inp.value = '';
   hidden.value = c.slug || c.projectId; // slug for allow-list, project_id otherwise
   hiddenPid.value = c.projectId;
   hiddenName.value = c.name;
   hiddenUrl.value = c.url || '';
-  // Render a chip in place of the typed text so the selection reads
-  // as a chosen entity, not free-form text.
   setComboChip(c.name, c.url || '');
   combo.classList.remove('open');
   btn.disabled = false;
@@ -1096,18 +1177,42 @@ function setComboChip(name, url) {
   fav.src = faviconUrlForUi(url);
   nm.textContent = name;
   chip.hidden = false;
-  inp.style.display = 'none';
+  // Keep the input in the DOM but blank out its placeholder so the
+  // selection reads cleanly. Disable typing while a pick is active —
+  // the only way forward is × or Continue.
+  inp.value = '';
+  inp.placeholder = '';
+  inp.disabled = true;
 }
 function clearComboPick(ev) {
   if (ev) { ev.preventDefault(); ev.stopPropagation(); }
   document.getElementById('combo-chip').hidden = true;
-  inp.style.display = '';
+  inp.disabled = false;
+  inp.placeholder = 'Search a client — name, URL, or project_id';
   inp.value = '';
   hidden.value = ''; hiddenPid.value = ''; hiddenName.value = ''; hiddenUrl.value = '';
   btn.disabled = true;
+  hideComboError();
   inp.focus();
   refresh('');
   combo.classList.add('open');
+}
+let comboErrorTimer = null;
+function showComboError() {
+  const el = document.getElementById('combo-error');
+  if (!el) return;
+  el.hidden = false;
+  document.getElementById('combo-chip').classList.add('combo-chip-shake');
+  if (comboErrorTimer) clearTimeout(comboErrorTimer);
+  comboErrorTimer = setTimeout(() => {
+    el.hidden = true;
+    document.getElementById('combo-chip').classList.remove('combo-chip-shake');
+  }, 2400);
+}
+function hideComboError() {
+  const el = document.getElementById('combo-error');
+  if (el) el.hidden = true;
+  document.getElementById('combo-chip').classList.remove('combo-chip-shake');
 }
 async function refresh(q) {
   const featuredHits = FEATURED.filter((c) => !q
@@ -1401,9 +1506,7 @@ async function workspacePage(
     const counts: Record<string, number> = {};
     for (const r of recs) counts[r.asset] = (counts[r.asset] ?? 0) + 1;
     const cover = recs.find((r) => r.asset === "cover" || r.asset === "service_h1" || r.asset === "category_industry");
-    const publishedUrl = c.slug && project!.url
-      ? `${project!.url.replace(/\/+$/, "")}/feeds/${c.page_type}/${c.slug}`
-      : null;
+    const publishedUrl = buildPublishedUrl(project!, c.page_type, c.slug);
     return {
       id: c.id,
       page_type: c.page_type,
@@ -1454,13 +1557,7 @@ async function workspacePage(
       // page_type + slug. Pattern (per spec):
       //   https://<root_domain>/feeds/<page_type>/<slug>
       // Falls back gracefully when slug isn't set on the cluster row.
-      const publishedUrl = (() => {
-        if (!c.slug) return null;
-        // Prefer projects.url (always populated) over root_domain.
-        const base = (project!.url ?? "").replace(/\/+$/, "");
-        if (!base) return null;
-        return `${base}/feeds/${c.page_type}/${c.slug}`;
-      })();
+      const publishedUrl = buildPublishedUrl(project!, c.page_type, c.slug);
       return `
 <tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-page-type="${esc(c.page_type)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
   <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onclick="onClusterCheck('${esc(c.id)}', this.checked, event)"></td>
@@ -1519,31 +1616,41 @@ async function workspacePage(
 </section>`;
 
   const effectiveLogo = overrides.logo_url || primaryLogo || "";
-  // Workspace tabs reflect ONLY the page types the operator picked at
-  // /import. If they unchecked Service or Category there, those tabs
-  // don't render here. Default = show all three (legacy direct hits).
-  const visibleTabs: PageType[] = selectedPageTypes && selectedPageTypes.size > 0
-    ? (["blog", "service", "category"] as PageType[]).filter((pt) => selectedPageTypes.has(pt))
-    : ["blog", "service", "category"];
-  const selectedQs = selectedPageTypes && selectedPageTypes.size > 0
-    ? `&selected=${[...selectedPageTypes].join(",")}`
-    : "";
-  const tabHref = (pt: PageType) => `/workspace/${esc(slug)}?page_type=${pt}${selectedQs}`;
-  // Each tab has a small × that drops it from the selected set; clicking
-  // the tab itself navigates to that page_type's view. The current
-  // active tab can't be removed (would leave an empty selection).
+  const allPageTypes: PageType[] = ["blog", "service", "category"];
+  const currentSelected = selectedPageTypes && selectedPageTypes.size > 0
+    ? new Set(allPageTypes.filter((pt) => selectedPageTypes.has(pt)))
+    : new Set<PageType>(allPageTypes);
+
+  // All three pills always render. Click semantics (single click = toggle):
+  //   - active pill, with siblings selected → deselect + switch active to first remaining
+  //   - active pill, only one selected → no-op (always need one active)
+  //   - inactive but selected → just switch active to it
+  //   - not selected → add to selection AND switch active
   const tabBtn = (pt: PageType, label: string) => {
     const isActive = pageType === pt;
-    const closeable = !isActive;
-    const dropQs = (() => {
-      if (!selectedPageTypes || selectedPageTypes.size <= 1) return "";
-      const remaining = [...visibleTabs].filter((t) => t !== pt).join(",");
-      return remaining ? `?page_type=${pageType}&selected=${remaining}` : `?page_type=${pageType}`;
-    })();
-    return `<span class="page-tab-wrap">
-      <a class="page-tab${isActive ? " active" : ""}" href="${tabHref(pt)}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>
-      ${closeable && selectedPageTypes && selectedPageTypes.size > 1 ? `<a class="page-tab-x" href="/workspace/${esc(slug)}${dropQs}" title="remove from selection">×</a>` : ""}
-    </span>`;
+    const isSelected = currentSelected.has(pt);
+    let nextSelected: PageType[];
+    let nextActive: PageType = pt;
+    if (isActive && isSelected) {
+      // Toggle off if there's at least one other selected.
+      const others = [...currentSelected].filter((t) => t !== pt) as PageType[];
+      if (others.length === 0) {
+        nextSelected = [pt]; // pinned — can't deselect last one
+        nextActive = pt;
+      } else {
+        nextSelected = others;
+        nextActive = others[0]!;
+      }
+    } else if (isSelected) {
+      nextSelected = [...currentSelected];
+      nextActive = pt;
+    } else {
+      nextSelected = [...currentSelected, pt];
+      nextActive = pt;
+    }
+    const href = `/workspace/${esc(slug)}?page_type=${nextActive}&selected=${nextSelected.join(",")}`;
+    const stateClass = isActive ? "active" : isSelected ? "selected" : "unselected";
+    return `<a class="page-tab ${stateClass}" href="${href}" title="${isSelected ? "click again to remove" : "click to add"}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
   };
 
   const body = `
@@ -1557,14 +1664,9 @@ ${awsBanner}
         ${clusters.length} ${esc(pageType)} pages · ${totalImages} images (${totalsBadges})
       </div>
       <div class="page-tabs" style="margin-top:10px;display:flex;gap:6px">
-        ${visibleTabs.map((pt) => tabBtn(pt, pt[0]!.toUpperCase() + pt.slice(1))).join("")}
-        <a class="page-tab" href="/import?client=${esc(slug)}" style="margin-left:auto;color:var(--ink-muted)">⇅ Change selection</a>
+        ${allPageTypes.map((pt) => tabBtn(pt, pt[0]!.toUpperCase() + pt.slice(1))).join("")}
       </div>
     </div>
-    <label class="toggle" id="test-run-toggle" style="flex:0 0 auto">
-      <input type="checkbox" id="test-run-mode" onchange="toggleTestRun(this.checked)">
-      Test run mode (3 clusters)
-    </label>
   </div>
 </section>
 
@@ -1604,13 +1706,19 @@ ${awsBanner}
       <h2 style="display:inline">Brand guidelines · graphic_token</h2>
     </summary>
     <div class="sub" style="margin:8px 0 10px">
-      The graphic_token JSON below is what the prompts read. To add brand guidelines (colors not in the token, mandatory taglines, things to avoid, etc.), type them in the box at the bottom and click <strong>Save</strong> — they're appended to the token under <code>additional_instructions</code> and become part of every prompt going forward.
+      The graphic_token JSON below is what every prompt reads. Edit it directly and hit <strong>Save token</strong> to overwrite the saved file. The free-text box below is for additional brand guidelines (colors not in the token, mandatory taglines, things to avoid) — those are appended under <code>additional_instructions</code> and woven into every prompt.
     </div>
 
-    <details style="margin-bottom:12px">
-      <summary><strong style="font-size:13px">graphic_token (read-only view)</strong></summary>
-      <pre class="json-dump" style="margin-top:8px">${esc(fmtJson(savedToken))}</pre>
-    </details>
+    <form id="token-form" onsubmit="saveToken(event)" style="margin-bottom:14px">
+      <label style="font-size:12px;color:var(--ink-muted)"><code>graphic_token</code> (editable JSON)</label>
+      <textarea id="token-text" class="json-edit" spellcheck="false">${esc(fmtJson(savedToken))}</textarea>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button type="submit" class="primary">Save token</button>
+        <button type="button" onclick="resetToken()">Reset</button>
+        <button type="button" onclick="formatToken()">Format JSON</button>
+        <span id="token-status" class="sub"></span>
+      </div>
+    </form>
 
     <form id="brand-form" onsubmit="saveBrand(event)">
       <label style="font-size:12px;color:var(--ink-muted)">Append to <code>graphic_token.additional_instructions</code></label>
@@ -1622,6 +1730,50 @@ ${awsBanner}
     </form>
   </details>
 </section>
+<script>
+const TOKEN_INITIAL = ${JSON.stringify(JSON.stringify(savedToken ?? {}, null, 2))};
+function resetToken() {
+  document.getElementById('token-text').value = TOKEN_INITIAL;
+  document.getElementById('token-status').textContent = '';
+}
+function formatToken() {
+  const t = document.getElementById('token-text');
+  try {
+    const parsed = JSON.parse(t.value || '{}');
+    t.value = JSON.stringify(parsed, null, 2);
+    document.getElementById('token-status').textContent = 'formatted ✓';
+    setTimeout(() => { document.getElementById('token-status').textContent = ''; }, 1200);
+  } catch (err) {
+    document.getElementById('token-status').textContent = 'invalid JSON: ' + err.message;
+    document.getElementById('token-status').style.color = 'var(--err)';
+  }
+}
+async function saveToken(e) {
+  e.preventDefault();
+  const status = document.getElementById('token-status');
+  status.style.color = '';
+  const raw = document.getElementById('token-text').value;
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (err) {
+    status.style.color = 'var(--err)';
+    status.textContent = 'invalid JSON: ' + err.message;
+    return;
+  }
+  status.textContent = 'saving…';
+  try {
+    const r = await fetch('/workspace/' + encodeURIComponent(${JSON.stringify(slug)}) + '/token', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: parsed })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    status.textContent = 'saved ✓';
+    setTimeout(() => { status.textContent = ''; }, 1500);
+  } catch (err) {
+    status.style.color = 'var(--err)';
+    status.textContent = 'error: ' + err.message;
+  }
+}
+</script>
 
 <section class="card" style="padding:0">
   <div class="toolbar">
@@ -1674,7 +1826,6 @@ ${awsBanner}
 <div class="action-bar">
   <div class="stats">
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
-    <span id="bar-test-mode" style="display:none;color:var(--brand);margin-left:10px;font-size:12px">· test-run mode active (3 clusters)</span>
   </div>
   <div class="right">
     <button class="primary" id="bar-generate-btn" onclick="runRegen()" disabled title="Generate replacement images for the selected items via Portkey + Replicate.">Generate →</button>
@@ -1686,7 +1837,6 @@ ${awsBanner}
 const SLUG = ${JSON.stringify(slug)};
 const PAGE_TYPE = ${JSON.stringify(pageType)};
 const CLUSTERS = ${JSON.stringify(payload)};
-const TEST_RUN_LIMIT = 3;
 // Per-cluster set of selected image IDs. Empty set = nothing selected.
 const selection = new Map();
 
@@ -1739,27 +1889,13 @@ function allRows() {
   return Array.from(document.querySelectorAll('#cluster-tbody tr'));
 }
 
-// ── Test run mode (limit to first 3 clusters) ──
-let testRunMode = false;
-function toggleTestRun(on) {
-  testRunMode = on;
-  document.getElementById('test-run-toggle').classList.toggle('on', on);
-  document.getElementById('bar-test-mode').style.display = on ? 'inline' : 'none';
-  applyFilters();
-}
 function applyFilters() {
   const q = (document.getElementById('topic-filter').value || '').toLowerCase().trim();
   let n = 0;
-  let matchedSoFar = 0;
   for (const tr of allRows()) {
     const topic = tr.dataset.topic ?? '';
     const cid = tr.dataset.clusterId ?? '';
-    const matchSearch = !q || topic.includes(q) || cid.includes(q);
-    let visible = matchSearch;
-    if (visible && testRunMode) {
-      if (matchedSoFar >= TEST_RUN_LIMIT) visible = false;
-      else matchedSoFar++;
-    }
+    const visible = !q || topic.includes(q) || cid.includes(q);
     tr.classList.toggle('row-hidden', !visible);
     if (visible) n++;
   }
@@ -2205,6 +2341,34 @@ async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug:
   const brandPath = await saveBrandGuidelines(slug, trimmed);
 
   sendJson(res, 200, { ok: true, brand_path: brandPath, token_path: tokenPath, length: trimmed.length });
+}
+
+/**
+ * POST /workspace/:slug/token — overwrite graphic-tokens/<slug>.json
+ * with operator-edited JSON. Body: { token: <object> }. Pre-validates
+ * that the body is a JSON object (not an array, not a string).
+ */
+async function saveTokenHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
+  if (!resolveClient(slug)) return sendJson(res, 400, { error: "unknown client" });
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let token: unknown;
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { token?: unknown };
+    token = body.token;
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON body" });
+  }
+  if (!token || typeof token !== "object" || Array.isArray(token)) {
+    return sendJson(res, 400, { error: "token must be a JSON object" });
+  }
+  try {
+    const { saveToken } = await import("./tokens.js");
+    const tokenPath = await saveToken(slug, token as Record<string, unknown>);
+    sendJson(res, 200, { ok: true, token_path: tokenPath });
+  } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
 }
 
 async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
@@ -2682,11 +2846,10 @@ async function runPage(res: ServerResponse, id: string) {
         lookupClusterSlugs(clusterIds).catch(() => new Map()),
         realImageIds.length > 0 ? lookupImageUrls(realImageIds).catch(() => new Map()) : Promise.resolve(new Map()),
       ]);
-      const projectBaseUrl = (projectForRun?.url ?? "").replace(/\/+$/, "");
       const publishedUrlOf = (clusterId: string): string | null => {
         const m = clusterMeta.get(clusterId);
-        if (!m || !m.slug || !projectBaseUrl) return null;
-        return `${projectBaseUrl}/feeds/${m.page_type}/${m.slug}`;
+        if (!m || !m.slug || !projectForRun) return null;
+        return buildPublishedUrl(projectForRun, m.page_type, m.slug);
       };
       const oldUrlOf = (imageId: string): string | null => {
         const u = oldUrlsMap.get(imageId);
@@ -2701,23 +2864,28 @@ async function runPage(res: ServerResponse, id: string) {
         const cards = g.rows
           .map((r) => {
             const oldUrl = oldUrlOf(r.image_id);
+            // Image preview is rendered without an inline onclick; a
+            // delegated click handler on the page binds zoom to every
+            // image on load (more reliable across browsers + matches
+            // future cards added dynamically).
             const previewHtml = r.image_url_new
-              ? `<img src="${esc(r.image_url_new)}" alt="" loading="lazy" onclick="lbOpen(event, this.src, ${jsAttr(r.asset_type + " · " + r.image_id)})">`
+              ? `<img class="rc-preview-img" src="${esc(r.image_url_new)}" alt="" loading="lazy">`
               : `<div class="ph">${esc(r.status)}</div>`;
             const errCell = r.error
               ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
               : "";
             const synthetic = r.image_id.includes("/");
-            // Compare button is only useful when we have BOTH a new
-            // image and a known old image to put next to it.
-            const canCompare = !!r.image_url_new && !!oldUrl;
+            // Compare button always renders when there's a new image —
+            // the modal handles "no old image found" with a placeholder
+            // so the operator gets feedback either way.
+            const canCompare = !!r.image_url_new;
             return `
 <div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk actions (Apply / Regenerate)"}">
     <input type="checkbox" class="rc-pick-cb" ${synthetic ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
   <div class="rc-img">${previewHtml}
-    <button class="rc-zoom" onclick="zoomCard('${esc(r.image_id)}', event)" title="Zoom in"><span aria-hidden="true">⤢</span></button>
+    <button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>
   </div>
   <div class="rc-body">
     <div class="rc-row">
@@ -2729,9 +2897,9 @@ async function runPage(res: ServerResponse, id: string) {
     ${errCell}
     <div class="rc-status-line"></div>
     <div class="rc-actions">
-      <button class="btn-regen" onclick="regenOne('${esc(r.image_id)}')" title="Regenerate this image">↻ Regenerate</button>
-      ${canCompare ? `<button class="btn-compare" onclick="openCompare('${esc(r.image_id)}')" title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
-      <button class="btn-apply primary" onclick="applyOne('${esc(r.image_id)}')" ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
+      <button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
+      ${canCompare ? `<button class="btn-compare" type="button" data-compare title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
+      <button class="btn-apply primary" type="button" data-apply ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
     </div>
   </div>
 </div>`;
@@ -2785,6 +2953,10 @@ ${clusterSections}
       <div class="cmp-pane">
         <div class="cmp-pane-h">Current (live)</div>
         <img id="cmp-old" alt="">
+        <div id="cmp-old-ph" class="cmp-ph" style="display:none">
+          <div>No live image found in media_registry.</div>
+          <div class="sub" style="font-size:11.5px;margin-top:4px">This image_id has no recorded CDN url, so we can only show the new image on the right.</div>
+        </div>
       </div>
       <div class="cmp-pane">
         <div class="cmp-pane-h cmp-pane-h-new">New</div>
@@ -2811,16 +2983,35 @@ ${clusterSections}
   sendHtml(res, 200, shell(`run ${id}`, `
 <section class="card">
   <h1>Run <code>${esc(id)}</code></h1>
-  <div class="sub">client <code>${esc(state.client)}</code> · started <code>${esc(state.startedAt)}</code></div>
+  <div class="sub">client <code>${esc(state.client)}</code> · started <code>${esc(state.startedAt)}</code> · <span id="elapsed-clock">—</span></div>
   <details style="margin-top:8px">
     <summary class="sub">command</summary>
     <pre style="background:#f1f5f9;padding:8px 12px;border-radius:6px;font-size:12px;overflow:auto"><code>${cmd}</code></pre>
   </details>
 </section>
 
+${state.done ? "" : `
+<!-- In-progress hero: shown only while the subprocess is still
+     running. Animated dots + cycled status messages give the operator
+     something to look at during long generations (~30–60s/image). -->
+<section class="card running-hero" id="running-hero">
+  <div class="running-spinner-wrap"><span class="running-spinner"></span></div>
+  <div class="running-text">
+    <div class="running-stage" id="running-stage">Warming up…</div>
+    <div class="running-tip" id="running-tip">Hang tight — generated images appear below as they finish.</div>
+  </div>
+  <div class="running-meta">
+    <div class="running-elapsed" id="running-elapsed">0s elapsed</div>
+    <div class="running-count" id="running-count"></div>
+  </div>
+</section>`}
+
 <section class="card">
-  <h2>Status</h2>
-  <div id="status">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <h2 style="margin:0">Status</h2>
+    <button class="btn" onclick="window.location.reload()" title="Reload to refresh state from disk">↻ Reload status</button>
+  </div>
+  <div id="status" style="margin-top:8px">
     ${state.done ? (state.exitCode === 0 ? `<div class="banner ok">finished, exit 0</div>` : `<div class="banner err">exited with code ${state.exitCode}</div>`) : `<div class="banner info">streaming…</div>`}
   </div>
   <div id="links" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
@@ -2830,14 +3021,8 @@ ${clusterSections}
 </section>
 
 <details class="card" ${state.done ? "" : "open"}>
-  <summary><h2 style="display:inline">Activity</h2></summary>
-  <div class="sub" style="margin:6px 0 12px">A plain-English view of what's happening behind the scenes. Use the toggle for the raw command output if you need to debug.</div>
-  <div id="log-friendly" class="log-friendly" style="margin-top:10px"></div>
-  <label class="toggle" style="margin-top:10px;cursor:pointer">
-    <input type="checkbox" id="log-raw-toggle" onchange="toggleRawLog(this.checked)">
-    Show raw log
-  </label>
-  <div id="log" class="log" style="margin-top:10px;display:none">${initial}</div>
+  <summary><h2 style="display:inline">Log</h2></summary>
+  <div id="log" class="log" style="margin-top:10px">${initial}</div>
 </details>
 
 ${resultsHtml}
@@ -2850,95 +3035,85 @@ ${resultsHtml}
 </div>
 `, `<script>
 const logEl = document.getElementById('log');
-const friendlyEl = document.getElementById('log-friendly');
 const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
 const RUN_ID = window.location.pathname.split('/').pop();
 
-// ── Friendly log: convert noisy CLI output into plain-English status ──
-// Buffers partial lines from the SSE stream and emits one rendered row
-// per recognised event. Falls back to a "verbose" line for anything we
-// don't pattern-match so nothing is silently dropped.
-let logBuf = '';
-function emitFriendly(html, kind) {
-  const row = document.createElement('div');
-  row.className = 'friendly-row friendly-' + (kind || 'info');
-  row.innerHTML = html;
-  friendlyEl.appendChild(row);
-  friendlyEl.scrollTop = friendlyEl.scrollHeight;
-}
-function shorten(id) { return (id || '').slice(0, 8); }
-function humanizeLine(line) {
-  if (!line) return;
-  const trimmed = line.trim();
-  if (!trimmed) return;
-
-  // Per-image progress: "[3/12] cluster=… asset=… id=… status=completed"
-  const m = trimmed.match(/^\[(\d+)\/(\d+)\]\s+cluster=(\S+)\s+asset=(\S+)\s+id=(\S+)\s+(.*)$/);
-  if (m) {
-    const [, n, total, cluster, asset, id, rest] = m;
-    let kind = 'info', label = 'working…';
-    if (/status=completed/.test(rest)) { kind = 'ok'; label = '✓ image ready'; }
-    else if (/status=mock/.test(rest)) { kind = 'ok'; label = '✓ mock image generated'; }
-    else if (/status=dry-run/.test(rest)) { kind = 'info'; label = '(dry-run) prompt only'; }
-    else if (/status=failed/.test(rest)) {
-      kind = 'err';
-      const errMatch = rest.match(/error=(.+)$/);
-      label = '✗ failed' + (errMatch ? ' — ' + errMatch[1] : '');
-    } else if (/prompt=override/.test(rest)) {
-      kind = 'info'; label = '↻ reusing previous prompt (skipping Claude)';
-    } else if (/status=/.test(rest)) {
-      label = rest.replace('status=', '');
-    }
-    emitFriendly(
-      '<span class="fr-step">' + n + '/' + total + '</span>' +
-      '<span class="fr-asset">' + asset + '</span>' +
-      '<span class="fr-cluster">cluster ' + shorten(cluster) + '…</span>' +
-      '<span class="fr-state">' + label + '</span>',
-      kind
-    );
-    return;
+// ── In-progress UI: elapsed clock + cycling stage messages ──
+// Drives the running-hero card while the subprocess streams. We parse
+// a few well-known marker lines out of the raw log to keep the stage
+// text current; everything else just keeps the clock ticking.
+const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
+let onLogStream = null;
+(function () {
+  const heroEl = document.getElementById('running-hero');
+  const stageEl = document.getElementById('running-stage');
+  const tipEl = document.getElementById('running-tip');
+  const elapsedEl = document.getElementById('running-elapsed');
+  const countEl = document.getElementById('running-count');
+  const clockEl = document.getElementById('elapsed-clock');
+  const startTs = Date.parse(RUN_STARTED_AT) || Date.now();
+  const fmt = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + 's elapsed';
+    const m = Math.floor(s / 60), r = s % 60;
+    return m + 'm ' + r + 's elapsed';
+  };
+  function tick() {
+    const ms = Date.now() - startTs;
+    if (elapsedEl) elapsedEl.textContent = fmt(ms);
+    if (clockEl) clockEl.textContent = fmt(ms);
   }
+  tick();
+  setInterval(tick, 1000);
 
-  // Setup messages — translate to plain English.
-  const TRANSLATIONS = [
-    [/^web: env ok/, 'Environment ready', 'info'],
-    [/^web: listening on (.+)/, (s) => 'Web server listening on ' + s, 'info'],
-    [/^regen: brand_guidelines=loaded \((\d+) chars/, (n) => 'Loaded brand guidelines (' + n + ' characters)', 'info'],
-    [/^regen: graphic_token=loaded/, 'Loaded saved graphic_token', 'info'],
-    [/^regen: graphic_token=fresh/, 'Extracting graphic_token from the live site (one-time)…', 'info'],
-    [/^regen: rows=(\d+)/, (n) => 'Found ' + n + ' image(s) to regenerate', 'info'],
-    [/^regen: csv=(.+)/, (p) => 'CSV report → <code>' + p + '</code>', 'info'],
-    [/^regen: html=(.+)/, (p) => 'HTML report → <code>' + p + '</code>', 'info'],
-    [/^regen: project=/, 'Loaded project + page data', 'info'],
-    [/^regen: applying brand directive/, 'Brand instructions are being applied to every prompt', 'info'],
-    [/^regen failed: (.+)/, (m) => '✗ Run failed: ' + m, 'err'],
+  // Rotate the tip line every 5s while running so the page feels live.
+  const TIPS = [
+    'Hang tight — generated images appear below as they finish.',
+    'Each image takes 30–60s on Replicate; bigger batches run in parallel.',
+    'Need a different angle? Hit ↻ Regenerate on any card after generation.',
+    'You can compare old vs new from the cards below before applying.',
+    'Closing this tab is fine — the run keeps going server-side.',
   ];
-  for (const [re, msg, kind] of TRANSLATIONS) {
-    const mm = trimmed.match(re);
-    if (mm) {
-      const text = typeof msg === 'function' ? msg(mm[1]) : msg;
-      emitFriendly(text, kind);
-      return;
-    }
+  if (tipEl && heroEl) {
+    let idx = 0;
+    setInterval(() => {
+      idx = (idx + 1) % TIPS.length;
+      tipEl.textContent = TIPS[idx];
+    }, 5500);
   }
-  // Fallback: render as muted verbose line.
-  const safe = trimmed.replace(/[<>&]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c]);
-  emitFriendly('<span class="fr-verbose">' + safe + '</span>', 'verbose');
-}
-function ingestLogChunk(text) {
-  logBuf += text;
-  const lines = logBuf.split('\n');
-  logBuf = lines.pop() ?? '';
-  for (const l of lines) humanizeLine(l);
-}
-function toggleRawLog(on) {
-  logEl.style.display = on ? 'block' : 'none';
-  friendlyEl.style.display = on ? 'none' : 'flex';
-}
-// Parse whatever was already on the server before the page rendered.
-ingestLogChunk(logEl.textContent || '');
-if (logBuf) { humanizeLine(logBuf); logBuf = ''; }
+
+  if (!heroEl) return; // run already done, hero not rendered
+
+  let totalCount = 0, doneCount = 0, failedCount = 0;
+  const updateCounts = () => {
+    if (!countEl) return;
+    if (totalCount > 0) {
+      const parts = [doneCount + ' / ' + totalCount + ' done'];
+      if (failedCount > 0) parts.push(failedCount + ' failed');
+      countEl.textContent = parts.join(' · ');
+    }
+  };
+
+  onLogStream = (text) => {
+    // Per-image log lines look like:
+    //   [3/12] cluster=… asset=cover id=… status=completed
+    const re = /\\[(\\d+)\\/(\\d+)\\]\\s+cluster=\\S+\\s+asset=(\\S+)\\s+\\S+\\s+(.*)/g;
+    let m;
+    while ((m = re.exec(text))) {
+      const [, n, total, asset, rest] = m;
+      totalCount = Number(total);
+      if (/status=completed|status=mock/.test(rest)) doneCount++;
+      else if (/status=failed/.test(rest)) failedCount++;
+      stageEl.textContent = 'Image ' + n + ' of ' + total + ' · ' + asset;
+    }
+    if (/regen: graphic_token=fresh/.test(text)) stageEl.textContent = 'Extracting graphic_token…';
+    else if (/regen: brand_guidelines=loaded/.test(text)) stageEl.textContent = 'Loaded brand guidelines';
+    else if (/regen: rows=\\d+/.test(text)) stageEl.textContent = 'Found images, starting generation…';
+    else if (/regen failed:/.test(text)) stageEl.textContent = 'Run failed';
+    updateCounts();
+  };
+})();
 
 // Per-image state machine. Two user actions: Apply (push to S3) and
 // Regenerate (re-roll the image). State is purely about Apply progress:
@@ -3138,14 +3313,27 @@ function zoomCard(imageId, ev) {
 }
 
 // Compare modal: old (live CDN URL from media_registry) vs new (from CSV).
+// When the old image isn't found (no media_registry hit), the left
+// pane falls back to a "no live image found" placeholder so the
+// button still gives the operator something to look at.
 function openCompare(imageId) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
   const img = card.querySelector('.rc-img img');
   const newSrc = img ? img.src : '';
+  if (!newSrc) return;
   const oldSrc = card.dataset.oldUrl || '';
-  if (!newSrc || !oldSrc) return;
-  document.getElementById('cmp-old').src = oldSrc;
+  const oldEl = document.getElementById('cmp-old');
+  const oldPh = document.getElementById('cmp-old-ph');
+  if (oldSrc) {
+    oldEl.src = oldSrc;
+    oldEl.style.display = '';
+    if (oldPh) oldPh.style.display = 'none';
+  } else {
+    oldEl.removeAttribute('src');
+    oldEl.style.display = 'none';
+    if (oldPh) oldPh.style.display = 'flex';
+  }
   document.getElementById('cmp-new').src = newSrc;
   document.getElementById('cmp-title').textContent = 'Compare — ' + imageId;
   const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
@@ -3236,6 +3424,33 @@ document.addEventListener('keydown', (e) => {
 
 if (document.getElementById('apply-all-btn')) refreshTotals();
 
+// ── Delegated click handler for result-cards ──
+// Inline onclick attributes were unreliable across some content/escape
+// edge cases; one document-level listener that walks the click target
+// is far more robust and supports cards added later.
+document.addEventListener('click', (ev) => {
+  const t = ev.target;
+  if (!(t instanceof Element)) return;
+  // Image click → zoom (lightbox).
+  const img = t.closest('.rc-img .rc-preview-img');
+  if (img && t.tagName !== 'BUTTON') {
+    const card = img.closest('.result-card');
+    if (card && card.dataset.imageId) zoomCard(card.dataset.imageId, ev);
+    return;
+  }
+  // Card-action buttons: data-zoom / data-compare / data-regen / data-apply.
+  const btn = t.closest('button[data-zoom],button[data-compare],button[data-regen],button[data-apply]');
+  if (!btn) return;
+  const card = btn.closest('.result-card');
+  if (!card) return;
+  const id = card.dataset.imageId;
+  if (!id) return;
+  if (btn.matches('[data-zoom]'))    { zoomCard(id, ev); return; }
+  if (btn.matches('[data-compare]')) { openCompare(id);  return; }
+  if (btn.matches('[data-regen]'))   { regenOne(id);     return; }
+  if (btn.matches('[data-apply]'))   { applyOne(id);     return; }
+});
+
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
 es.onmessage = (ev) => {
@@ -3243,7 +3458,7 @@ es.onmessage = (ev) => {
     const { text } = JSON.parse(ev.data);
     logEl.textContent += text;
     logEl.scrollTop = logEl.scrollHeight;
-    ingestLogChunk(text);
+    if (typeof onLogStream === 'function') onLogStream(text);
   } catch {}
 };
 es.addEventListener('end', (ev) => {
@@ -3333,6 +3548,10 @@ export function startWebServer(port: number): void {
       const wsLogoMatch = /^\/workspace\/([^/]+)\/logo$/.exec(p);
       if (method === "POST" && wsLogoMatch && wsLogoMatch[1]) {
         return await saveLogoHandler(req, res, decodeURIComponent(wsLogoMatch[1]));
+      }
+      const wsTokenMatch = /^\/workspace\/([^/]+)\/token$/.exec(p);
+      if (method === "POST" && wsTokenMatch && wsTokenMatch[1]) {
+        return await saveTokenHandler(req, res, decodeURIComponent(wsTokenMatch[1]));
       }
       const wsMatch = /^\/workspace\/([^/]+)\/?$/.exec(p);
       if (method === "GET" && wsMatch && wsMatch[1]) {

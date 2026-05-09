@@ -27,6 +27,14 @@ export interface ProjectRow {
   url: string | null;
   /** Used as the client-prefix in S3 paths: `page_data/<staging_subdomain>/blog/...` */
   staging_subdomain: string | null;
+  /**
+   * Public-facing base URL for the live "feeds" experience. Pattern is
+   * not consistent across clients:
+   *   https://<root>/feeds         (Sentinel, SpecGas, Inzure, ACH)
+   *   https://feeds.<root>         (Trussed)
+   * The published-page URL is always `<canonical_url>/<page_type>/<slug>`.
+   */
+  canonical_url: string | null;
   additional_info: unknown;
   company_info: unknown;
   design_tokens: unknown;
@@ -40,7 +48,7 @@ export interface ProjectRow {
  */
 export async function lookupProjectById(projectId: string): Promise<ProjectRow | null> {
   const sql = `
-    SELECT id, name, url, staging_subdomain,
+    SELECT id, name, url, staging_subdomain, canonical_url,
            additional_info, company_info, design_tokens, logo_urls
     FROM projects
     WHERE id = $1::uuid
