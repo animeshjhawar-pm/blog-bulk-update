@@ -31,8 +31,10 @@ export interface RegenOptions {
   clusterIds?: Set<string>;
   /** When set, only records whose `imageId` is in the set are regenerated. */
   imageIds?: Set<string>;
-  /** Defaults to "blog". */
-  pageType?: PageType;
+  /** Defaults to "blog". Accepts a single page_type or an array of
+   * them — when an array is passed, listPublishedClusters merges all
+   * matching clusters into one run. */
+  pageType?: PageType | PageType[];
   /** When set, persisted to the manifest so the web UI can link
    * `/runs/<id>` back to this run after a server restart. */
   runId?: string;
@@ -338,12 +340,15 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     }
   }
 
-  const pageType: PageType = options.pageType ?? "blog";
-  const clusters = await listPublishedClusters(project.id, pageType);
-  process.stderr.write(`regen: ${clusters.length} published ${pageType} clusters\n`);
+  const pageTypeOpt: PageType | PageType[] = options.pageType ?? "blog";
+  const clusters = await listPublishedClusters(project.id, pageTypeOpt);
+  const pageTypeLabel = Array.isArray(pageTypeOpt) ? pageTypeOpt.join("+") : pageTypeOpt;
+  process.stderr.write(`regen: ${clusters.length} published ${pageTypeLabel} clusters\n`);
 
   const records = await collectImageRecords(clusters, {
-    pageType,
+    // collectImageRecords expects a single PageType; when multi, we
+    // pass undefined so it derives the page_type from each cluster row.
+    pageType: Array.isArray(pageTypeOpt) ? undefined : pageTypeOpt,
     assetTypes: options.assetTypes,
     clusterIds: options.clusterIds,
     imageIds: options.imageIds,

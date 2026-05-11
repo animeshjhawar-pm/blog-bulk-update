@@ -135,8 +135,10 @@ program
   )
   .option("--cluster-ids <list>", "comma-separated cluster UUIDs to restrict to")
   .option("--image-ids <list>", "comma-separated image_id values to restrict to (per-image scoping; the web UI uses this)")
-  .addOption(
-    new Option("--page-type <type>", "which page_type to regen for the client").choices(["blog", "service", "category"]).default("blog"),
+  .option(
+    "--page-type <types>",
+    "page_type(s) to regen — single value (blog/service/category) or comma-separated list. Defaults to 'blog'.",
+    "blog",
   )
   .option("--run-id <id>", "stamp this run with a stable id (web UI uses this to link to /runs/<id> after a server restart)")
   .option("--mock", "skip Portkey + image generation; emit synthetic prompts and picsum.photos URLs (UX validation, no API spend)", false)
@@ -156,7 +158,7 @@ program
       assetTypes?: string;
       clusterIds?: string;
       imageIds?: string;
-      pageType?: "blog" | "service" | "category";
+      pageType?: string;
       runId?: string;
       mock?: boolean;
       provider?: Provider;
@@ -176,6 +178,16 @@ program
           promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
         }
 
+        // --page-type accepts a CSV list ("blog,service") — split and
+        // validate. listPublishedClusters already takes PageType[].
+        const validPt = new Set(["blog", "service", "category"]);
+        const ptList = (opts.pageType ?? "blog")
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s): s is "blog" | "service" | "category" => validPt.has(s));
+        if (ptList.length === 0) ptList.push("blog");
+        const pageType = ptList.length === 1 ? ptList[0]! : ptList;
+
         await runRegen({
           client: opts.client,
           dryRun: Boolean(opts.dryRun),
@@ -183,7 +195,7 @@ program
           assetTypes,
           clusterIds,
           imageIds,
-          pageType: opts.pageType ?? "blog",
+          pageType,
           runId: opts.runId,
           mock: Boolean(opts.mock),
           provider: opts.provider,

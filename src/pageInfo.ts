@@ -660,11 +660,19 @@ export async function collectImageRecords(
     }
   }
 
-  // MDX fallback for clusters whose S3 markdown ids didn't resolve in
-  // media_registry (e.g., Sentinel placeholders). Group missing
-  // records by cluster, scan each cluster's MDX <Image imageId="…"/>
-  // tags, and do ONE big media_registry batch across every cluster's
-  // MDX UUIDs. Then pair by document-order index per cluster.
+  // MDX fallback for inline records whose S3-markdown hash ids didn't
+  // resolve in media_registry (Sentinel/SpecGas-style). Group the
+  // missing records per cluster, scan each cluster's MDX
+  // <Image imageId="…"/> tags, and do ONE big media_registry batch
+  // across every cluster's MDX UUIDs. Pair by document-order index
+  // per cluster.
+  //
+  // OFF-BY-ONE: when blog_text.md exists, MDX tags[0] is consumed by
+  // coverRecord (it becomes the cover image's UUID). The inline
+  // infographic records that end up in `missing` therefore correspond
+  // to MDX tags[1..N], NOT tags[0..N-1]. We carry an `offset` per
+  // cluster — 1 when the cover's imageId matches tags[0], else 0 —
+  // so the pairing aligns with the actual document order.
   const stillMissing = records.filter((r) => !r.previewUrl && !r.imageId.includes("/"));
   if (stillMissing.length > 0) {
     const byCluster = new Map<string, ImageRecord[]>();
@@ -673,8 +681,8 @@ export async function collectImageRecords(
       byCluster.get(r.cluster.id)!.push(r);
     }
 
-    // Build the per-cluster MDX tag arrays + the global UUID list.
     const mdxByCluster = new Map<string, MdxImageTag[]>();
+    const offsetByCluster = new Map<string, number>();
     const allMdxIds: string[] = [];
     for (const [cid, missing] of byCluster) {
       const cluster = missing[0]!.cluster;
@@ -683,6 +691,16 @@ export async function collectImageRecords(
       const tags = scanMdxImageTags(md);
       if (tags.length === 0) continue;
       mdxByCluster.set(cid, tags);
+
+      // Detect whether tags[0] is the cover image by looking at the
+      // cluster's cover record (asset === "cover"). If its imageId
+      // equals tags[0].imageId, the inline records map to tags[1..N].
+      const coverRec = records.find(
+        (r) => r.cluster.id === cid && r.asset === "cover",
+      );
+      const coverIsTag0 = !!coverRec && coverRec.imageId === tags[0]!.imageId;
+      offsetByCluster.set(cid, coverIsTag0 ? 1 : 0);
+
       for (const t of tags) allMdxIds.push(t.imageId);
     }
     if (allMdxIds.length > 0) {
@@ -690,9 +708,11 @@ export async function collectImageRecords(
       for (const [cid, missing] of byCluster) {
         const tags = mdxByCluster.get(cid);
         if (!tags) continue;
-        const len = Math.min(missing.length, tags.length);
-        for (let i = 0; i < len; i++) {
-          const urls = mdxUrls.get(tags[i]!.imageId);
+        const offset = offsetByCluster.get(cid) ?? 0;
+        for (let i = 0; i < missing.length; i++) {
+          const tag = tags[i + offset];
+          if (!tag) break;
+          const urls = mdxUrls.get(tag.imageId);
           if (!urls) continue;
           missing[i]!.previewUrl =
             urls["720"] ?? urls["1080"] ?? urls["360"] ?? undefined;

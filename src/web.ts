@@ -1292,9 +1292,11 @@ function ptContinue() {
   const checks = Array.from(document.querySelectorAll('#pt-grid input[name=pt]:checked')).map((c) => c.value);
   if (checks.length === 0) { document.getElementById('pt-warn').textContent = 'pick at least one'; return; }
   const slug = document.getElementById('pt-grid').dataset.slug;
+  // Workspace is multi-page-type now: ALL chosen types go into
+  // ?selected= as a CSV. The workspace shows the union and the pills
+  // act as toggles.
   const params = new URLSearchParams();
-  params.set('page_type', checks[0]);
-  if (checks.length > 1) params.set('selected', checks.join(','));
+  params.set('selected', checks.join(','));
   window.location.href = '/workspace/' + encodeURIComponent(slug) + '?' + params.toString();
 }
 function closePtModal(ev) { if (ev.target === ev.currentTarget) hidePtModal(); }
@@ -1619,36 +1621,23 @@ async function workspacePage(
     ? new Set(allPageTypes.filter((pt) => selectedPageTypes.has(pt)))
     : new Set<PageType>(allPageTypes);
 
-  // All three pills always render. Click semantics (single click = toggle):
-  //   - active pill, with siblings selected → deselect + switch active to first remaining
-  //   - active pill, only one selected → no-op (always need one active)
-  //   - inactive but selected → just switch active to it
-  //   - not selected → add to selection AND switch active
+  // Pure toggle pills — no "active" concept. The cluster table shows
+  // the union of every pill that's currently selected (a per-row
+  // page_type pill keeps things distinguishable). Clicking a selected
+  // pill removes it (unless it's the last one); clicking an
+  // unselected pill adds it.
   const tabBtn = (pt: PageType, label: string) => {
-    const isActive = pageType === pt;
     const isSelected = currentSelected.has(pt);
     let nextSelected: PageType[];
-    let nextActive: PageType = pt;
-    if (isActive && isSelected) {
-      // Toggle off if there's at least one other selected.
+    if (isSelected) {
       const others = [...currentSelected].filter((t) => t !== pt) as PageType[];
-      if (others.length === 0) {
-        nextSelected = [pt]; // pinned — can't deselect last one
-        nextActive = pt;
-      } else {
-        nextSelected = others;
-        nextActive = others[0]!;
-      }
-    } else if (isSelected) {
-      nextSelected = [...currentSelected];
-      nextActive = pt;
+      nextSelected = others.length > 0 ? others : [pt]; // last pill is pinned
     } else {
-      nextSelected = [...currentSelected, pt];
-      nextActive = pt;
+      nextSelected = [...currentSelected, pt] as PageType[];
     }
-    const href = `/workspace/${esc(slug)}?page_type=${nextActive}&selected=${nextSelected.join(",")}`;
-    const stateClass = isActive ? "active" : isSelected ? "selected" : "unselected";
-    return `<a class="page-tab ${stateClass}" href="${href}" title="${isSelected ? "click again to remove" : "click to add"}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
+    const href = `/workspace/${esc(slug)}?selected=${nextSelected.join(",")}`;
+    const stateClass = isSelected ? "active" : "unselected";
+    return `<a class="page-tab ${stateClass}" href="${href}" title="${isSelected ? "click to remove" : "click to add"}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
   };
 
   const body = `
@@ -1659,7 +1648,7 @@ ${awsBanner}
     <div style="flex:1">
       <h1>${esc(project.name ?? slug)}</h1>
       <div class="sub">
-        ${clusters.length} ${esc(pageType)} pages · ${totalImages} images (${totalsBadges})
+        ${clusters.length} pages across ${[...currentSelected].join(" + ")} · ${totalImages} images (${totalsBadges})
       </div>
       <div class="page-tabs" style="margin-top:10px;display:flex;gap:6px">
         ${allPageTypes.map((pt) => tabBtn(pt, pt[0]!.toUpperCase() + pt.slice(1))).join("")}
@@ -1833,7 +1822,9 @@ async function saveToken(e) {
 
   const scripts = `<script>
 const SLUG = ${JSON.stringify(slug)};
-const PAGE_TYPE = ${JSON.stringify(pageType)};
+// Comma-separated list of every selected page_type — sent to /regen
+// so the CLI lists clusters across all of them, not just one.
+const SELECTED_PAGE_TYPES = ${JSON.stringify([...currentSelected].join(","))};
 const CLUSTERS = ${JSON.stringify(payload)};
 // Per-cluster set of selected image IDs. Empty set = nothing selected.
 const selection = new Map();
@@ -2125,7 +2116,7 @@ async function runRegen() {
 
   const fd = new FormData();
   fd.set('client', SLUG);
-  fd.set('page_type', PAGE_TYPE);
+  fd.set('page_type', SELECTED_PAGE_TYPES);
   for (const it of items) {
     fd.append('cluster_id', it.cluster_id);
     for (const id of it.image_ids) fd.append('image_id', id);
@@ -2453,7 +2444,9 @@ function startRegen(opts: {
   mock: boolean;
   useSavedToken: boolean;
   assetTypes?: string;
-  pageType?: PageType;
+  /** Either a single page_type ("blog"/"service"/"category") or a
+   *  comma-separated list. The CLI now accepts the CSV form too. */
+  pageType?: string;
   provider?: string;
   promptOverrideFile?: string;
 }): RunState {
@@ -2513,8 +2506,16 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     sendHtml(res, 400, shell("Error", `<div class="banner err">No images selected.</div>`));
     return;
   }
-  const ptRaw = body.get("page_type");
-  const pageType: PageType = ptRaw === "service" || ptRaw === "category" ? ptRaw : "blog";
+  // page_type accepts either a single value or a comma-separated list
+  // (the workspace sends the full selected set so multi-page-type
+  // regens work in one subprocess).
+  const ptRaw = (body.get("page_type") ?? "").trim();
+  const validTypes = new Set(["blog", "service", "category"]);
+  const ptList = ptRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => validTypes.has(s));
+  const pageTypeArg = ptList.length > 0 ? ptList.join(",") : "blog";
   const state = startRegen({
     client,
     clusterIds,
@@ -2523,7 +2524,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     mock: body.get("mock") === "on",
     useSavedToken: body.get("use_saved_token") === "on",
     assetTypes: body.get("asset_types") || undefined,
-    pageType,
+    pageType: pageTypeArg,
     provider: body.get("provider") || undefined,
   });
   res.writeHead(303, { location: `/runs/${state.id}` });
@@ -3623,17 +3624,22 @@ export function startWebServer(port: number): void {
       }
       const wsMatch = /^\/workspace\/([^/]+)\/?$/.exec(p);
       if (method === "GET" && wsMatch && wsMatch[1]) {
+        // `?selected=blog,service,category` is now the canonical
+        // multi-select param. Legacy `?page_type=service` (singular)
+        // still resolves — we treat it as a single-pill selection.
         const ptRaw = url.searchParams.get("page_type");
-        const pageType: PageType = ptRaw === "service" || ptRaw === "category" ? ptRaw : "blog";
+        const legacyPt: PageType | null =
+          ptRaw === "service" || ptRaw === "category" || ptRaw === "blog" ? ptRaw : null;
         const selectedRaw = url.searchParams.get("selected") ?? "";
         const selected = new Set<PageType>();
         for (const t of selectedRaw.split(",").map((s) => s.trim())) {
           if (t === "blog" || t === "service" || t === "category") selected.add(t);
         }
+        if (selected.size === 0 && legacyPt) selected.add(legacyPt);
         return await workspacePage(
           res,
           decodeURIComponent(wsMatch[1]),
-          pageType,
+          legacyPt ?? "blog",
           selected.size > 0 ? selected : undefined,
         );
       }
