@@ -734,7 +734,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     text-align: left; animation: dotskey 1.4s steps(4, end) infinite;
   }
   @keyframes dotskey { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } 100% { content: ""; } }
-  .running-tip { margin-top: 4px; font-size: 13px; color: rgba(255,255,255,.78); transition: opacity .3s; }
+  .running-tip { margin-top: 4px; font-size: 13px; color: rgba(255,255,255,.78); transition: opacity .25s ease; }
   .running-meta { flex: 0 0 auto; text-align: right; }
   .running-elapsed { font-size: 12px; opacity: .8; font-variant-numeric: tabular-nums; }
   .running-count { font-size: 13px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
@@ -3056,10 +3056,12 @@ const statusEl = document.getElementById('status');
 const linksEl = document.getElementById('links');
 const RUN_ID = window.location.pathname.split('/').pop();
 
-// ── In-progress UI: elapsed clock + cycling stage messages ──
-// Drives the running-hero card while the subprocess streams. We parse
-// a few well-known marker lines out of the raw log to keep the stage
-// text current; everything else just keeps the clock ticking.
+// ── In-progress UI: stateful stage label + cycling platform tips ──
+// Re-parses the FULL log on every update (existing content on load,
+// then streamed chunks) so the primary stage label always reflects
+// the latest event — never stuck on "Warming up". Mirrors the
+// Claude UX: a primary verb that mutates ("Thinking…", "Generating
+// image 3 of 7…") with a rotating secondary tip about the platform.
 const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
 let onLogStream = null;
 (function () {
@@ -3084,51 +3086,100 @@ let onLogStream = null;
   tick();
   setInterval(tick, 1000);
 
-  // Rotate the tip line every 5s while running so the page feels live.
+  // Platform tips — rotated every 5s in the secondary line. Focus is
+  // on things the user can do / should know about the platform, not
+  // generic motivational text.
   const TIPS = [
-    'Hang tight — generated images appear below as they finish.',
-    'Each image takes 30–60s on Replicate; bigger batches run in parallel.',
-    'Need a different angle? Hit ↻ Regenerate on any card after generation.',
-    'You can compare old vs new from the cards below before applying.',
-    'Closing this tab is fine — the run keeps going server-side.',
+    'You can close this tab — the run keeps going server-side.',
+    'Each image runs through Claude (prompt) + Replicate (generation).',
+    'Regenerate re-uses the same prompt to skip the Claude round-trip.',
+    'Cards below appear as soon as their images finish.',
+    'Use ⇄ Compare on any card to put old next to new before applying.',
+    'Apply pushes directly to gw-content-store at the live image key.',
+    'Logos + brand guidelines come from the project\\'s graphic_token.',
+    'Multiple runs can stream in parallel — open more tabs if you need.',
   ];
   if (tipEl && heroEl) {
     let idx = 0;
     setInterval(() => {
       idx = (idx + 1) % TIPS.length;
-      tipEl.textContent = TIPS[idx];
-    }, 5500);
+      tipEl.style.opacity = '0';
+      setTimeout(() => { tipEl.textContent = TIPS[idx]; tipEl.style.opacity = '1'; }, 200);
+    }, 5000);
   }
 
   if (!heroEl) return; // run already done, hero not rendered
 
-  let totalCount = 0, doneCount = 0, failedCount = 0;
-  const updateCounts = () => {
-    if (!countEl) return;
-    if (totalCount > 0) {
-      const parts = [doneCount + ' / ' + totalCount + ' done'];
-      if (failedCount > 0) parts.push(failedCount + ' failed');
-      countEl.textContent = parts.join(' · ');
-    }
-  };
+  // Stage parser: scans the entire raw log and returns the most recent
+  // recognised state. Order matters — later in the log wins. Also
+  // accumulates done/failed counts as it goes.
+  function deriveState(fullText) {
+    const lines = fullText.split('\\n');
+    let stage = 'Warming up';
+    let total = 0, done = 0, failed = 0;
+    let lastImageStage = null;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
 
-  onLogStream = (text) => {
-    // Per-image log lines look like:
-    //   [3/12] cluster=… asset=cover id=… status=completed
-    const re = /\\[(\\d+)\\/(\\d+)\\]\\s+cluster=\\S+\\s+asset=(\\S+)\\s+\\S+\\s+(.*)/g;
-    let m;
-    while ((m = re.exec(text))) {
-      const [, n, total, asset, rest] = m;
-      totalCount = Number(total);
-      if (/status=completed|status=mock/.test(rest)) doneCount++;
-      else if (/status=failed/.test(rest)) failedCount++;
-      stageEl.textContent = 'Image ' + n + ' of ' + total + ' · ' + asset;
+      // Per-image progress: "[3/12] cluster=… asset=cover id=… status=completed"
+      const m = line.match(/^\\[(\\d+)\\/(\\d+)\\]\\s+cluster=\\S+\\s+asset=(\\S+)\\s+id=\\S+\\s+(.*)$/);
+      if (m) {
+        const n = Number(m[1]), tot = Number(m[2]), asset = m[3], rest = m[4];
+        total = tot;
+        if (/status=completed|status=mock/.test(rest)) done++;
+        else if (/status=failed/.test(rest)) failed++;
+        lastImageStage = 'Generating image ' + n + ' of ' + tot + ' · ' + asset;
+        continue;
+      }
+
+      // Setup lifecycle (each row overwrites the prior stage).
+      if (/^regen: client=/.test(line))                             stage = 'Loading project info';
+      else if (/^regen: brand_guidelines=loaded/.test(line))        stage = 'Reading brand guidelines';
+      else if (/^regen: logo_url=overridden/.test(line))            stage = 'Applying logo override';
+      else if (/^regen: mock mode/.test(line))                      stage = 'Mock mode — skipping APIs';
+      else if (/^regen: graphic_token=fresh|extracting/i.test(line))stage = 'Extracting graphic_token from the live site';
+      else if (/^regen: graphic_token=saved/.test(line))            stage = 'Saved graphic_token';
+      else if (/^regen: graphic_token=loaded/.test(line))           stage = 'Loaded saved graphic_token';
+      else if (/^regen: \\d+ published .* clusters/.test(line))     stage = 'Listing published pages';
+      else if (/^regen: \\d+ image records to process/.test(line))  stage = 'Resolving image records';
+      else if (/^regen: writing /.test(line))                       stage = 'Preparing output files';
+      else if (/^regen: nothing to do/.test(line))                  stage = 'Nothing to do — exiting';
+      else if (/^regen: csv=/.test(line))                           stage = 'Wrote CSV report';
+      else if (/^regen: html=/.test(line))                          stage = 'Wrote HTML report';
+      else if (/^regen failed:/.test(line))                         stage = 'Run failed';
+      else if (/^extract-token: scraping/.test(line))               stage = 'Scraping the live site (Firecrawl)';
+      else if (/^extract-token: calling portkey/.test(line))        stage = 'Asking Claude for the brand token';
     }
-    if (/regen: graphic_token=fresh/.test(text)) stageEl.textContent = 'Extracting graphic_token…';
-    else if (/regen: brand_guidelines=loaded/.test(text)) stageEl.textContent = 'Loaded brand guidelines';
-    else if (/regen: rows=\\d+/.test(text)) stageEl.textContent = 'Found images, starting generation…';
-    else if (/regen failed:/.test(text)) stageEl.textContent = 'Run failed';
-    updateCounts();
+    // Once images start generating, the per-image stage outranks the
+    // setup stages until the run finishes.
+    if (lastImageStage && done < total) stage = lastImageStage;
+    return { stage, total, done, failed };
+  }
+
+  function applyState(s) {
+    stageEl.textContent = s.stage;
+    if (countEl) {
+      if (s.total > 0) {
+        const parts = [s.done + ' / ' + s.total + ' done'];
+        if (s.failed > 0) parts.push(s.failed + ' failed');
+        countEl.textContent = parts.join(' · ');
+      } else {
+        countEl.textContent = '';
+      }
+    }
+  }
+
+  // Initial parse: everything already on the page (server-side log
+  // for any run that started before this tab loaded).
+  const logEl = document.getElementById('log');
+  if (logEl) applyState(deriveState(logEl.textContent || ''));
+
+  onLogStream = (_chunkText) => {
+    // The raw <pre> already gets the chunk appended before this fires,
+    // so re-parsing its full textContent picks up the new event AND
+    // every previous one in order — simplest, always-correct path.
+    if (logEl) applyState(deriveState(logEl.textContent || ''));
   };
 })();
 
