@@ -150,6 +150,10 @@ program
     "--prompt-override-file <path>",
     "use the literal text in this file as the image-gen prompt instead of calling Portkey (used by the web UI's Regenerate button to skip the prompt-build step)",
   )
+  .option(
+    "--extra-instructions-file <path>",
+    "merge this file's text into the per-image top-priority block (treated like additional_instructions for this run only — does NOT mutate the saved graphic_token)",
+  )
   .action(
     async (opts: {
       client: string;
@@ -164,6 +168,7 @@ program
       provider?: Provider;
       concurrency: string;
       promptOverrideFile?: string;
+      extraInstructionsFile?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
@@ -173,9 +178,15 @@ program
         const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 5);
 
         let promptOverride: string | undefined;
-        if (opts.promptOverrideFile) {
+        let extraInstructions: string | undefined;
+        if (opts.promptOverrideFile || opts.extraInstructionsFile) {
           const fs = await import("node:fs/promises");
-          promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
+          if (opts.promptOverrideFile) {
+            promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
+          }
+          if (opts.extraInstructionsFile) {
+            extraInstructions = (await fs.readFile(opts.extraInstructionsFile, "utf8")).trim();
+          }
         }
 
         // --page-type accepts a CSV list ("blog,service") — split and
@@ -201,6 +212,7 @@ program
           provider: opts.provider,
           concurrency,
           promptOverride,
+          extraInstructions,
         });
       } catch (err) {
         process.stderr.write(

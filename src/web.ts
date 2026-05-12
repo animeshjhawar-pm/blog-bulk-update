@@ -632,6 +632,17 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .rc-img .rc-preview-img { cursor: zoom-in; }
   .btn-compare { font-size: 12px; padding: 5px 10px; }
   .btn-compare:hover { color: var(--brand); border-color: var(--brand); }
+  /* "Regenerate with custom instructions" — a hyperlink-style trigger
+     so it sits beside the main Regenerate button without competing
+     for visual weight. */
+  .btn-regen-custom {
+    display: inline-flex; align-items: center; gap: 2px;
+    background: transparent; border: 0; padding: 4px 6px;
+    font-size: 12px; color: var(--ink-muted); cursor: pointer;
+    text-decoration: underline; text-decoration-style: dotted;
+    text-underline-offset: 2px;
+  }
+  .btn-regen-custom:hover { color: var(--brand); text-decoration-style: solid; }
   /* Per-card Download anchor — render like a button. */
   .btn-download { font-size: 12px; padding: 5px 10px; text-decoration: none; }
   .btn-download:hover { color: var(--brand); border-color: var(--brand); text-decoration: none; }
@@ -2270,14 +2281,15 @@ async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  let runId = "", imageId = "", clusterId = "";
+  let runId = "", imageId = "", clusterId = "", customInstructions = "";
   try {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
-      run_id?: string; image_id?: string; cluster_id?: string;
+      run_id?: string; image_id?: string; cluster_id?: string; custom_instructions?: string;
     };
     runId = body.run_id ?? "";
     imageId = body.image_id ?? "";
     clusterId = body.cluster_id ?? "";
+    customInstructions = (body.custom_instructions ?? "").trim();
   } catch {
     return sendJson(res, 400, { error: "invalid JSON body" });
   }
@@ -2310,6 +2322,20 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
+  // Operator-supplied one-off instructions for this regen only — the
+  // workspace UI's "Regenerate (custom instructions)" flow. Written
+  // to a temp file so multi-line text + odd characters don't go
+  // through argv shell-escaping. The CLI merges this into the
+  // per-record top-priority directive block at generation time.
+  let extraInstructionsFile: string | undefined;
+  if (customInstructions.length > 0) {
+    const tmpDir = path.resolve(process.cwd(), "out");
+    const fname = `extra-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
+    extraInstructionsFile = path.join(tmpDir, fname);
+    await fs.mkdir(tmpDir, { recursive: true });
+    await fs.writeFile(extraInstructionsFile, customInstructions, "utf8");
+  }
+
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
   // We reuse the parent's client/page_type so the subprocess loads the
   // identical graphic_token + project context.
@@ -2323,6 +2349,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     pageType: extractPageTypeFromArgs(parent.args),
     provider: extractProviderFromArgs(parent.args),
     promptOverrideFile,
+    extraInstructionsFile,
   });
 
   // Wait for the subprocess to finish, then read its CSV for the new URL.
@@ -2534,6 +2561,10 @@ function startRegen(opts: {
   pageType?: string;
   provider?: string;
   promptOverrideFile?: string;
+  /** Path to a UTF-8 file with one-off operator instructions for this
+   *  regen only — merged into the top-priority directives block at
+   *  generation time. Never mutates the saved graphic_token. */
+  extraInstructionsFile?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
   const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client, "--run-id", id];
@@ -2546,6 +2577,7 @@ function startRegen(opts: {
   if (opts.assetTypes) args.push("--asset-types", opts.assetTypes);
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.promptOverrideFile) args.push("--prompt-override-file", opts.promptOverrideFile);
+  if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
 
   const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
 
@@ -3021,6 +3053,7 @@ async function runPage(res: ServerResponse, id: string) {
     <div class="rc-status-line"></div>
     <div class="rc-actions">
       <button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
+      <a class="btn-regen-custom" type="button" data-regen-custom title="Re-roll with one-off instructions for this image only" role="button" tabindex="0">↻ Custom…</a>
       ${canCompare ? `<button class="btn-compare" type="button" data-compare title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
@@ -3088,6 +3121,32 @@ ${clusterSections}
         <img id="cmp-new" alt="">
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Regenerate (custom instructions) modal — operator-supplied
+     one-off addendum for a single regeneration. Cancel discards, the
+     primary button kicks off /api/regen-one with the text in the body. -->
+<div class="cmp-overlay" id="rc-overlay" onclick="rcBackdrop(event)">
+  <div class="cmp-modal" role="dialog" aria-modal="true" style="max-width:640px">
+    <header class="cmp-head">
+      <strong>Regenerate with custom instructions</strong>
+      <span class="sub" id="rc-meta" style="margin-left:auto"></span>
+    </header>
+    <div style="padding:18px 20px">
+      <label style="font-size:12px;color:var(--ink-muted);display:block;margin-bottom:6px">
+        These instructions are appended to the image-generation prompt
+        as a top-priority block — they override visual choices Claude
+        would otherwise make. Saved brand guidelines still apply;
+        these stack on top for this regen only.
+      </label>
+      <textarea id="rc-text" placeholder="e.g. make it warmer / remove the people / use a closer crop / lean editorial, not stock"
+        style="width:100%;min-height:140px;font-size:13px;line-height:1.45"></textarea>
+    </div>
+    <footer style="padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" onclick="rcClose()">Cancel</button>
+      <button type="button" class="primary" id="rc-submit" onclick="rcSubmit()">↻ Regenerate</button>
+    </footer>
   </div>
 </div>
 
@@ -3531,7 +3590,7 @@ function closeCompareOnBackdrop(ev) {
   if (ev.target === ev.currentTarget) closeCompare();
 }
 
-async function regenOne(imageId) {
+async function regenOne(imageId, customInstructions) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
   const btn = card.querySelector('.btn-regen');
@@ -3543,9 +3602,15 @@ async function regenOne(imageId) {
   // sees something is in flight (the actual call can take 30–60s).
   card.classList.add('regenerating');
   try {
+    const body = { run_id: RUN_ID, image_id: imageId, cluster_id: card.dataset.clusterId };
+    // Only include custom_instructions when actually supplied — the
+    // empty case must hit the fast no-op path on the server.
+    if (typeof customInstructions === 'string' && customInstructions.trim().length > 0) {
+      body.custom_instructions = customInstructions.trim();
+    }
     const r = await fetch('/api/regen-one', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_id: card.dataset.clusterId })
+      body: JSON.stringify(body)
     });
     if (!r.ok) throw new Error(await r.text());
     const j = await r.json();
@@ -3563,6 +3628,39 @@ async function regenOne(imageId) {
     if (btn) { btn.innerHTML = '↻ Regenerate'; btn.disabled = false; }
   }
   refreshTotals();
+}
+
+// ── Regenerate (custom instructions) modal ──
+// Holds the image_id while the modal is open so the Cancel/Submit
+// buttons know which card to act on. Cleared on close.
+let rcImageIdInFlight = null;
+function rcOpen(imageId) {
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  rcImageIdInFlight = imageId;
+  const pillEl = card.querySelector('.pill');
+  const assetLabel = pillEl ? pillEl.textContent : '';
+  document.getElementById('rc-meta').textContent = (assetLabel || '') + ' · ' + imageId;
+  const ta = document.getElementById('rc-text');
+  ta.value = '';
+  document.getElementById('rc-overlay').classList.add('open');
+  // Defer focus until after the open-transition starts.
+  setTimeout(() => { try { ta.focus(); } catch (_) { /* */ } }, 50);
+}
+function rcClose() {
+  document.getElementById('rc-overlay').classList.remove('open');
+  rcImageIdInFlight = null;
+}
+function rcBackdrop(ev) { if (ev.target === ev.currentTarget) rcClose(); }
+async function rcSubmit() {
+  const id = rcImageIdInFlight;
+  if (!id) return;
+  const text = (document.getElementById('rc-text').value || '').trim();
+  // Closing first means the operator can keep using the page while
+  // the (~30-60s) regen runs — the in-page card shimmer already
+  // signals what's in flight.
+  rcClose();
+  await regenOne(id, text);
 }
 
 function refreshTotals() {
@@ -3601,6 +3699,8 @@ function lbBackdrop(ev) { if (ev.target === ev.currentTarget) lbClose(); }
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   // Close whichever modal is on top, in priority order.
+  const rc = document.getElementById('rc-overlay');
+  if (rc && rc.classList.contains('open')) { rcClose(); return; }
   const cmp = document.getElementById('cmp-overlay');
   if (cmp && cmp.classList.contains('open')) { closeCompare(); return; }
   lbClose();
@@ -3622,17 +3722,20 @@ document.addEventListener('click', (ev) => {
     if (card && card.dataset.imageId) zoomCard(card.dataset.imageId, ev);
     return;
   }
-  // Card-action buttons: data-zoom / data-compare / data-regen / data-apply.
-  const btn = t.closest('button[data-zoom],button[data-compare],button[data-regen],button[data-apply]');
+  // Card-action triggers. We include <a> alongside <button> because
+  // "↻ Custom…" is styled as a hyperlink, and we don't want it to
+  // navigate (no href), so its onclick goes through here too.
+  const btn = t.closest('[data-zoom],[data-compare],[data-regen],[data-regen-custom],[data-apply]');
   if (!btn) return;
   const card = btn.closest('.result-card');
   if (!card) return;
   const id = card.dataset.imageId;
   if (!id) return;
-  if (btn.matches('[data-zoom]'))    { zoomCard(id, ev); return; }
-  if (btn.matches('[data-compare]')) { openCompare(id);  return; }
-  if (btn.matches('[data-regen]'))   { regenOne(id);     return; }
-  if (btn.matches('[data-apply]'))   { applyOne(id);     return; }
+  if (btn.matches('[data-zoom]'))          { zoomCard(id, ev);  return; }
+  if (btn.matches('[data-compare]'))       { openCompare(id);   return; }
+  if (btn.matches('[data-regen]'))         { regenOne(id);      return; }
+  if (btn.matches('[data-regen-custom]'))  { ev.preventDefault(); rcOpen(id); return; }
+  if (btn.matches('[data-apply]'))         { applyOne(id);      return; }
 });
 
 ${state.done ? "" : `

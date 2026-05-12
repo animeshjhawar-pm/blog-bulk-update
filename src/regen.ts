@@ -60,6 +60,16 @@ export interface RegenOptions {
    * run's prompt — saves ~5–10s per regeneration.
    */
   promptOverride?: string;
+  /**
+   * Free-text addendum merged into the per-record top-priority
+   * brand-directives block at generation time. Used by the web UI's
+   * "Regenerate (custom instructions)" flow — the operator types a
+   * one-off tweak ("make it warmer", "remove the people") and it
+   * rides along ONLY for this run. Never mutates the saved
+   * graphic_token. Combines with any existing additional_instructions
+   * from the token (both go into the same block).
+   */
+  extraInstructions?: string;
 }
 
 function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
@@ -193,6 +203,18 @@ async function processOne(args: {
     };
   }
 
+  // Compose the "directives" that prefix the final prompt. Saved
+  // graphic_token additional_instructions + this run's one-off extra
+  // instructions (web UI's "Regenerate with custom instructions"
+  // flow) are concatenated into a single block. Extras come AFTER
+  // saved so they read as the most-specific override.
+  const savedDirectives = extractAdditionalInstructions(graphicToken);
+  const extras = (options.extraInstructions ?? "").trim();
+  const mergedDirectives = [savedDirectives, extras]
+    .filter((s): s is string => !!s && s.length > 0)
+    .join("\n\n")
+    || null;
+
   let promptUsed = "";
   try {
     if (options.promptOverride && options.promptOverride.trim().length > 0) {
@@ -202,15 +224,13 @@ async function processOne(args: {
       //
       // Brand-directives twist: the parent prompt has the directives
       // that were active AT THE TIME of the original generation. If
-      // the operator has since updated additional_instructions, those
-      // stale directives would ride along. Strip + re-apply the
-      // CURRENT directives so a regenerate always honours the latest
-      // saved brand guidelines.
+      // the operator has since updated additional_instructions, OR
+      // passed one-off extras for this regen, those stale directives
+      // would ride along. Strip + re-apply the MERGED current ones.
       const stripped = stripAdditionalInstructions(options.promptOverride);
-      const currentDirectives = extractAdditionalInstructions(graphicToken);
-      promptUsed = applyAdditionalInstructions(stripped, currentDirectives);
+      promptUsed = applyAdditionalInstructions(stripped, mergedDirectives);
       process.stderr.write(
-        `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override${currentDirectives ? "+directives" : ""}\n`,
+        `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override${mergedDirectives ? `+directives${extras ? "+extras" : ""}` : ""}\n`,
       );
     } else {
       const built = await buildImagePrompt({
@@ -222,7 +242,12 @@ async function processOne(args: {
         clientHomepageUrl: project.url ?? "",
         projectId: project.id,
       });
-      promptUsed = built.finalPrompt;
+      // buildImagePrompt already prepended the saved-token directives.
+      // When per-run extras are present, we re-apply with the merged
+      // set so both saved + extras land in the same block.
+      promptUsed = extras
+        ? applyAdditionalInstructions(stripAdditionalInstructions(built.finalPrompt), mergedDirectives)
+        : built.finalPrompt;
     }
 
     if (options.dryRun) {
