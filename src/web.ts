@@ -1751,6 +1751,7 @@ ${awsBanner}
         <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button type="submit" class="primary">Save token</button>
           <button type="button" onclick="resetToken()">Reset</button>
+          <button type="button" id="reextract-btn" onclick="extractToken(event)"${project.url ? "" : ' disabled title="No project.url to scrape"'}>⚡ Re-extract from site</button>
           <span id="token-status" class="sub"></span>
         </div>
       </form>
@@ -1767,24 +1768,28 @@ function resetToken() {
 }
 async function extractToken(e) {
   if (e) e.preventDefault();
-  const btn = document.getElementById('extract-token-btn');
-  const status = document.getElementById('extract-status');
-  if (!btn || !status) return;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Extracting…';
-  status.textContent = 'scraping + asking Claude — can take up to 60s';
+  // The same handler powers both the first-time banner button and the
+  // "Re-extract from site" button nested in the advanced view.
+  // Whichever fired the click is what we update; status falls back to
+  // a status node if present.
+  const btn = (e && e.currentTarget) || document.getElementById('extract-token-btn') || document.getElementById('reextract-btn');
+  const status = document.getElementById('extract-status') || document.getElementById('token-status');
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Extracting…';
+  }
+  if (status) { status.style.color = ''; status.textContent = 'scraping + asking Claude — can take up to 60s'; }
   try {
     const r = await fetch('/workspace/' + encodeURIComponent(${JSON.stringify(slug)}) + '/token/extract', {
       method: 'POST'
     });
     if (!r.ok) throw new Error(await r.text());
-    status.textContent = 'done — reloading…';
+    if (status) status.textContent = 'done — reloading…';
     setTimeout(() => window.location.reload(), 500);
   } catch (err) {
-    btn.disabled = false;
-    btn.textContent = '⚡ Extract graphic_token now';
-    status.style.color = 'var(--err)';
-    status.textContent = 'failed: ' + err.message;
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel || '⚡ Extract graphic_token now'; }
+    if (status) { status.style.color = 'var(--err)'; status.textContent = 'failed: ' + err.message; }
   }
 }
 async function saveToken(e) {

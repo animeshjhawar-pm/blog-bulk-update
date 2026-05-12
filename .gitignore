@@ -7,7 +7,12 @@ out/
 *.log
 .DS_Store
 
-# graphic_tokens are pre-fetched and committed (cheap brand-extract JSON).
-# But operator-edited brand text and per-client overrides stay local.
+# Only the curated featured-client tokens (slug-named) are tracked in
+# git. Ad-hoc tokens extracted by the workspace UI are saved under
+# their project_id (UUID); those should stay local to each deployment
+# so a re-deploy doesn't ship someone else's extraction back to every
+# operator. Operator-edited brand text and per-client overrides also
+# stay local.
 graphic-tokens/*-brand.txt
 graphic-tokens/*-overrides.json
+graphic-tokens/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*.json
