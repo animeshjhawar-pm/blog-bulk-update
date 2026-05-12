@@ -28,6 +28,7 @@ import {
   loadToken,
   loadProjectOverrides,
   saveProjectOverrides,
+  tokenStoreLayout,
 } from "./tokens.js";
 import { promises as fs } from "node:fs";
 import { parse as csvParse } from "csv-parse/sync";
@@ -4133,6 +4134,19 @@ export function startWebServer(port: number): void {
 
   server.listen(port, () => {
     process.stdout.write(`web: listening on http://localhost:${port}\n`);
+    // Surface the token-store layout so operators can confirm at boot
+    // whether extracts will survive redeploys (operator dir ≠ bundled
+    // dir + the operator dir is on a persistent volume).
+    const tsl = tokenStoreLayout();
+    if (tsl.layered) {
+      process.stdout.write(
+        `web: graphic_token store = bundled:${tsl.bundled} + operator:${tsl.operator}\n`,
+      );
+    } else {
+      process.stdout.write(
+        `web: graphic_token store = ${tsl.bundled} (single layer — set GRAPHIC_TOKEN_DIR for persistence)\n`,
+      );
+    }
     // Warm the featured-client cache so the very first home page render
     // doesn't pay the projects.id round-trip cost.
     loadClientPickerEntries().catch(() => { /* ignore — env may not be ready yet */ });
