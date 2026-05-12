@@ -1718,49 +1718,73 @@ ${awsBanner}
 <section class="card">
   <details>
     <summary>
-      <h2 style="display:inline">Brand guidelines · graphic_token</h2>
+      <h2 style="display:inline">Brand guidelines</h2>
     </summary>
     <div class="sub" style="margin:8px 0 10px">
-      The graphic_token JSON below is what every prompt reads. Edit it directly and hit <strong>Save token</strong> to overwrite the saved file. The free-text box below is for additional brand guidelines (colors not in the token, mandatory taglines, things to avoid) — those are appended under <code>additional_instructions</code> and woven into every prompt.
+      Free-text directives that get <strong>appended verbatim</strong> to every image-generation prompt as a top-priority block — they override any visual choice Claude would otherwise make. Saved under <code>graphic_token.additional_instructions</code>.
     </div>
 
-    <form id="token-form" onsubmit="saveToken(event)" style="margin-bottom:14px">
-      <label style="font-size:12px;color:var(--ink-muted)"><code>graphic_token</code> (editable JSON)</label>
-      <textarea id="token-text" class="json-edit" spellcheck="false">${esc(fmtJson(savedToken))}</textarea>
-      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button type="submit" class="primary">Save token</button>
-        <button type="button" onclick="resetToken()">Reset</button>
-        <button type="button" onclick="formatToken()">Format JSON</button>
-        <span id="token-status" class="sub"></span>
-      </div>
-    </form>
-
     <form id="brand-form" onsubmit="saveBrand(event)">
-      <label style="font-size:12px;color:var(--ink-muted)">Append to <code>graphic_token.additional_instructions</code></label>
+      <label style="font-size:12px;color:var(--ink-muted)">Additional instructions (highest priority — passed verbatim to the image model)</label>
       <textarea id="brand-text" style="margin-top:4px" placeholder="(optional) e.g. Use deep navy + gold only. Avoid stock-photo people. Always include the brand mark in the footer.">${esc(brand)}</textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button type="submit" class="primary">Save</button>
         <span id="brand-status" class="sub"></span>
       </div>
     </form>
+
+    ${!savedToken || Object.keys(savedToken as Record<string, unknown>).length === 0
+      ? `<div id="token-missing-banner" class="banner warn" style="margin-top:16px">
+           <strong>No <code>graphic_token</code> saved for this project yet.</strong>
+           <div class="sub" style="margin-top:4px">The regen pipeline needs colors + brand info from the live site. Extract once and it's cached on disk; takes ~30s.</div>
+           <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+             <button class="primary" onclick="extractToken(event)" id="extract-token-btn"${project.url ? "" : ' disabled title="No project.url to scrape"'}>⚡ Extract graphic_token now</button>
+             <span class="sub" id="extract-status"></span>
+           </div>
+         </div>`
+      : ""}
+
+    <details style="margin-top:14px">
+      <summary class="sub"><strong>graphic_token (advanced — editable JSON)</strong></summary>
+      <form id="token-form" onsubmit="saveToken(event)" style="margin-top:8px">
+        <textarea id="token-text" class="json-edit" spellcheck="false">${esc(fmtJson(savedToken))}</textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button type="submit" class="primary">Save token</button>
+          <button type="button" onclick="resetToken()">Reset</button>
+          <span id="token-status" class="sub"></span>
+        </div>
+      </form>
+    </details>
   </details>
 </section>
 <script>
 const TOKEN_INITIAL = ${JSON.stringify(JSON.stringify(savedToken ?? {}, null, 2))};
 function resetToken() {
-  document.getElementById('token-text').value = TOKEN_INITIAL;
-  document.getElementById('token-status').textContent = '';
-}
-function formatToken() {
   const t = document.getElementById('token-text');
+  if (t) t.value = TOKEN_INITIAL;
+  const s = document.getElementById('token-status');
+  if (s) s.textContent = '';
+}
+async function extractToken(e) {
+  if (e) e.preventDefault();
+  const btn = document.getElementById('extract-token-btn');
+  const status = document.getElementById('extract-status');
+  if (!btn || !status) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Extracting…';
+  status.textContent = 'scraping + asking Claude — can take up to 60s';
   try {
-    const parsed = JSON.parse(t.value || '{}');
-    t.value = JSON.stringify(parsed, null, 2);
-    document.getElementById('token-status').textContent = 'formatted ✓';
-    setTimeout(() => { document.getElementById('token-status').textContent = ''; }, 1200);
+    const r = await fetch('/workspace/' + encodeURIComponent(${JSON.stringify(slug)}) + '/token/extract', {
+      method: 'POST'
+    });
+    if (!r.ok) throw new Error(await r.text());
+    status.textContent = 'done — reloading…';
+    setTimeout(() => window.location.reload(), 500);
   } catch (err) {
-    document.getElementById('token-status').textContent = 'invalid JSON: ' + err.message;
-    document.getElementById('token-status').style.color = 'var(--err)';
+    btn.disabled = false;
+    btn.textContent = '⚡ Extract graphic_token now';
+    status.style.color = 'var(--err)';
+    status.textContent = 'failed: ' + err.message;
   }
 }
 async function saveToken(e) {
@@ -2384,6 +2408,33 @@ async function saveTokenHandler(req: IncomingMessage, res: ServerResponse, slug:
     const tokenPath = await saveToken(slug, token as Record<string, unknown>);
     sendJson(res, 200, { ok: true, token_path: tokenPath });
   } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
+}
+
+/**
+ * POST /workspace/:slug/token/extract — Firecrawl + Claude to derive
+ * the graphic_token from the project's live site, then persist to
+ * graphic-tokens/<slug>.json. Used by non-allowlist projects (picked
+ * via DB search) that don't have a pre-shipped token. Synchronous —
+ * takes 30–60s. The UI shows a spinner and reloads on success.
+ */
+async function extractTokenHandler(res: ServerResponse, slug: string) {
+  const entry = resolveClient(slug);
+  if (!entry) return sendJson(res, 400, { error: "unknown client" });
+  try {
+    const project = await lookupProjectById(entry.projectId);
+    if (!project) return sendJson(res, 404, { error: "project not found in DB" });
+    if (!project.url) return sendJson(res, 400, { error: "project has no url to scrape" });
+    const { runExtractTokenCli } = await import("./extractToken.js");
+    const { tokenPath } = await runExtractTokenCli({
+      slug,
+      url: project.url,
+      projectId: project.id,
+    });
+    sendJson(res, 200, { ok: true, token_path: tokenPath });
+  } catch (err) {
+    process.stderr.write(`extractToken: failed for slug=${slug}: ${(err as Error).message}\n`);
     sendJson(res, 500, { error: (err as Error).message });
   }
 }
@@ -3976,6 +4027,10 @@ export function startWebServer(port: number): void {
       const wsTokenMatch = /^\/workspace\/([^/]+)\/token$/.exec(p);
       if (method === "POST" && wsTokenMatch && wsTokenMatch[1]) {
         return await saveTokenHandler(req, res, decodeURIComponent(wsTokenMatch[1]));
+      }
+      const wsTokenExtractMatch = /^\/workspace\/([^/]+)\/token\/extract$/.exec(p);
+      if (method === "POST" && wsTokenExtractMatch && wsTokenExtractMatch[1]) {
+        return await extractTokenHandler(res, decodeURIComponent(wsTokenExtractMatch[1]));
       }
       const wsMatch = /^\/workspace\/([^/]+)\/?$/.exec(p);
       if (method === "GET" && wsMatch && wsMatch[1]) {

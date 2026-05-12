@@ -92,19 +92,75 @@ export interface BuildPromptResult {
   rawResponse: object;
 }
 
+/**
+ * Append the operator's additional_instructions to the prompt that
+ * will be handed to Replicate. Two design choices worth calling out:
+ *
+ *   1. Position — we PREPEND. Image-gen models (Flux, Nano Banana,
+ *      etc.) read the entire prompt; there's no formal priority
+ *      mechanism, but putting brand directives at the top of the
+ *      prompt keeps them salient and unmissable.
+ *
+ *   2. Wording — the wrapper is explicitly imperative ("MUST",
+ *      "override any visual choice below"). The model is being told
+ *      that anything below is subordinate, which empirically biases
+ *      Replicate's image models toward honouring the directives.
+ *
+ * We append at THIS layer (post-Claude, pre-Replicate) instead of
+ * relying on Claude to splice the directives into its output. That
+ * proved unreliable in practice — Claude would paraphrase or drop
+ * parts of the directive. By appending here we guarantee the text
+ * reaches Replicate verbatim every time, and the same string also
+ * lands in the CSV as `prompt_used` so single-image Regenerate (which
+ * skips Claude) inherits the directives unchanged.
+ */
+const BRAND_OPEN = "[TOP-PRIORITY BRAND DIRECTIVES — these MUST be followed and override any visual choice in the description that follows]";
+const BRAND_CLOSE = "[/TOP-PRIORITY BRAND DIRECTIVES]";
+const BRAND_RE = new RegExp(
+  `${escapeRegex(BRAND_OPEN)}[\\s\\S]*?${escapeRegex(BRAND_CLOSE)}\\s*`,
+  "g",
+);
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function applyAdditionalInstructions(
+  basePrompt: string,
+  additionalInstructions: string | null,
+): string {
+  const trimmed = (additionalInstructions ?? "").trim();
+  if (!trimmed) return basePrompt;
+  return [
+    BRAND_OPEN,
+    trimmed,
+    BRAND_CLOSE,
+    "",
+    basePrompt,
+  ].join("\n");
+}
+
+/**
+ * Remove any previously-injected brand-directives block from a prompt
+ * so it can be re-applied with the latest additional_instructions.
+ * Used by single-image Regenerate so a user who updated their brand
+ * guidelines doesn't keep getting stale directives carried forward.
+ */
+export function stripAdditionalInstructions(prompt: string): string {
+  return prompt.replace(BRAND_RE, "").trimStart();
+}
+
+export { extractAdditionalInstructions };
+
 export async function buildImagePrompt(params: BuildPromptParams): Promise<BuildPromptResult> {
   const { asset } = params;
   const { system, user } = templatesFor(asset);
 
-  // If the operator saved brand guidelines via the workspace UI, they
-  // were appended to graphic_token.additional_instructions. Surface
-  // that string explicitly to the prompt-builder LLM so it gets pasted
-  // verbatim into the final image-gen prompt — not paraphrased and not
-  // dropped.
+  // The operator's additional_instructions are NOT injected into the
+  // Claude system prompt anymore — Claude is left to do its job, and
+  // we append the directives ourselves AFTER it returns. That makes
+  // the post-Claude prompt the single source of truth for what
+  // Replicate sees.
   const additionalInstructions = extractAdditionalInstructions(params.graphicToken);
-  const systemWithDirective = additionalInstructions
-    ? `${system}\n\nADDITIONAL_INSTRUCTIONS_DIRECTIVE: The graphic_token contains a key \`additional_instructions\`. You MUST include the value of that key VERBATIM and unedited inside the final image-generation prompt as a dedicated "Additional brand instructions" block. Do not paraphrase, summarize, or omit any part of it. The current value (for reference) is:\n<<<\n${additionalInstructions}\n>>>`
-    : system;
 
   const userPrompt = interpolate(user, {
     placeholder_description: params.imageDescription ?? "",
@@ -119,7 +175,7 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
 
   const result = await callPortkey({
     model: "claude-sonnet-4-6",
-    systemPrompt: systemWithDirective,
+    systemPrompt: system,
     userPrompt,
     maxTokens: 64000,
     metadata: {
@@ -130,8 +186,13 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
     },
   });
 
+  const finalPrompt = applyAdditionalInstructions(
+    stripFinalPromptWrapper(result.text),
+    additionalInstructions,
+  );
+
   return {
-    finalPrompt: stripFinalPromptWrapper(result.text),
+    finalPrompt,
     rawResponse: result.rawResponse,
   };
 }

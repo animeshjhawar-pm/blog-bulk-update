@@ -10,7 +10,12 @@ import {
 } from "./db.js";
 import { resolveGraphicToken, type TokenSource } from "./extractToken.js";
 import { loadBrandGuidelines, loadProjectOverrides } from "./tokens.js";
-import { buildImagePrompt } from "./buildPrompt.js";
+import {
+  buildImagePrompt,
+  applyAdditionalInstructions,
+  stripAdditionalInstructions,
+  extractAdditionalInstructions,
+} from "./buildPrompt.js";
 import { generate, type Provider } from "./generate.js";
 import { downloadImage } from "./rehost.js";
 import { openCsv, type CsvRow, type CsvWriter } from "./csv.js";
@@ -191,12 +196,21 @@ async function processOne(args: {
   let promptUsed = "";
   try {
     if (options.promptOverride && options.promptOverride.trim().length > 0) {
-      // Skip Portkey: reuse the parent run's prompt verbatim. Used by
-      // the web UI's single-image Regenerate flow to shave the
+      // Skip Portkey: reuse the parent run's prompt. Used by the
+      // web UI's single-image Regenerate flow to shave the
       // prompt-building round trip.
-      promptUsed = options.promptOverride;
+      //
+      // Brand-directives twist: the parent prompt has the directives
+      // that were active AT THE TIME of the original generation. If
+      // the operator has since updated additional_instructions, those
+      // stale directives would ride along. Strip + re-apply the
+      // CURRENT directives so a regenerate always honours the latest
+      // saved brand guidelines.
+      const stripped = stripAdditionalInstructions(options.promptOverride);
+      const currentDirectives = extractAdditionalInstructions(graphicToken);
+      promptUsed = applyAdditionalInstructions(stripped, currentDirectives);
       process.stderr.write(
-        `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override\n`,
+        `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override${currentDirectives ? "+directives" : ""}\n`,
       );
     } else {
       const built = await buildImagePrompt({
