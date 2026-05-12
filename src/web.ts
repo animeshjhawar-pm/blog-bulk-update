@@ -43,6 +43,12 @@ const archiver: typeof ArchiverDefault = requireCjs("archiver");
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
 import { Readable } from "node:stream";
+import {
+  loadRetentionConfig,
+  sweepRunRetention,
+  expiryForRun,
+  type RetentionConfig,
+} from "./retention.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
@@ -628,6 +634,14 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   /* Per-card Download anchor — render like a button. */
   .btn-download { font-size: 12px; padding: 5px 10px; text-decoration: none; }
   .btn-download:hover { color: var(--brand); border-color: var(--brand); text-decoration: none; }
+  /* Download retention notice on the run page. */
+  .retention-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent-bg); color: var(--brand);
+    padding: 5px 10px; border-radius: 6px; font-size: 12px;
+    border: 1px solid #c7d2fe;
+  }
+  .retention-badge .ret-left { color: var(--ink-muted); font-weight: 500; }
 
   /* Old-vs-new compare modal — two stacked or side-by-side panes. */
   .cmp-overlay {
@@ -2823,7 +2837,26 @@ async function runPage(res: ServerResponse, id: string) {
     // the operator gets the persisted CSV + cluster grid only.
     const reconstructed = await tryReconstructRunFromDisk(id);
     if (!reconstructed) {
-      sendHtml(res, 404, shell("Not found", `<div class="banner err">run ${esc(id)} not found</div>`));
+      // No manifest for this id — most likely the retention sweep
+      // pruned it. Tell the operator what happened instead of a bare
+      // 404 so they know it's expected behaviour, not a bug.
+      const cfg = loadRetentionConfig();
+      sendHtml(
+        res,
+        404,
+        shell(
+          "Run expired",
+          `<section class="card">
+             <h1>Run <code>${esc(id)}</code> not found</h1>
+             <div class="sub" style="margin-top:8px">
+               Either the id is wrong, or the run's downloads have expired and the artefacts were pruned.
+               Retention on this deployment is <strong>${cfg.maxRunsKept} runs</strong> or
+               <strong>${cfg.retentionHours} hours</strong>, whichever trips first.
+             </div>
+             <div style="margin-top:14px"><a class="btn" href="/runs">← back to runs</a></div>
+           </section>`,
+        ),
+      );
       return;
     }
     state = reconstructed;
@@ -3016,10 +3049,17 @@ ${clusterSections}
     }
   }
 
+  const retentionCfg = loadRetentionConfig();
+  const expiry = expiryForRun({ startedAt: state.startedAt, cfg: retentionCfg });
+  const expiryHtml = expiry.expiresAt
+    ? `<span class="retention-badge" title="Downloads (single image + ZIP) work until this time. After that the files are pruned to keep disk bounded.">⏱ Downloads available until <strong>${esc(expiry.expiresAt.toISOString().slice(0, 16).replace("T", " "))} UTC</strong>${expiry.hoursLeft != null ? ` · <span class="ret-left">~${expiry.hoursLeft}h left</span>` : ""}</span>`
+    : "";
+
   sendHtml(res, 200, shell(`run ${id}`, `
 <section class="card">
   <h1>Run <code>${esc(id)}</code></h1>
   <div class="sub">client <code>${esc(state.client)}</code> · started <code>${esc(state.startedAt)}</code> · <span id="elapsed-clock">—</span></div>
+  ${expiryHtml ? `<div style="margin-top:8px">${expiryHtml}</div>` : ""}
   <details style="margin-top:8px">
     <summary class="sub">command</summary>
     <pre style="background:#f1f5f9;padding:8px 12px;border-radius:6px;font-size:12px;overflow:auto"><code>${cmd}</code></pre>
@@ -3952,6 +3992,30 @@ export function startWebServer(port: number): void {
     // Warm the featured-client cache so the very first home page render
     // doesn't pay the projects.id round-trip cost.
     loadClientPickerEntries().catch(() => { /* ignore — env may not be ready yet */ });
+
+    // Retention sweep — bounded disk on Railway. Run once at boot
+    // (clears anything that aged out while we were offline) and then
+    // every 30 minutes. The sweep is best-effort and never blocks
+    // requests.
+    const cfg = loadRetentionConfig();
+    process.stdout.write(
+      `web: retention = keep last ${cfg.maxRunsKept} runs OR last ${cfg.retentionHours}h\n`,
+    );
+    const runSweep = () => {
+      sweepRunRetention(cfg)
+        .then((r) => {
+          if (r.evicted > 0) {
+            process.stdout.write(
+              `retention: evicted ${r.evicted}/${r.scanned} runs · freed ${(r.bytesFreed / 1024 / 1024).toFixed(1)} MB\n`,
+            );
+          }
+        })
+        .catch((err) => {
+          process.stderr.write(`retention: sweep failed: ${(err as Error).message}\n`);
+        });
+    };
+    runSweep();
+    setInterval(runSweep, 30 * 60 * 1000).unref();
   });
 
   process.on("SIGINT", async () => {

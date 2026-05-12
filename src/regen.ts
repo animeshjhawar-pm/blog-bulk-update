@@ -240,6 +240,7 @@ async function processOne(args: {
       url: gen.imageUrl,
       slug,
       imageId: record.imageId,
+      runId: options.runId,
     });
 
     process.stderr.write(
