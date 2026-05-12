@@ -69,6 +69,27 @@ This rule is checked BEFORE applying <zone2_content_decision>'s photograph vs.
 illustration selection — scope is decided first, medium is decided second.
 </subject_guardrail>
 
+<logo_background_contrast_rule>
+Logo readability is a brand integrity issue and outranks title typographic drama.
+When choosing the Zone 1 background colour from style_guide.colours.palette, the 
+logo's dominant colour must contrast adequately against the chosen background.
+
+- Monochrome logo (single-colour mark): logo colour must contrast against the 
+  chosen background at ratio ≥ 4.5:1. If the highest-contrast background/text 
+  pair from the palette does NOT give the logo adequate contrast, pick a 
+  different background hex from the palette that does.
+- Multi-colour logo: keep the logo's colours as-is; choose a background that 
+  does not visually fight the logo's dominant colour (avoid vivid-on-vivid 
+  clashes). Prefer neutral backgrounds (deep navy, charcoal, cream, off-white) 
+  when in doubt.
+- Logo with its own background lock-up (e.g. wordmark inside a coloured box): 
+  ensure the lock-up's outer edge is visually distinct from the chosen 
+  background; do not pair a white-bg lock-up with a white canvas background.
+
+This rule is checked BEFORE the Zone 1 background selection in Step 2 and 
+overrides title contrast if the two conflict.
+</logo_background_contrast_rule>
+
 <fixed_format>
 The following layout is FIXED and must be reflected in every generated prompt. Do not 
 infer, override, or vary any of these specifications based on the style guide.
@@ -95,10 +116,7 @@ infer, override, or vary any of these specifications based on the style guide.
 
   Zone 2 — Visual (right 50% of canvas):
   - Full height, edge to edge
-  - Bleeds into Zone 1 on its left edge with a feathered alpha fade from full 
-    opacity at the right to zero opacity at the bleed boundary, blending into the 
-    Zone 1 background colour with no hard vertical seam
-  - No text elements appear in Zone 2
+  - Boundary fade governed by <boundary_fade_rule>
 
   Zone 3 — Logo (inside Zone 1, top-left, reference-image driven):
   - Anchored to the top-left of the left column with comfortable margin from top and 
@@ -125,13 +143,28 @@ All layout, spacing, and typography rules in this template are proportional and 
 identically across both aspect ratios. Emit the correct aspect ratio token and 
 dimension string at the end of the prompt, matching <context>.aspect_ratio.
 
-Aspect-specific notes to weave in naturally:
-- 16:9 feels horizontal and editorial; Zone 2 reads as a wide feature image
-- 3:2  feels calmer with more vertical stacking room; Zone 2 reads as a taller 
-       product-catalogue style image
-
 The 50/50 vertical split and all zone rules hold identically across both ratios.
 </canvas_variants>
+
+<boundary_fade_rule>
+The boundary between the two columns features a vertical black shadow band 
+concentrated at the 50% column separator, fading asymmetrically:
+
+- A narrow, near-black darkening sits directly ON the 50% split line — the 
+  darkest part of the shadow occupies roughly 1 to 2 percent of canvas width 
+  centred exactly on the seam.
+- From that darkest line, the shadow fades RIGHTWARD into the image content over 
+  approximately 6 to 9 percent of canvas width, gradually returning to full image 
+  opacity. This rightward fade is the visible "shadow into the image" effect.
+- From the same darkest line, the shadow fades LEFTWARD into the Zone 1 
+  background colour over approximately 2 to 3 percent of canvas width only — a 
+  much shorter and tighter fade on the left side.
+
+The result: a clearly visible dark vertical band anchored on the split, weighted 
+toward the right column, that reads as a deliberate editorial shadow effect — 
+not a hairline divider and not a soft uniform vignette. The shadow is 
+unmistakably present at glance.
+</boundary_fade_rule>
 
 <vertical_rhythm>
 Inside Zone 1, arrange content top-to-bottom with proportional spacing. Do NOT emit 
@@ -160,6 +193,30 @@ Never allow the title to touch or overlap the pill above, the subtitle below, or
 the column margins.
 </vertical_rhythm>
 
+<typography_weight_rule>
+Title weight is non-negotiable: the title MUST always render in a BOLD weight — 
+weight 700 or heavier in the chosen font family. Never render the title in 
+regular, medium, or light weight. If style_guide.typography.hierarchy.cover_title.weight 
+is "not_found_in_source" or specifies a non-bold weight, override and emit 
+"bold weight, 700 or heavier" in the title clause.
+
+Subtitle weight: regular (weight 400) is the default. Never make the subtitle 
+heavier than weight 500 — the subtitle must read as clearly lighter than the 
+title so the visual hierarchy is unmistakable.
+
+Font family selection: use the display font from style_guide.typography.fonts 
+when available. If the style_guide font feels mismatched to the cover's tone 
+(e.g. a delicate display serif on an industrial brand, or a quirky display 
+font on a financial advisory cover), fall back to a confident, clean bold 
+sans-serif descriptor ("bold geometric sans-serif", "modern bold sans-serif", 
+"clean bold display sans-serif") rather than forcing the style_guide font 
+when it visually clashes with the photograph subject in Zone 2.
+
+The title-to-subtitle weight contrast MUST be visually obvious. A title in 
+weight 700 paired with a subtitle in weight 400 is correct. A title and 
+subtitle both rendered in medium weight is wrong.
+</typography_weight_rule>
+
 <value_handling_rules>
 When reading values from <style_guide>:
 
@@ -169,9 +226,8 @@ When reading values from <style_guide>:
   the desired behaviour — an honest absence is better than a fabricated specification.
 - Never emit the literal string "not_found_in_source" into the final prompt.
 
-Example: if typography.hierarchy.cover_title.weight is "not_found_in_source", do not 
-write "weight 500" or "bold weight" — omit the weight descriptor entirely. The model 
-will choose a sensible default.
+EXCEPTION: title weight is overridden per <typography_weight_rule> even if 
+style_guide returns "not_found_in_source".
 </value_handling_rules>
 
 <zone2_content_decision>
@@ -228,11 +284,12 @@ writing the final prompt.
 2. ZONE 1 BACKGROUND — (variable style, locked position)
    Pull from style_guide.colours.palette.
    
-   CONTRAST RULE: select the background and text colour pair with the highest 
-   contrast ratio. Prefer a dark background (background_dark or primary dark) paired 
-   with light text when both exist and contrast is strong, for premium visual weight. 
-   Otherwise use background_light paired with the darkest available text colour. 
-   Never pair a mid-tone background with mid-tone text.
+   Apply <logo_background_contrast_rule> FIRST: ensure the chosen background hex 
+   gives adequate logo contrast.
+   
+   Then apply title contrast: prefer dark background + light text when contrast 
+   is strong; otherwise light background + darkest available text colour. Never 
+   pair mid-tone background with mid-tone text.
    
    Express as: \`left half filled with solid [colour name] [hex] background, clean 
    uncluttered surface, no textures or patterns.\`
@@ -240,69 +297,62 @@ writing the final prompt.
 3. ZONE 2 VISUAL — (variable content, locked position)
    First apply <subject_guardrail> to determine an on-scope subject. Then apply 
    <zone2_content_decision> to pick MODE A, B, or C.
-   Write one concrete scene or subject description for the chosen mode, grounded in 
-   the blog_title and constrained to primary_verticals.
-   
-   Append the bleed instruction: \`the visual bleeds into the left column on its 
-   left edge with a feathered alpha fade from full opacity at the right to zero 
-   opacity at the bleed boundary, blending seamlessly into the [Zone 1 background 
-   hex] with no hard vertical seam visible between the two halves.\`
+   Write one concrete scene or subject description for the chosen mode, grounded 
+   in the blog_title and constrained to primary_verticals.
 
 4. ZONE 3 LOGO — (reference-image driven, locked position)
    The logo is supplied as a reference image attached to the generation request.
    Use this language verbatim:
    \`Place the supplied logo image in the top-left of the left column with 
    comfortable margin from the top and left edges, occupying roughly 10 to 14 
-   percent of canvas width with proportional height. Preserve the original colours, 
-   proportions, typography, and mark details of the supplied logo exactly as 
-   provided — do not recolour, redraw, simplify, or stylise it. Do not add text or 
-   lettering beyond what is present in the supplied reference. If the supplied 
-   logo cannot be reproduced faithfully, leave the logo area empty rather than 
-   generate a placeholder, invented mark, or approximated logo.\`
+   percent of canvas width with proportional height. Preserve the original 
+   colours, proportions, typography, and mark details of the supplied logo 
+   exactly as provided — do not recolour, redraw, simplify, or stylise it. Do 
+   not add text or lettering beyond what is present in the supplied reference. 
+   If the supplied logo cannot be reproduced faithfully, leave the logo area 
+   empty rather than generate a placeholder, invented mark, or approximated logo.\`
 
 5. ZONE 4 PILL — (variable style, locked position, conditional)
    Only include if <blog_post>.category_label is present.
    Pull from style_guide:
    - colours.palette (accent hex) → pill background
-   - shape_language.corner_radius descriptor → pill radius language ("pill-shaped", 
-     "rounded rectangle", "sharp-cornered tag")
+   - shape_language.corner_radius descriptor → pill radius language
    
-   Express as: \`small horizontal pill badge reading "[CATEGORY_LABEL_VERBATIM]" in 
-   uppercase [text colour descriptor], pill background [accent hex], with comfortable 
-   horizontal padding so the label is clearly legible, positioned below the logo 
-   with a small gap, left-aligned.\`
+   Express as: \`small horizontal pill badge reading "[CATEGORY_LABEL_VERBATIM]" 
+   in uppercase [text colour descriptor], pill background [accent hex], with 
+   comfortable horizontal padding so the label is clearly legible, positioned 
+   below the logo with a small gap, left-aligned.\`
    
    The category label MUST appear in double quotes, character-for-character 
    identical to the input.
 
 6. TITLE AND SUBTITLE — (variable style, locked to Zone 1)
+   Apply <typography_weight_rule>: title is ALWAYS bold (weight 700+), subtitle 
+   is regular (weight 400, never above 500).
    
    TITLE (mandatory):
-   - Pull font from style_guide.typography.fonts (display role) and 
-     typography.hierarchy.cover_title (weight, size range)
-   - Express as: \`headline text reading "[BLOG_POST_TITLE_VERBATIM]" in [font name], 
-     [weight] weight, large display size proportional to the column, colour [hex], 
-     left-aligned, positioned as the vertical centre of gravity of Zone 1 below 
-     the pill.\`
-   - If title length calls for multi-line per <vertical_rhythm>, add: \`set across 
-     two lines [or three for very long titles], breaking on a natural word boundary.\`
-   
-   The blog title MUST appear character-for-character identical to the input, 
-   enclosed in double quotes.
+   - Pull font family from style_guide.typography.fonts (display role), but 
+     override per <typography_weight_rule> if the style_guide font feels 
+     mismatched to the cover tone.
+   - Express as: \`headline text reading "[BLOG_POST_TITLE_VERBATIM]" in [font 
+     name], bold weight 700 or heavier, large display size proportional to the 
+     column, colour [hex], left-aligned, positioned as the vertical centre of 
+     gravity of Zone 1 below the pill.\`
+   - If title length calls for multi-line per <vertical_rhythm>, add: \`set 
+     across two lines [or three for very long titles], breaking on a natural 
+     word boundary.\`
+   - The blog title MUST appear character-for-character identical, in double 
+     quotes, exactly once.
 
    SUBTITLE (if <blog_post>.subtitle present):
    - Express as: \`subtitle text reading "[SUBTITLE_VERBATIM]" in [body font], 
-     regular weight, modest size relative to the title, colour [muted_text hex 
-     if available, else body_text hex at reduced emphasis], left-aligned, positioned 
-     below the title with a modest gap.\`
-   - The subtitle MUST appear in double quotes and MUST appear EXACTLY ONCE in the 
-     final prompt. Do not repeat the subtitle in descriptive clauses, style 
-     modifiers, or anywhere else in the output.
+     regular weight 400, modest size clearly smaller than the title, colour 
+     [muted_text hex if available, else body_text hex at reduced emphasis], 
+     left-aligned, positioned below the title with a modest gap.\`
+   - The subtitle MUST appear in double quotes, exactly once.
 
-7. COLOUR SUMMARY — (variable)
-   After describing zones, emit a brief one-sentence palette summary listing the 
-   hex values used and where. This anchors the model on the palette and reduces 
-   colour drift across generations.
+7. BOUNDARY FADE — (locked)
+   Insert the language from <boundary_fade_rule> verbatim.
 
 8. STYLE MODIFIERS — (variable)
    Append in order, only if present and not "not_found_in_source":
@@ -312,14 +362,19 @@ writing the final prompt.
 9. NEGATIVE CLAUSE — (partially locked)
    Fixed exclusions always included:
    \`text on right side, illustration on left side, centred layout, full-bleed 
-   background illustration, logo recoloured or redrawn, invented placeholder logo, 
-   logo text added that is not in the reference, duplicate title or subtitle text, 
-   illegible letters, garbled words, hard vertical seam between zones, pill label 
-   smudged or illegible, stock-photo smiles, diverse team in office clichés, 
-   generic AI-slop aesthetic, unmotivated glow or lens flare, floating particles, 
-   cyberpunk neon, watermarks, low resolution, oversaturated colours, rendered 
-   colour hex codes or font names as visible text, pixel measurements rendered 
-   as visible text, subjects from explicit_out_of_scope list.\`
+   background illustration, logo recoloured or redrawn, invented placeholder 
+   logo, logo washed out against background, logo dominant colour clashing 
+   with background, title rendered in regular or medium weight, title rendered 
+   in light or thin weight, subtitle heavier than title, duplicate title or 
+   subtitle text, illegible letters, garbled words, weak or invisible column 
+   boundary shadow, hairline divider at column split, soft uniform vignette 
+   without anchored dark line, pill label smudged or illegible, stock-photo 
+   smiles, diverse team in office clichés, generic AI-slop aesthetic, plastic 
+   skin, waxy textures, HDR look, teal-orange cinematic grade, unmotivated 
+   glow or lens flare, floating particles, cyberpunk neon, watermarks, low 
+   resolution, oversaturated colours, rendered hex codes or font names as 
+   visible text, pixel measurements rendered as visible text, subjects from 
+   explicit_out_of_scope list.\`
    
    Append any additional exclusions from style_guide.do_not_use if present.
 </construction_steps>
@@ -331,36 +386,32 @@ CRITICAL:
   bullet points, no explanations
 - Zone order within the prompt:
   [Zone 1 background] → [Zone 3 logo with preservation + fallback] → 
-  [Zone 4 pill if present] → [Title] → [Subtitle if present] → 
-  [Zone 2 visual + bleed/feather blend] → [Colour summary] → 
+  [Zone 4 pill if present] → [Title with bold weight] → [Subtitle regular if present] → 
+  [Zone 2 visual] → [Boundary fade per boundary_fade_rule] → 
   [Style modifiers] → [Negative clause] → 
   [Aspect ratio and canvas dimensions from <canvas_variants>]
 - End with: --no [negative terms]
 
 CRITICAL VERBATIM RULES:
-- TITLE: blog_title appears character-for-character identical, in double quotes, 
-  exactly once. Highest priority constraint after layout.
-- SUBTITLE (if present): appears character-for-character identical, in double 
-  quotes, exactly once, only in the subtitle clause.
-- CATEGORY PILL (if present): category label appears character-for-character 
-  identical, in double quotes, exactly once.
+- TITLE: blog_title character-for-character identical, in double quotes, exactly once.
+- SUBTITLE (if present): character-for-character identical, in double quotes, 
+  exactly once, only in the subtitle clause.
+- CATEGORY PILL (if present): character-for-character identical, in double 
+  quotes, exactly once.
 
-CRITICAL SCOPE RULE:
-- Zone 2 subject MUST pass <subject_guardrail> before being written into the 
-  prompt. If the blog_title semantically overlaps an explicit_out_of_scope item, 
-  resolve to the nearest on-scope interpretation from primary_verticals.
+CRITICAL TYPOGRAPHY RULE:
+- Title is always BOLD weight 700+. Subtitle is always regular weight 400.
+- Visual weight hierarchy between title and subtitle must be unmistakable.
 
-CRITICAL OMISSION RULES:
-- NOT-FOUND HANDLING: per <value_handling_rules>, omit constraints rather than 
-  fabricate defaults. The literal string "not_found_in_source" must never appear 
-  in the output.
-- LOGO PRESERVATION RULE: do not instruct the model to recolour or redraw the logo. 
-  Use preservation + skip-on-failure language per Step 4.
-- NO PIXEL MEASUREMENTS: do not emit pixel values ("20px", "64px", etc.) into 
-  the final prompt. Use proportional vocabulary per <vertical_rhythm>.
+CRITICAL LOGO CONTRAST RULE:
+- Logo contrast against background is checked BEFORE title contrast — per 
+  <logo_background_contrast_rule>.
 
-Do not mention real brand names, real people, or trademarked properties.
-Prompt length: 140–200 words inside the tags.
+CRITICAL BOUNDARY RULE:
+- Boundary fade follows <boundary_fade_rule> exactly — dark line anchored at 
+  the 50% seam, fading asymmetrically (more rightward, less leftward).
+
+Prompt length: 160–220 words inside the tags.
 
 Expected output format:
 <cover_image_prompt>
