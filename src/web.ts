@@ -3052,7 +3052,7 @@ ${clusterSections}
   const retentionCfg = loadRetentionConfig();
   const expiry = expiryForRun({ startedAt: state.startedAt, cfg: retentionCfg });
   const expiryHtml = expiry.expiresAt
-    ? `<span class="retention-badge" title="Downloads (single image + ZIP) work until this time. After that the files are pruned to keep disk bounded.">⏱ Downloads available until <strong>${esc(expiry.expiresAt.toISOString().slice(0, 16).replace("T", " "))} UTC</strong>${expiry.hoursLeft != null ? ` · <span class="ret-left">~${expiry.hoursLeft}h left</span>` : ""}</span>`
+    ? `<span class="retention-badge" title="Until this time the run's bytes are served from local disk on the server. Older than ~${retentionCfg.replicateUrlTtlHours}h, Replicate's signed URLs expire too, so any image whose local copy was lost would no longer be recoverable.">⏱ Downloads available until <strong>${esc(expiry.expiresAt.toISOString().slice(0, 16).replace("T", " "))} UTC</strong>${expiry.hoursLeft != null ? ` · <span class="ret-left">~${expiry.hoursLeft}h left</span>` : ""}</span>`
     : "";
 
   sendHtml(res, 200, shell(`run ${id}`, `
@@ -3642,19 +3642,29 @@ const IMAGE_CT: Record<string, string> = {
  * Resolve a CSV row to a Node Readable stream of the image bytes.
  *
  * Priority:
- *   1. image_local_path on disk — the regen pipeline saved a copy
- *      here at run time, so it's always available even after the
- *      Replicate signed URL expires.
+ *   1. image_local_path on disk — the regen pipeline saved a copy at
+ *      run time, so it works for the full retention window.
  *   2. image_url_new (Replicate signed URL) — only useful while the
- *      run is fresh, but the safety net for older runs whose local
- *      files were pruned.
+ *      run is fresh. Replicate signs delivery URLs for ~1h, so we
+ *      gate this branch on `generated_at_utc` to avoid burning a
+ *      TCP timeout on every miss for an old run.
  *
  * Both paths stream; the response is never buffered into memory.
- * Returns null when neither source works.
+ * Returns either the stream + (when known) size and stat metadata
+ * for caching headers, or null when neither source works.
  */
+interface OpenedImage {
+  stream: Readable;
+  size?: number;
+  ext: string;
+  /** Populated only for the local-file path; lets the caller emit
+   *  Last-Modified / ETag headers for a 304 Not Modified flow. */
+  localMtimeMs?: number;
+}
 async function openImageStream(
-  row: { image_local_path?: string; image_url_new?: string },
-): Promise<{ stream: Readable; size?: number; ext: string } | null> {
+  row: { image_local_path?: string; image_url_new?: string; generated_at_utc?: string },
+  retentionCfg: RetentionConfig = loadRetentionConfig(),
+): Promise<OpenedImage | null> {
   const local = row.image_local_path?.trim();
   if (local) {
     try {
@@ -3663,13 +3673,26 @@ async function openImageStream(
       if (abs.startsWith(root)) {
         const st = statSync(abs);
         if (st.isFile()) {
-          return { stream: createReadStream(abs), size: st.size, ext: extOf(abs) };
+          return {
+            stream: createReadStream(abs),
+            size: st.size,
+            ext: extOf(abs),
+            localMtimeMs: st.mtimeMs,
+          };
         }
       }
     } catch { /* fall through to remote */ }
   }
   const remote = row.image_url_new?.trim();
   if (remote && /^https?:\/\//.test(remote)) {
+    // Skip the remote round-trip when the URL is almost certainly
+    // expired. Replicate signs delivery URLs for roughly an hour;
+    // requesting after that just costs us a 5–10s timeout per file.
+    const generatedMs = row.generated_at_utc ? Date.parse(row.generated_at_utc) : NaN;
+    if (Number.isFinite(generatedMs)) {
+      const ageH = (Date.now() - generatedMs) / 3600_000;
+      if (ageH > retentionCfg.replicateUrlTtlHours) return null;
+    }
     const stream = await fetchAsStream(remote);
     if (stream) return { stream, ext: extOf(new URL(remote).pathname) };
   }
@@ -3706,7 +3729,12 @@ function fetchAsStream(url: string, maxRedirects = 3): Promise<Readable | null> 
   });
 }
 
-async function runDownloadOne(res: ServerResponse, runId: string, imageId: string) {
+async function runDownloadOne(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
   let state = RUNS.get(runId) ?? null;
   if (!state) state = await tryReconstructRunFromDisk(runId);
   if (!state || !state.csvPath) {
@@ -3731,8 +3759,40 @@ async function runDownloadOne(res: ServerResponse, runId: string, imageId: strin
     "content-type": IMAGE_CT[opened.ext] ?? "application/octet-stream",
     "content-disposition": `attachment; filename="${filename}"`,
     "cache-control": "private, max-age=0",
+    "accept-ranges": "none",
   };
   if (opened.size != null) headers["content-length"] = String(opened.size);
+  // Weak ETag from (mtime, size) — strong enough to detect changes
+  // (regen overwrites both fields), cheap to compute. Pairs with
+  // Last-Modified to enable a 304 Not Modified short-circuit when
+  // the operator re-clicks the link.
+  if (opened.localMtimeMs != null && opened.size != null) {
+    const lastMod = new Date(opened.localMtimeMs).toUTCString();
+    const etag = `W/"${opened.size.toString(16)}-${Math.floor(opened.localMtimeMs).toString(16)}"`;
+    headers["last-modified"] = lastMod;
+    headers["etag"] = etag;
+    const ifNoneMatch = req.headers["if-none-match"];
+    const ifModSince = req.headers["if-modified-since"];
+    const matchesEtag = typeof ifNoneMatch === "string" && ifNoneMatch === etag;
+    const notModified =
+      typeof ifModSince === "string" &&
+      !Number.isNaN(Date.parse(ifModSince)) &&
+      opened.localMtimeMs <= Date.parse(ifModSince) + 999; // ±1s rounding
+    if (matchesEtag || notModified) {
+      // Close the stream we just opened — we won't read it.
+      try { opened.stream.destroy(); } catch { /* */ }
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+  }
+  // HEAD just needs the headers — no body.
+  if (req.method === "HEAD") {
+    try { opened.stream.destroy(); } catch { /* */ }
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
   res.writeHead(200, headers);
   opened.stream.pipe(res);
   opened.stream.on("error", () => { try { res.destroy(); } catch { /* */ } });
@@ -3749,7 +3809,7 @@ async function runDownloadOne(res: ServerResponse, runId: string, imageId: strin
  * topics readable while guaranteeing uniqueness when two clusters
  * happen to share the same topic string.
  */
-async function runDownloadZip(res: ServerResponse, runId: string) {
+async function runDownloadZip(req: IncomingMessage, res: ServerResponse, runId: string) {
   let state = RUNS.get(runId) ?? null;
   if (!state) state = await tryReconstructRunFromDisk(runId);
   if (!state || !state.csvPath) {
@@ -3764,11 +3824,20 @@ async function runDownloadZip(res: ServerResponse, runId: string) {
   }
 
   const zipName = `${safeForFs(state.client, 40)}-${state.id}.zip`;
-  res.writeHead(200, {
+  const headers: Record<string, string> = {
     "content-type": "application/zip",
     "content-disposition": `attachment; filename="${zipName}"`,
     "cache-control": "private, max-age=0",
-  });
+    "accept-ranges": "none",
+  };
+  // HEAD: confirm the run is downloadable without streaming the body.
+  if (req.method === "HEAD") {
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, headers);
+
   // Store mode (level 0) — never recompress. Images already compressed.
   let archive: ReturnType<typeof archiver>;
   try {
@@ -3808,8 +3877,23 @@ async function runDownloadZip(res: ServerResponse, runId: string) {
     "Each subfolder is one cluster (topic). Files inside are named",
     "<asset_type>__<image_id>.<ext> and are the raw generated images",
     "with no recompression.",
+    "",
+    "manifest.csv at the zip root has every row from the run — image_id,",
+    "asset_type, cluster_id, page_topic, prompt_used, etc. — so you can",
+    "cross-reference back to the original page.",
   ].join("\n");
   archive.append(readme, { name: "README.txt" });
+
+  // Include the run's CSV as manifest.csv — small (a few KB) and gives
+  // the user every detail of the run (prompts, descriptions, ids).
+  if (state.csvPath) {
+    try {
+      const stat = statSync(state.csvPath);
+      if (stat.isFile()) {
+        archive.file(state.csvPath, { name: "manifest.csv" });
+      }
+    } catch { /* CSV missing — skip silently */ }
+  }
 
   try {
     for (const [clusterId, group] of byCluster) {
@@ -3943,12 +4027,12 @@ export function startWebServer(port: number): void {
       if (method === "GET" && p === "/flows") return await flowsPage(res);
       if (method === "GET" && p === "/runs") return runListPage(res);
       const runZipMatch = /^\/runs\/([a-f0-9]+)\/download\.zip$/.exec(p);
-      if (method === "GET" && runZipMatch && runZipMatch[1]) {
-        return await runDownloadZip(res, runZipMatch[1]);
+      if ((method === "GET" || method === "HEAD") && runZipMatch && runZipMatch[1]) {
+        return await runDownloadZip(req, res, runZipMatch[1]);
       }
       const runOneMatch = /^\/runs\/([a-f0-9]+)\/download\/(.+)$/.exec(p);
-      if (method === "GET" && runOneMatch && runOneMatch[1] && runOneMatch[2]) {
-        return await runDownloadOne(res, runOneMatch[1], decodeURIComponent(runOneMatch[2]));
+      if ((method === "GET" || method === "HEAD") && runOneMatch && runOneMatch[1] && runOneMatch[2]) {
+        return await runDownloadOne(req, res, runOneMatch[1], decodeURIComponent(runOneMatch[2]));
       }
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {

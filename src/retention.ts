@@ -30,14 +30,20 @@ import path from "node:path";
 export interface RetentionConfig {
   retentionHours: number;
   maxRunsKept: number;
+  /** How long a Replicate output URL is treated as potentially live.
+   * Defaults to 1h — past this point, openImageStream skips the
+   * remote fallback to avoid burning a TCP timeout on every miss. */
+  replicateUrlTtlHours: number;
 }
 
 export function loadRetentionConfig(): RetentionConfig {
   const hours = Number.parseInt(process.env.DOWNLOAD_RETENTION_HOURS ?? "", 10);
   const max = Number.parseInt(process.env.MAX_RUNS_KEPT ?? "", 10);
+  const repl = Number.parseFloat(process.env.REPLICATE_URL_TTL_HOURS ?? "");
   return {
     retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 168, // 7 days
-    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 50,
+    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 10,
+    replicateUrlTtlHours: Number.isFinite(repl) && repl > 0 ? repl : 1,
   };
 }
 
@@ -89,6 +95,10 @@ export interface SweepResult {
   evicted: number;
   bytesFreed: number;
   reasonByRun: Record<string, "age" | "count">;
+  /** Per-run-id image dirs that had no surviving manifest (orphans). */
+  orphanRunsDeleted: number;
+  /** Legacy images (out/images/<slug>/<file>) no manifest's CSV references. */
+  legacyImagesDeleted: number;
 }
 
 async function dirSize(p: string): Promise<number> {
@@ -115,7 +125,14 @@ export async function sweepRunRetention(
   cfg: RetentionConfig = loadRetentionConfig(),
   outDir: string = path.resolve(process.cwd(), "out"),
 ): Promise<SweepResult> {
-  const result: SweepResult = { scanned: 0, evicted: 0, bytesFreed: 0, reasonByRun: {} };
+  const result: SweepResult = {
+    scanned: 0,
+    evicted: 0,
+    bytesFreed: 0,
+    reasonByRun: {},
+    orphanRunsDeleted: 0,
+    legacyImagesDeleted: 0,
+  };
 
   let names: string[];
   try {
@@ -171,7 +188,95 @@ export async function sweepRunRetention(
     if (entry.runId) result.reasonByRun[entry.runId] = reason;
   }
 
+  // ── 2. Orphan run directories ──────────────────────────────────────
+  // out/runs/<runId>/ folders whose manifest has been deleted (or
+  // was never written — e.g. the CLI crashed mid-startup) are
+  // unreferenced and can be reclaimed. Cross-check against the
+  // *remaining* manifests after step 1.
+  const remainingRunIds = new Set<string>();
+  for (const e of entries) {
+    if (e.runId && !toEvict.find((x) => x.entry.manifestPath === e.manifestPath)) {
+      remainingRunIds.add(e.runId);
+    }
+  }
+  const runsRoot = path.join(outDir, "runs");
+  try {
+    const runDirs = await fs.readdir(runsRoot, { withFileTypes: true });
+    for (const d of runDirs) {
+      if (!d.isDirectory()) continue;
+      if (remainingRunIds.has(d.name)) continue;
+      const p = path.join(runsRoot, d.name);
+      const sz = await dirSize(p);
+      await rmrfIfExists(p);
+      result.orphanRunsDeleted++;
+      result.bytesFreed += sz;
+    }
+  } catch { /* runsRoot may not exist yet */ }
+
+  // ── 3. Legacy out/images/<slug>/<file> cleanup ────────────────────
+  // Files written by older versions (and any future CLI runs that
+  // don't pass --run-id) live here. Build the set of paths currently
+  // referenced by any surviving manifest's CSV, then delete any
+  // legacy file that ISN'T referenced. This is cheap because each
+  // CSV is tiny; we never load image bytes.
+  try {
+    const refSet = await buildLegacyRefSet(outDir, entries.filter((e) =>
+      !toEvict.find((x) => x.entry.manifestPath === e.manifestPath)));
+    const legacyRoot = path.join(outDir, "images");
+    const slugDirs = await fs.readdir(legacyRoot, { withFileTypes: true });
+    for (const sd of slugDirs) {
+      if (!sd.isDirectory()) continue;
+      const slugDir = path.join(legacyRoot, sd.name);
+      const files = await fs.readdir(slugDir);
+      for (const f of files) {
+        const full = path.join(slugDir, f);
+        if (refSet.has(full)) continue;
+        let sz = 0;
+        try { sz = (await fs.stat(full)).size; } catch { /* */ }
+        await rmIfExists(full);
+        result.legacyImagesDeleted++;
+        result.bytesFreed += sz;
+      }
+      // If the slug dir is now empty, remove it.
+      try {
+        const leftover = await fs.readdir(slugDir);
+        if (leftover.length === 0) await fs.rmdir(slugDir);
+      } catch { /* */ }
+    }
+  } catch { /* legacy dir may not exist */ }
+
   return result;
+}
+
+/**
+ * Parse every surviving manifest's CSV once and return the set of
+ * `image_local_path` values currently referenced. Used to decide
+ * which legacy image files are safe to delete.
+ */
+async function buildLegacyRefSet(_outDir: string, surviving: ManifestEntry[]): Promise<Set<string>> {
+  const refs = new Set<string>();
+  for (const e of surviving) {
+    if (!e.csvPath) continue;
+    let raw: string;
+    try { raw = await fs.readFile(e.csvPath, "utf8"); } catch { continue; }
+    // We only need the `image_local_path` column — cheap text scan
+    // beats pulling in a CSV parser here.
+    const lines = raw.split("\n");
+    if (lines.length === 0) continue;
+    const header = lines[0]!.split(",").map((s) => s.trim().replace(/^"|"$/g, ""));
+    const idx = header.indexOf("image_local_path");
+    if (idx < 0) continue;
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      // Naive CSV split — image_local_path doesn't contain commas or
+      // quotes in practice (it's a filesystem path written by us).
+      const cols = line.split(",");
+      const cell = (cols[idx] ?? "").trim().replace(/^"|"$/g, "");
+      if (cell) refs.add(path.resolve(cell));
+    }
+  }
+  return refs;
 }
 
 /**
