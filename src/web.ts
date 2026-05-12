@@ -32,6 +32,17 @@ import {
 import { promises as fs } from "node:fs";
 import { parse as csvParse } from "csv-parse/sync";
 import { uploadBlogImage } from "./s3.js";
+// archiver is CommonJS. Node's ESM loader refuses `import archiver
+// from "archiver"` because the CJS module has no static `default`
+// export — so we go through `createRequire` to load it. The types
+// still come from @types/archiver.
+import { createRequire } from "node:module";
+import type ArchiverDefault from "archiver";
+const requireCjs = createRequire(import.meta.url);
+const archiver: typeof ArchiverDefault = requireCjs("archiver");
+import { request as httpsRequest } from "node:https";
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
@@ -614,6 +625,9 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .rc-img .rc-preview-img { cursor: zoom-in; }
   .btn-compare { font-size: 12px; padding: 5px 10px; }
   .btn-compare:hover { color: var(--brand); border-color: var(--brand); }
+  /* Per-card Download anchor — render like a button. */
+  .btn-download { font-size: 12px; padding: 5px 10px; text-decoration: none; }
+  .btn-download:hover { color: var(--brand); border-color: var(--brand); text-decoration: none; }
 
   /* Old-vs-new compare modal — two stacked or side-by-side panes. */
   .cmp-overlay {
@@ -2918,6 +2932,9 @@ async function runPage(res: ServerResponse, id: string) {
     <div class="rc-actions">
       <button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
       ${canCompare ? `<button class="btn-compare" type="button" data-compare title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
+      ${r.image_url_new || r.image_local_path
+        ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
+        : ""}
       <button class="btn-apply primary" type="button" data-apply ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
     </div>
   </div>
@@ -2990,6 +3007,7 @@ ${clusterSections}
     <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending · <strong id="picked-count-bar">0</strong> selected
   </div>
   <div class="right">
+    <a class="btn" id="download-all-btn" href="/runs/${esc(id)}/download.zip" title="Stream a ZIP of every generated image, organised by cluster topic. Images are not re-encoded." download>⬇ Download all (ZIP)</a>
     <button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
     <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Apply selected →</button>
   </div>
@@ -3562,6 +3580,219 @@ function runEvents(res: ServerResponse, id: string) {
   res.on("close", () => state.listeners.delete(res));
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Download endpoints — per-image + bulk ZIP, both fully streaming
+// ────────────────────────────────────────────────────────────────────────
+
+const SAFE_FILE_RE = /[^A-Za-z0-9._-]+/g;
+function safeForFs(s: string, max = 80): string {
+  const cleaned = (s || "").replace(SAFE_FILE_RE, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned.slice(0, max) || "untitled";
+}
+function extOf(p: string): string {
+  const m = /\.([a-zA-Z0-9]{2,5})$/.exec(p);
+  return m && m[1] ? m[1].toLowerCase() : "png";
+}
+const IMAGE_CT: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  webp: "image/webp", gif: "image/gif", avif: "image/avif",
+};
+
+/**
+ * Resolve a CSV row to a Node Readable stream of the image bytes.
+ *
+ * Priority:
+ *   1. image_local_path on disk — the regen pipeline saved a copy
+ *      here at run time, so it's always available even after the
+ *      Replicate signed URL expires.
+ *   2. image_url_new (Replicate signed URL) — only useful while the
+ *      run is fresh, but the safety net for older runs whose local
+ *      files were pruned.
+ *
+ * Both paths stream; the response is never buffered into memory.
+ * Returns null when neither source works.
+ */
+async function openImageStream(
+  row: { image_local_path?: string; image_url_new?: string },
+): Promise<{ stream: Readable; size?: number; ext: string } | null> {
+  const local = row.image_local_path?.trim();
+  if (local) {
+    try {
+      const abs = path.resolve(local);
+      const root = path.resolve(process.cwd());
+      if (abs.startsWith(root)) {
+        const st = statSync(abs);
+        if (st.isFile()) {
+          return { stream: createReadStream(abs), size: st.size, ext: extOf(abs) };
+        }
+      }
+    } catch { /* fall through to remote */ }
+  }
+  const remote = row.image_url_new?.trim();
+  if (remote && /^https?:\/\//.test(remote)) {
+    const stream = await fetchAsStream(remote);
+    if (stream) return { stream, ext: extOf(new URL(remote).pathname) };
+  }
+  return null;
+}
+
+/**
+ * Stream a remote URL as a Readable without buffering. Uses the
+ * native http/https client (no axios) so the response body flows
+ * straight through with no intermediate ArrayBuffer.
+ */
+function fetchAsStream(url: string, maxRedirects = 3): Promise<Readable | null> {
+  return new Promise((resolve) => {
+    let u: URL;
+    try { u = new URL(url); } catch { return resolve(null); }
+    const lib = u.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = lib(u, { method: "GET" }, (resp) => {
+      const code = resp.statusCode ?? 0;
+      if (code >= 300 && code < 400 && resp.headers.location && maxRedirects > 0) {
+        const next = new URL(resp.headers.location, u).toString();
+        resp.resume();
+        fetchAsStream(next, maxRedirects - 1).then(resolve);
+        return;
+      }
+      if (code < 200 || code >= 300) {
+        resp.resume();
+        resolve(null);
+        return;
+      }
+      resolve(resp);
+    });
+    req.on("error", () => resolve(null));
+    req.end();
+  });
+}
+
+async function runDownloadOne(res: ServerResponse, runId: string, imageId: string) {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) {
+    send(res, 404, "text/plain", "run or csv not found");
+    return;
+  }
+  const rows = await readRunCsv(state.csvPath);
+  const row = rows.find((r) => r.image_id === imageId);
+  if (!row) {
+    send(res, 404, "text/plain", `image ${imageId} not in run`);
+    return;
+  }
+  const opened = await openImageStream(row);
+  if (!opened) {
+    send(res, 410, "text/plain", "image bytes no longer available (local file pruned and Replicate URL expired)");
+    return;
+  }
+  const topic = safeForFs(row.page_topic || row.cluster_id || "image", 60);
+  const safeId = safeForFs(row.image_id, 60);
+  const filename = `${topic}__${row.asset_type}__${safeId}.${opened.ext}`;
+  const headers: Record<string, string> = {
+    "content-type": IMAGE_CT[opened.ext] ?? "application/octet-stream",
+    "content-disposition": `attachment; filename="${filename}"`,
+    "cache-control": "private, max-age=0",
+  };
+  if (opened.size != null) headers["content-length"] = String(opened.size);
+  res.writeHead(200, headers);
+  opened.stream.pipe(res);
+  opened.stream.on("error", () => { try { res.destroy(); } catch { /* */ } });
+}
+
+/**
+ * Stream every completed image in a run as a single ZIP, organised
+ * into per-cluster folders by topic. Uses archiver in "store" mode
+ * (no compression) — images are already compressed, so deflate would
+ * just burn CPU. Peak memory is tiny: archiver pipes entries straight
+ * to the response, and each entry is itself a file/network stream.
+ *
+ * Cluster folder naming: `<safe-topic>__<short-cluster-id>` keeps
+ * topics readable while guaranteeing uniqueness when two clusters
+ * happen to share the same topic string.
+ */
+async function runDownloadZip(res: ServerResponse, runId: string) {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) {
+    send(res, 404, "text/plain", "run or csv not found");
+    return;
+  }
+  const rows = await readRunCsv(state.csvPath);
+  const usable = rows.filter((r) => r.image_url_new || r.image_local_path);
+  if (usable.length === 0) {
+    send(res, 404, "text/plain", "no completed images in this run");
+    return;
+  }
+
+  const zipName = `${safeForFs(state.client, 40)}-${state.id}.zip`;
+  res.writeHead(200, {
+    "content-type": "application/zip",
+    "content-disposition": `attachment; filename="${zipName}"`,
+    "cache-control": "private, max-age=0",
+  });
+  // Store mode (level 0) — never recompress. Images already compressed.
+  let archive: ReturnType<typeof archiver>;
+  try {
+    archive = archiver("zip", { zlib: { level: 0 }, store: true });
+  } catch (err) {
+    process.stderr.write(`zip: archiver init failed: ${(err as Error).message}\n`);
+    try { res.destroy(); } catch { /* */ }
+    return;
+  }
+  archive.on("warning", (err) => {
+    process.stderr.write(`zip: warning ${err.message}\n`);
+  });
+  archive.on("error", (err) => {
+    process.stderr.write(`zip: error ${err.message}\n`);
+    try { res.destroy(); } catch { /* */ }
+  });
+  archive.pipe(res);
+  res.on("close", () => { try { archive.abort(); } catch { /* */ } });
+
+  // Group by cluster — same as the workspace publish view — so folders
+  // are stable + we can write the manifest with the topic at the top.
+  const byCluster = new Map<string, { topic: string; rows: CsvRowParsed[] }>();
+  for (const r of usable) {
+    const g = byCluster.get(r.cluster_id) ?? { topic: r.page_topic, rows: [] };
+    g.rows.push(r);
+    byCluster.set(r.cluster_id, g);
+  }
+
+  // Top-level README so the zip is self-describing.
+  const readme = [
+    `Run ${state.id}`,
+    `Client: ${state.client}`,
+    `Generated at: ${state.startedAt}`,
+    `Total images: ${usable.length}`,
+    `Clusters: ${byCluster.size}`,
+    "",
+    "Each subfolder is one cluster (topic). Files inside are named",
+    "<asset_type>__<image_id>.<ext> and are the raw generated images",
+    "with no recompression.",
+  ].join("\n");
+  archive.append(readme, { name: "README.txt" });
+
+  try {
+    for (const [clusterId, group] of byCluster) {
+      const folder = `${safeForFs(group.topic || clusterId, 80)}__${clusterId.slice(0, 8)}`;
+      for (const r of group.rows) {
+        const opened = await openImageStream(r);
+        if (!opened) {
+          process.stderr.write(`zip: skip ${r.image_id} (no usable source)\n`);
+          continue;
+        }
+        const safeId = safeForFs(r.image_id, 60);
+        const entryName = `${folder}/${r.asset_type}__${safeId}.${opened.ext}`;
+        archive.append(opened.stream, { name: entryName });
+      }
+    }
+    await archive.finalize();
+  } catch (err) {
+    process.stderr.write(`zip: build failed: ${(err as Error).message}\n${(err as Error).stack ?? ""}\n`);
+    try { archive.abort(); } catch { /* */ }
+    try { res.destroy(); } catch { /* */ }
+  }
+}
+
 function serveFile(res: ServerResponse, fsPath: string) {
   const abs = path.resolve(fsPath);
   const root = path.resolve(process.cwd());
@@ -3671,6 +3902,14 @@ export function startWebServer(port: number): void {
       }
       if (method === "GET" && p === "/flows") return await flowsPage(res);
       if (method === "GET" && p === "/runs") return runListPage(res);
+      const runZipMatch = /^\/runs\/([a-f0-9]+)\/download\.zip$/.exec(p);
+      if (method === "GET" && runZipMatch && runZipMatch[1]) {
+        return await runDownloadZip(res, runZipMatch[1]);
+      }
+      const runOneMatch = /^\/runs\/([a-f0-9]+)\/download\/(.+)$/.exec(p);
+      if (method === "GET" && runOneMatch && runOneMatch[1] && runOneMatch[2]) {
+        return await runDownloadOne(res, runOneMatch[1], decodeURIComponent(runOneMatch[2]));
+      }
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {
         const [, id, suffix] = runMatch;
@@ -3695,7 +3934,16 @@ export function startWebServer(port: number): void {
 
       send(res, 404, "text/plain", "not found");
     } catch (err) {
-      send(res, 500, "text/plain", `error: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      process.stderr.write(`server: handler error: ${msg}\n${(err as Error).stack ?? ""}\n`);
+      // If we already started streaming a response, we can't write a
+      // 500 status — just destroy the socket and let the client see
+      // the truncation. (The detailed error is in the stderr above.)
+      if (res.headersSent) {
+        try { res.destroy(); } catch { /* */ }
+      } else {
+        send(res, 500, "text/plain", `error: ${msg}`);
+      }
     }
   });
 
