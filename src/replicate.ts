@@ -256,6 +256,16 @@ export async function pollPredictionOnce(
   }
 }
 
+/**
+ * How many times to re-create the prediction when Replicate returns
+ * status=succeeded with an empty output. This is a transient failure
+ * mode we've seen with nano-banana — the model is up, the call
+ * succeeded, but no URL came back. A second attempt almost always
+ * produces a real image. Capped low so we fail fast on real refusals
+ * (which return failed/cancelled, not succeeded-empty).
+ */
+const EMPTY_OUTPUT_RETRIES = 2;
+
 export async function generateImage(params: GenerateImageParams): Promise<ReplicateResult> {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) {
@@ -266,7 +276,7 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
 
   // Resume path — if the caller passed a prediction id from a prior
   // attempt, see if Replicate has finished it since we last polled.
-  // Hits cost is one GET; happy path returns the image with zero new
+  // Cost is one GET; happy path returns the image with zero new
   // model-spend.
   if (params.resumePredictionId) {
     const recovered = await pollPredictionOnce(params.resumePredictionId);
@@ -278,6 +288,37 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
     }
   }
 
+  // Outer loop retries specifically the "succeeded with empty output"
+  // failure mode by creating a fresh prediction. Real Replicate
+  // errors (failed status, 4xx/5xx, timeouts) propagate immediately.
+  let lastEmptyError: ReplicateGenerationError | null = null;
+  for (let emptyAttempt = 0; emptyAttempt <= EMPTY_OUTPUT_RETRIES; emptyAttempt++) {
+    try {
+      return await runSinglePrediction(token, params);
+    } catch (err) {
+      const isEmpty =
+        err instanceof ReplicateGenerationError &&
+        /output was empty/.test(err.message);
+      if (!isEmpty) throw err;
+      lastEmptyError = err;
+      process.stderr.write(
+        `replicate: empty output on attempt ${emptyAttempt + 1}/${EMPTY_OUTPUT_RETRIES + 1} (prediction_id=${err.prediction_id ?? "?"}) — retrying\n`,
+      );
+    }
+  }
+  throw lastEmptyError ?? new ReplicateGenerationError("Replicate succeeded but output was empty (after retries)");
+}
+
+/**
+ * One pass of the actual create-prediction + poll loop. Pulled out so
+ * the outer generateImage can wrap it in an empty-output retry. All
+ * error semantics are preserved — callers see the same
+ * ReplicateGenerationError shape as before.
+ */
+async function runSinglePrediction(
+  token: string,
+  params: GenerateImageParams,
+): Promise<ReplicateResult> {
   const model = params.model ?? DEFAULT_IMAGE_MODEL;
   const input = buildModelInput(model, params);
   const endpoint = `https://api.replicate.com/v1/models/${model}/predictions`;
@@ -390,9 +431,23 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
     // status === 'starting' | 'processing' → keep polling
   }
 
-  // Timed out on our side. The prediction id is still valid on
-  // Replicate's side — surface it through the error so processOne
-  // can write it to the CSV. A subsequent regenerate will resume.
+  // Timed out on our side. Before declaring failure, give the
+  // prediction one last grace window — predictions frequently
+  // complete a few seconds after our budget expires, and a single
+  // GET here saves the operator a manual regenerate-recover round.
+  if (predictionId) {
+    await sleep(3_000);
+    const late = await pollPredictionOnce(predictionId);
+    if (late) {
+      process.stderr.write(
+        `replicate: late-recovered prediction ${predictionId} after timeout grace window\n`,
+      );
+      return late;
+    }
+  }
+  // Still not done — the prediction id is recorded on the error so
+  // processOne can write it to the CSV. A subsequent regenerate will
+  // poll-and-resume.
   throw new ReplicateGenerationError(
     `Replicate prediction timed out after ${maxWaitMs / 1000}s (prediction_id=${predictionId}; a later regenerate will try to recover it)`,
     predictionId,

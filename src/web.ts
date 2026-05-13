@@ -559,6 +559,17 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .rc-img { background: #f1f5f9; aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
   .result-card .rc-img img { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
   .result-card .rc-img .ph { color: var(--ink-faint); font-size: 12px; }
+  /* Unmistakable failure placeholder — replaces the bare status
+     string when an image didn't generate. Operators were missing the
+     subtle red err-line below the card; this one is impossible to
+     miss inside the preview frame itself. */
+  .result-card .rc-img .ph-failed {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; color: var(--err); background: var(--err-bg);
+    width: 100%; height: 100%; padding: 16px; text-align: center;
+  }
+  .ph-failed-icon { font-size: 28px; line-height: 1; }
+  .ph-failed-hint { font-size: 11px; color: var(--err); opacity: .8; margin-top: 2px; }
   .result-card .rc-body { padding: 10px 12px 12px; }
   .result-card .rc-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
   .result-card .rc-id code { font-size: 10.5px; word-break: break-all; }
@@ -1299,6 +1310,16 @@ async function openPtModal(slug, projectId, name) {
   document.getElementById('pt-modal').classList.add('open');
   document.getElementById('pt-overlay').classList.add('open');
 
+  // Eager graphic_token extraction. Fires the moment the modal
+  // opens so by the time the operator picks page types and clicks
+  // Continue (~5–10s), the ~60s Firecrawl+Claude pass is well in
+  // flight. Server coalesces (one extraction per slug at a time)
+  // and no-ops when a token's already on disk, so this is safe to
+  // fire unconditionally — featured clients pay nothing, ad-hoc
+  // projects get a head start.
+  fetch('/workspace/' + encodeURIComponent(slug) + '/token/extract', { method: 'POST' })
+    .catch(() => { /* fire-and-forget; workspace polls status separately */ });
+
   let counts = { blog: 0, service: 0, category: 0 };
   try {
     const r = await fetch('/api/page-type-counts?project_id=' + encodeURIComponent(projectId));
@@ -1746,14 +1767,69 @@ ${awsBanner}
     </form>
 
     ${!savedToken || Object.keys(savedToken as Record<string, unknown>).length === 0
-      ? `<div id="token-missing-banner" class="banner warn" style="margin-top:16px">
-           <strong>No <code>graphic_token</code> saved for this project yet.</strong>
-           <div class="sub" style="margin-top:4px">The regen pipeline needs colors + brand info from the live site. Extract once and it's cached on disk; takes ~30s.</div>
+      ? `<div id="token-missing-banner" class="banner info" style="margin-top:16px">
+           <div style="display:flex;align-items:center;gap:10px">
+             <span class="spinner" aria-hidden="true"></span>
+             <strong id="extract-state-label">Extracting <code>graphic_token</code> from the live site…</strong>
+           </div>
+           <div class="sub" style="margin-top:4px" id="extract-state-detail">
+             ${project.url
+               ? "We start this the moment you pick a project — it usually finishes within 30–60s. The page will auto-refresh as soon as it's ready."
+               : "This project has no <code>url</code> set in the projects table — extraction can't run. Add one in the DB and reload."}
+           </div>
            <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-             <button class="primary" onclick="extractToken(event)" id="extract-token-btn"${project.url ? "" : ' disabled title="No project.url to scrape"'}>⚡ Extract graphic_token now</button>
+             <button class="primary" onclick="extractToken(event)" id="extract-token-btn"${project.url ? "" : ' disabled title="No project.url to scrape"'}>⚡ Extract now</button>
              <span class="sub" id="extract-status"></span>
            </div>
-         </div>`
+         </div>
+         <script>
+         // Auto-poll: every 4s, ask the server whether the token has
+         // landed yet. As soon as it has, reload the page so the
+         // freshly-saved file gets picked up by loadToken on the
+         // server-side render. If the status endpoint reports a
+         // recent failure, surface it.
+         (function () {
+           const slug = ${JSON.stringify(slug)};
+           if (!${JSON.stringify(project.url ?? "")}) return; // can't extract
+           // Kick off an extraction in case nobody else has (e.g.
+           // operator landed via deep-link without going through the
+           // home-page modal). The server coalesces, so this is a
+           // no-op when one is already in flight.
+           fetch('/workspace/' + encodeURIComponent(slug) + '/token/extract', { method: 'POST' })
+             .catch(() => { /* polled separately below */ });
+           let attempts = 0;
+           const timer = setInterval(async () => {
+             attempts++;
+             try {
+               const r = await fetch('/workspace/' + encodeURIComponent(slug) + '/token/status', { cache: 'no-store' });
+               if (!r.ok) return;
+               const j = await r.json();
+               if (j.has_token) {
+                 clearInterval(timer);
+                 const lbl = document.getElementById('extract-state-label');
+                 if (lbl) lbl.textContent = 'Token ready — refreshing…';
+                 setTimeout(() => window.location.reload(), 300);
+                 return;
+               }
+               if (j.last_error && !j.extracting) {
+                 const lbl = document.getElementById('extract-state-label');
+                 const det = document.getElementById('extract-state-detail');
+                 if (lbl) lbl.textContent = 'Extraction failed';
+                 if (det) det.textContent = j.last_error;
+                 const banner = document.getElementById('token-missing-banner');
+                 if (banner) { banner.classList.remove('info'); banner.classList.add('err'); }
+                 const spin = banner ? banner.querySelector('.spinner') : null;
+                 if (spin) spin.remove();
+                 clearInterval(timer);
+                 return;
+               }
+               // Give up automatic polling after ~5 min of no result;
+               // operator can still click "Extract now".
+               if (attempts > 75) clearInterval(timer);
+             } catch (_) { /* network blip; try again next tick */ }
+           }, 4000);
+         })();
+         </script>`
       : ""}
 
     <details style="margin-top:14px">
@@ -2454,30 +2530,112 @@ async function saveTokenHandler(req: IncomingMessage, res: ServerResponse, slug:
 }
 
 /**
- * POST /workspace/:slug/token/extract — Firecrawl + Claude to derive
- * the graphic_token from the project's live site, then persist to
- * graphic-tokens/<slug>.json. Used by non-allowlist projects (picked
- * via DB search) that don't have a pre-shipped token. Synchronous —
- * takes 30–60s. The UI shows a spinner and reloads on success.
+ * In-memory tracker for in-flight token extractions. Lets the home
+ * page kick off an extract optimistically when the operator opens
+ * the page-type modal, and the workspace page poll for completion
+ * without re-running the (expensive) Firecrawl+Portkey pipeline.
+ *
+ * Keyed by slug. Value is the running Promise so callers can await.
+ * The entry is removed in `finally` regardless of success/failure.
+ */
+const EXTRACTING_TOKENS = new Map<string, Promise<{ tokenPath: string }>>();
+const EXTRACT_ERRORS = new Map<string, { message: string; at: number }>(); // last failure per slug, ~5min retention
+const EXTRACT_ERROR_TTL_MS = 5 * 60 * 1000;
+
+function recordExtractError(slug: string, message: string): void {
+  EXTRACT_ERRORS.set(slug, { message, at: Date.now() });
+}
+function consumeRecentExtractError(slug: string): string | null {
+  const e = EXTRACT_ERRORS.get(slug);
+  if (!e) return null;
+  if (Date.now() - e.at > EXTRACT_ERROR_TTL_MS) { EXTRACT_ERRORS.delete(slug); return null; }
+  return e.message;
+}
+
+/**
+ * Start (or join) an extraction for a slug. Multiple callers in the
+ * same window get the same Promise — only one Firecrawl + Portkey
+ * pass runs at a time. Cheap GET status doesn't need this; only the
+ * actual work-doing path coalesces.
+ */
+async function ensureExtractionInFlight(slug: string): Promise<{ tokenPath: string }> {
+  const existing = EXTRACTING_TOKENS.get(slug);
+  if (existing) return existing;
+  // No-op if the token's already saved (featured clients ship one,
+  // or a prior extraction already wrote one). Lets the home page
+  // fire extract optimistically without burning Firecrawl/Portkey
+  // calls on clients that don't need it.
+  if ((await loadToken(slug)) != null) {
+    return { tokenPath: "(already saved — no re-extraction)" };
+  }
+  const entry = resolveClient(slug);
+  if (!entry) throw new Error("unknown client");
+  const project = await lookupProjectById(entry.projectId);
+  if (!project) throw new Error("project not found in DB");
+  if (!project.url) throw new Error("project has no url to scrape");
+
+  const { runExtractTokenCli } = await import("./extractToken.js");
+  const p = (async () => {
+    try {
+      const r = await runExtractTokenCli({
+        slug,
+        url: project.url ?? "",
+        projectId: project.id,
+      });
+      EXTRACT_ERRORS.delete(slug);
+      return r;
+    } catch (err) {
+      const msg = (err as Error).message;
+      recordExtractError(slug, msg);
+      throw err;
+    }
+  })();
+  EXTRACTING_TOKENS.set(slug, p);
+  p.finally(() => EXTRACTING_TOKENS.delete(slug));
+  return p;
+}
+
+/**
+ * POST /workspace/:slug/token/extract
+ *
+ * Two callers:
+ *   • The home page kicks this off (fire-and-forget) the moment the
+ *     page-type modal opens, so by the time the operator reaches the
+ *     workspace it's usually done.
+ *   • The workspace page calls it directly if no in-flight extraction
+ *     exists yet (operator landed via deep-link, etc.).
+ *
+ * Concurrent calls for the same slug coalesce — only ONE Firecrawl +
+ * Portkey pass runs at a time. The handler completes either when the
+ * extraction is finished or when it errors.
  */
 async function extractTokenHandler(res: ServerResponse, slug: string) {
+  try {
+    const r = await ensureExtractionInFlight(slug);
+    sendJson(res, 200, { ok: true, token_path: r.tokenPath });
+  } catch (err) {
+    const msg = (err as Error).message;
+    process.stderr.write(`extractToken: failed for slug=${slug}: ${msg}\n`);
+    sendJson(res, 500, { error: msg });
+  }
+}
+
+/**
+ * GET /workspace/:slug/token/status — non-blocking probe. Tells the
+ * UI whether the token is on disk, whether an extraction is in
+ * flight, and (if a recent one failed) why.
+ */
+async function tokenStatusHandler(res: ServerResponse, slug: string) {
   const entry = resolveClient(slug);
   if (!entry) return sendJson(res, 400, { error: "unknown client" });
-  try {
-    const project = await lookupProjectById(entry.projectId);
-    if (!project) return sendJson(res, 404, { error: "project not found in DB" });
-    if (!project.url) return sendJson(res, 400, { error: "project has no url to scrape" });
-    const { runExtractTokenCli } = await import("./extractToken.js");
-    const { tokenPath } = await runExtractTokenCli({
-      slug,
-      url: project.url,
-      projectId: project.id,
-    });
-    sendJson(res, 200, { ok: true, token_path: tokenPath });
-  } catch (err) {
-    process.stderr.write(`extractToken: failed for slug=${slug}: ${(err as Error).message}\n`);
-    sendJson(res, 500, { error: (err as Error).message });
-  }
+  const has = (await loadToken(slug)) != null;
+  const inFlight = EXTRACTING_TOKENS.has(slug);
+  const recentError = consumeRecentExtractError(slug);
+  sendJson(res, 200, {
+    has_token: has,
+    extracting: inFlight,
+    last_error: !has && recentError ? recentError : null,
+  });
 }
 
 async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
@@ -3036,15 +3194,28 @@ async function runPage(res: ServerResponse, id: string) {
         const cards = g.rows
           .map((r) => {
             const oldUrl = oldUrlOf(r.image_id);
+            const isFailed = r.status === "failed" || (!r.image_url_new && r.status !== "completed");
             // Image preview is rendered without an inline onclick; a
             // delegated click handler on the page binds zoom to every
             // image on load (more reliable across browsers + matches
-            // future cards added dynamically).
+            // future cards added dynamically). For failed/no-image
+            // rows we render an unmistakable failure placeholder
+            // instead of a bare status string.
             const previewHtml = r.image_url_new
               ? `<img class="rc-preview-img" src="${esc(r.image_url_new)}" alt="" loading="lazy">`
-              : `<div class="ph">${esc(r.status)}</div>`;
-            const errCell = r.error
-              ? `<div class="err-line">${esc(r.error.slice(0, 240))}</div>`
+              : isFailed
+                ? `<div class="ph ph-failed"><span class="ph-failed-icon">⚠</span><span>Generation failed</span><span class="ph-failed-hint">Hit ↻ Regenerate to retry</span></div>`
+                : `<div class="ph">${esc(r.status)}</div>`;
+            // Always show SOMETHING in red when a row is failed, even
+            // if the upstream error string is empty — operators were
+            // seeing blank cards with no explanation when the CSV
+            // happened to land without an error column populated.
+            const errText = (r.error || "").trim()
+              || (isFailed
+                ? "No specific error captured — likely a Replicate empty output or model refusal. Hit ↻ Regenerate to retry (it will try to recover any prediction that completed late)."
+                : "");
+            const errCell = errText
+              ? `<div class="err-line"><strong>Error:</strong> ${esc(errText.slice(0, 400))}</div>`
               : "";
             const synthetic = r.image_id.includes("/");
             // Compare button gate: BOTH a new image AND a known old
@@ -3054,17 +3225,17 @@ async function runPage(res: ServerResponse, id: string) {
             // on any run created after that change shipped.
             const canCompare = !!r.image_url_new && !!oldUrl;
             return `
-<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="pending"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
+<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk actions (Apply / Regenerate)"}">
-    <input type="checkbox" class="rc-pick-cb" ${synthetic ? "disabled" : "checked"} onchange="onCardPick(this)">
+    <input type="checkbox" class="rc-pick-cb" ${synthetic || isFailed ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
   <div class="rc-img">${previewHtml}
-    <button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>
+    ${isFailed ? "" : `<button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>`}
   </div>
   <div class="rc-body">
     <div class="rc-row">
       <span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span>
-      <span class="state-pill"></span>
+      ${isFailed ? `<span class="state-pill state-failed">failed</span>` : `<span class="state-pill"></span>`}
     </div>
     <div class="rc-id"><code>${esc(r.image_id)}</code></div>
     <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
@@ -4159,6 +4330,10 @@ export function startWebServer(port: number): void {
       const wsTokenExtractMatch = /^\/workspace\/([^/]+)\/token\/extract$/.exec(p);
       if (method === "POST" && wsTokenExtractMatch && wsTokenExtractMatch[1]) {
         return await extractTokenHandler(res, decodeURIComponent(wsTokenExtractMatch[1]));
+      }
+      const wsTokenStatusMatch = /^\/workspace\/([^/]+)\/token\/status$/.exec(p);
+      if (method === "GET" && wsTokenStatusMatch && wsTokenStatusMatch[1]) {
+        return await tokenStatusHandler(res, decodeURIComponent(wsTokenStatusMatch[1]));
       }
       const wsMatch = /^\/workspace\/([^/]+)\/?$/.exec(p);
       if (method === "GET" && wsMatch && wsMatch[1]) {
