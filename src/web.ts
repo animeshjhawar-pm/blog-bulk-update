@@ -4486,8 +4486,15 @@ export function startWebServer(port: number): void {
     }
   });
 
-  server.listen(port, () => {
-    process.stdout.write(`web: listening on http://localhost:${port}\n`);
+  // Bind to 0.0.0.0 explicitly. Default Node `listen(port)` picks
+  // ::  (all IPv6) on dual-stack systems — Railway / Fly / Render
+  // health checks all hit IPv4, and a container with constrained
+  // IPv6 will appear unreachable, get SIGTERM'd, and the deploy
+  // marked failed at CREATE_CONTAINER. 0.0.0.0 is the portable
+  // choice for any PaaS.
+  const host = process.env.HOST ?? "0.0.0.0";
+  server.listen(port, host, () => {
+    process.stdout.write(`web: listening on http://${host}:${port}\n`);
     // Surface the token-store layout so operators can confirm at boot
     // whether extracts will survive redeploys (operator dir ≠ bundled
     // dir + the operator dir is on a persistent volume).
