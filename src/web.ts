@@ -2503,12 +2503,109 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   if (child.exitCode !== 0 || !child.csvPath) {
     return sendJson(res, 500, { error: `regen subprocess failed (exit ${child.exitCode})`, run_id: child.id });
   }
-  const rows = await readRunCsv(child.csvPath);
-  const row = rows.find((r) => r.image_id === imageId);
-  if (!row || !row.image_url_new) {
+  const childRows = await readRunCsv(child.csvPath);
+  const childRow = childRows.find((r) => r.image_id === imageId);
+  if (!childRow || !childRow.image_url_new) {
     return sendJson(res, 500, { error: `no new image URL produced for ${imageId}`, run_id: child.id });
   }
-  sendJson(res, 200, { image_url_new: row.image_url_new, image_id: imageId, cluster_id: clusterId, run_id: child.id });
+
+  // CRITICAL: write the regenerated columns back into the PARENT
+  // CSV row in place. Without this:
+  //   Download   → still serves the pre-regen image (old bytes from
+  //                parent's image_local_path).
+  //   Apply to S3→ uploads the pre-regen image_url_new.
+  //   ZIP        → archives the pre-regen image.
+  //   Compare    → the "new" pane shows the pre-regen image
+  //                (the card's <img src> is updated client-side, but
+  //                the cmp modal also uses src so this part already
+  //                worked — the others didn't).
+  //
+  // The parent CSV is the single source of truth for every read on
+  // the runs page; mutating the matching row keeps Download/Apply/
+  // ZIP semantically aligned with what the operator just saw.
+  if (parent.csvPath) {
+    try {
+      await updateParentCsvRow(parent.csvPath, imageId, {
+        image_url_new: childRow.image_url_new,
+        image_local_path: childRow.image_local_path,
+        prompt_used: childRow.prompt_used,
+        prediction_id: childRow.prediction_id ?? "",
+        generated_at_utc: childRow.generated_at_utc,
+        status: "completed",
+        error: "",
+      });
+    } catch (err) {
+      process.stderr.write(
+        `regenOne: parent CSV update failed for ${imageId} in ${parent.csvPath}: ${(err as Error).message}\n`,
+      );
+      // Continue — the UI still gets the new URL, but Download/Apply
+      // on a refresh will still show the old one. Logged so we can
+      // diagnose any persistence issue separately.
+    }
+  }
+
+  sendJson(res, 200, { image_url_new: childRow.image_url_new, image_id: imageId, cluster_id: clusterId, run_id: child.id });
+}
+
+/**
+ * Atomically rewrite a single row in a CSV in place. Used by the
+ * single-image Regenerate flow to update the parent run's CSV with
+ * the regenerated image's new URL / local path / prompt / prediction
+ * id, so the rest of the runs page (Download, Apply, ZIP, Compare)
+ * stays in sync.
+ *
+ * Implementation: read the whole CSV with csv-parse, mutate the
+ * target row in memory, re-serialise with csv-stringify, write
+ * atomically via tmp + rename. The CSV is bounded (50 runs × tens
+ * of rows) so the full read/write is cheap. The atomic rename
+ * means a crash mid-write leaves the original CSV intact.
+ */
+async function updateParentCsvRow(
+  csvPath: string,
+  imageId: string,
+  patch: Partial<Record<string, string>>,
+): Promise<void> {
+  const { CSV_HEADER } = await import("./csv.js");
+  const { stringify } = await import("csv-stringify/sync");
+
+  const raw = await fs.readFile(csvPath, "utf8");
+  const rows = csvParse(raw, { columns: true, skip_empty_lines: true }) as Array<
+    Record<string, string>
+  >;
+
+  let touched = false;
+  for (const r of rows) {
+    if (r.image_id === imageId) {
+      Object.assign(r, patch);
+      touched = true;
+      break;
+    }
+  }
+  if (!touched) {
+    process.stderr.write(
+      `updateParentCsvRow: image_id=${imageId} not found in ${csvPath}\n`,
+    );
+    return;
+  }
+
+  // Normalise every row so every column from CSV_HEADER is present
+  // as a string. csv-stringify writes header order from `columns`
+  // and an explicit value list keeps shape stable even when the
+  // source file pre-dates a column we added later (e.g. predicted_id).
+  const normalised = rows.map((r) => {
+    const out: Record<string, string> = {};
+    for (const h of CSV_HEADER) out[h] = r[h] ?? "";
+    return out;
+  });
+  const body = stringify(normalised, { header: true, columns: [...CSV_HEADER] });
+
+  // Atomic write: tmp file in same dir, then rename. Rename is
+  // atomic on POSIX, so concurrent reads of the parent CSV either
+  // see the old version in full or the new version in full — never
+  // a torn half-write.
+  const tmp = csvPath + ".tmp-" + Date.now();
+  await fs.writeFile(tmp, body, "utf8");
+  await fs.rename(tmp, csvPath);
 }
 
 function extractPageTypeFromArgs(args: string[]): PageType | undefined {

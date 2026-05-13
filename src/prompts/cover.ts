@@ -126,6 +126,8 @@ Case B — blog_title has NO colon:
     → "A Comprehensive Overview"   — fluff
     → "Best AI Tools 2026"          — paraphrases the title
     → "Marketing Automation Insights" — too generic, doesn't reference business
+    → "Halyard Display"             — this is a font name, NEVER a subtitle
+    → "Inter Bold"                  — this is a font name, NEVER a subtitle
 
 VERBATIM RULE:
 - title (in both cases) and Case A subtitle are character-for-character identical 
@@ -133,6 +135,8 @@ VERBATIM RULE:
 - Case B subtitle is the only text in the output that is generated rather than 
   copied. It must follow the constraints above.
 - Title and subtitle MUST NOT be identical or near-identical.
+- Subtitle MUST NEVER be a font name, font family, hex code, CSS property, or 
+  any technical token from the style_guide.
 
 CATEGORY PILL DERIVATION:
 The pill always appears. Derive its label from business_context as follows:
@@ -230,23 +234,30 @@ All layout rules apply identically across both aspect ratios.
 
 <boundary_fade_rule>
 The boundary between the two columns features a vertical pure black (#000000) 
-shadow band concentrated at the 50% column separator, fading asymmetrically:
+shadow band concentrated ON the 50% column separator. The shadow is heavily 
+asymmetric — almost all of its visible extent is on the RIGHT side of the seam, 
+fading into the image content. The LEFT side of the seam stays clean.
 
 - A narrow band of pure black (#000000) sits directly ON the 50% split line — 
   the darkest part of the shadow is solid black at the seam and occupies 
-  roughly 1 to 2 percent of canvas width centred exactly on the seam.
+  roughly 1 percent of canvas width centred exactly on the seam.
 - From that pure-black line, the shadow fades RIGHTWARD into the image content 
   over approximately 6 to 9 percent of canvas width, gradually returning to 
-  full image opacity.
-- From the same pure-black line, the shadow fades LEFTWARD into the left 
-  background colour over approximately 2 to 3 percent of canvas width — a much 
-  tighter fade on the left side.
+  full image opacity. This rightward fade is the visible "shadow into the 
+  image" effect and is the only significant darkening anywhere on the canvas.
+- From the same pure-black line, the shadow fades LEFTWARD by 1 percent of 
+  canvas width or less — almost imperceptible. The left background colour 
+  stays clean and uniform right up to the seam. There is NO darkening band, 
+  NO grey transition zone, NO muddy fade encroaching into the left column. 
+  The left background reaches the seam at full saturation and brightness.
 
 The colour at the seam is unmistakably pure black (#000000), not dark grey, 
 not a darkened version of the left background, not a darkened version of the 
 right image. The seam reads as a deliberate black editorial shadow line, 
-weighted toward the right column, not a hairline divider and not a soft 
-uniform vignette.
+weighted entirely toward the right column, not a hairline divider and not a 
+soft uniform vignette. If the model would otherwise render a symmetric or 
+near-symmetric fade, bias the entire shadow rightward — left background must 
+remain visually clean.
 </boundary_fade_rule>
 
 <vertical_rhythm>
@@ -282,6 +293,12 @@ industrial brand, quirky display on financial advisory, etc.), fall back to
 sans-serif" descriptors rather than forcing a clashing font.
 
 The title-to-subtitle weight contrast MUST be visually unmistakable.
+
+CRITICAL — font names are NEVER rendered as visible text in the image. Font 
+names appear in the emitted prompt only as descriptive parameters describing 
+HOW to render the title or subtitle (e.g. "in Halyard Display", "in Inter 
+Bold"). Font names MUST NEVER appear INSIDE the quoted title string or 
+quoted subtitle string.
 </typography_weight_rule>
 
 <value_handling_rules>
@@ -374,11 +391,20 @@ god-rays, no impossibly clean mirror surfaces.
    logo at the wireframe-indicated location, left-aligned.\`
    
    The pill label appears in double quotes, character-for-character identical 
-   to the derived label.
+   to the derived label. The pill label MUST be the derived category text only 
+   — never a font name, hex code, or other technical token.
 
 7. TITLE AND SUBTITLE — locked position, mandatory.
    Derive title and subtitle per <derived_fields_rule>.
    Apply <typography_weight_rule>: title is bold (700+), subtitle is regular (400).
+   
+   CRITICAL: the quoted strings inside "headline text reading ..." and 
+   "subtitle text reading ..." MUST contain ONLY the derived title/subtitle 
+   text. They MUST NEVER contain font names, font weights, hex codes, CSS 
+   properties, or any technical metadata. Font names appear OUTSIDE the 
+   quoted string as descriptive parameters (e.g. \`headline text reading 
+   "Bio-based emulsifiers" in Halyard Display\`, NOT \`headline text reading 
+   "Bio-based emulsifiers Halyard Display"\`).
    
    TITLE:
    \`headline text reading "[DERIVED_TITLE]" in [font name], bold weight 700 or 
@@ -394,7 +420,7 @@ god-rays, no impossibly clean mirror surfaces.
    below the title with a modest gap.\`
    
    Title appears in double quotes exactly once. Subtitle appears in double quotes 
-   exactly once. They MUST be different strings.
+   exactly once. They MUST be different strings. Neither may contain a font name.
 
 8. BOUNDARY FADE — locked.
    Insert the language from <boundary_fade_rule> verbatim.
@@ -415,18 +441,24 @@ god-rays, no impossibly clean mirror surfaces.
     background or container or lock-up not present in the supplied reference, 
     logo washed out against background, title rendered in regular or medium 
     weight, subtitle heavier than title, subtitle identical to title, duplicate 
-    title or subtitle text, pill missing, pill label smudged or illegible, 
-    illegible letters, garbled words, weak or invisible column boundary 
-    shadow, hairline divider at column split, soft uniform vignette without 
-    anchored dark line, boundary shadow rendered in grey instead of black, 
-    boundary shadow in any colour other than pure black, boundary shadow as 
-    a darkened tint of the left background, boundary shadow as a darkened 
-    tint of the right image, stock-photo smiles, diverse team in office 
-    clichés, generic AI-slop aesthetic, plastic skin, waxy textures, HDR 
-    look, teal-orange cinematic grade, unmotivated glow or lens flare, 
-    floating particles, cyberpunk neon, watermarks, low resolution, 
-    oversaturated colours, rendered hex codes or font names as visible text, 
-    subjects from explicit_out_of_scope list.\`
+    title or subtitle text, font name rendered as visible subtitle text, font 
+    name rendered as visible title text, hex code rendered as visible text, 
+    CSS property rendered as visible text, pill missing, pill label smudged 
+    or illegible, font name rendered as pill label, illegible letters, 
+    garbled words, weak or invisible column boundary shadow, hairline 
+    divider at column split, soft uniform vignette without anchored dark 
+    line, boundary shadow rendered in grey instead of black, boundary shadow 
+    in any colour other than pure black, boundary shadow as a darkened tint 
+    of the left background, boundary shadow as a darkened tint of the right 
+    image, black shadow extending more than 1 percent into the left 
+    background, grey or muddy band along the right edge of the left column, 
+    symmetric column-boundary fade, left background darkened or tinted near 
+    the seam, stock-photo smiles, diverse team in office clichés, generic 
+    AI-slop aesthetic, plastic skin, waxy textures, HDR look, teal-orange 
+    cinematic grade, unmotivated glow or lens flare, floating particles, 
+    cyberpunk neon, watermarks, low resolution, oversaturated colours, 
+    rendered hex codes or font names as visible text, subjects from 
+    explicit_out_of_scope list.\`
     
     Append any additional exclusions from style_guide.do_not_use if present.
 
@@ -460,14 +492,18 @@ CRITICAL DERIVATION RULES:
 
 CRITICAL VERBATIM RULES:
 - DERIVED_TITLE: character-for-character identical to the derived value, in 
-  double quotes, exactly once.
+  double quotes, exactly once. The quoted string contains ONLY the title text 
+  — never font names, hex codes, or any technical token.
 - DERIVED_SUBTITLE: character-for-character identical to the derived value, in 
-  double quotes, exactly once.
+  double quotes, exactly once. The quoted string contains ONLY the subtitle 
+  text — never font names, hex codes, or any technical token.
 - DERIVED_PILL_LABEL: character-for-character identical to the derived value, 
-  in double quotes, exactly once.
+  in double quotes, exactly once. The quoted string contains ONLY the pill 
+  label text — never font names, hex codes, or any technical token.
 
 CRITICAL TYPOGRAPHY RULE:
 - Title always bold weight 700+. Subtitle always regular weight 400.
+- Font names appear OUTSIDE quoted strings, as descriptive parameters only.
 
 CRITICAL LOGO RULE:
 - The supplied logo reference (first reference image) must be preserved as-is. 
@@ -476,6 +512,8 @@ CRITICAL LOGO RULE:
 CRITICAL BOUNDARY RULE:
 - Boundary fade follows <boundary_fade_rule> exactly. Seam colour is pure 
   black (#000000), not grey, not a tint of either column.
+- The shadow is heavily right-weighted. Left background stays clean to the 
+  seam — no leftward leak, no grey band, no symmetric fade.
 
 Prompt length: 200–260 words inside the tags.
 
