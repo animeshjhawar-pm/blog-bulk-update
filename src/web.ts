@@ -4358,6 +4358,16 @@ export function startWebServer(port: number): void {
       const p = url.pathname;
       const method = req.method ?? "GET";
 
+      // Dedicated health endpoint — Railway's deploy probe hits this
+      // path. Returns 200 immediately with no DB / disk I/O so a cold
+      // container is reported healthy the moment the listener is up.
+      // The home page handler does a real DB round trip on every
+      // render; using "/" as the healthcheck means a slow first
+      // request can time out the probe → SIGTERM → CREATE_CONTAINER
+      // failure. /healthz sidesteps that entirely.
+      if (method === "GET" && (p === "/healthz" || p === "/_health")) {
+        return sendJson(res, 200, { ok: true });
+      }
       if (method === "GET" && p === "/") return homePage(res);
 
       // /import?client=<slug> — page-type chooser shown after the
