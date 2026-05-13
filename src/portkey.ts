@@ -8,6 +8,85 @@ export interface PortkeyResult {
   rawResponse: object;
 }
 
+// Retry policy for transient Portkey gateway errors (5xx + 429).
+// These almost always succeed on a second or third try — Portkey's
+// gateway sits in front of provider-specific routes and occasionally
+// returns a Cloudflare 503 HTML page when an upstream is briefly
+// unavailable. The retry budget is intentionally tight; permanent
+// errors (4xx auth, 400 validation) propagate immediately.
+const RETRY_MAX_ATTEMPTS = 4;            // 1 initial + 3 retries
+const RETRY_BASE_DELAY_MS = 1_000;       // 1s, 2s, 4s
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * When Portkey routes through a Cloudflare-fronted upstream that's
+ * unavailable, the response body is a multi-KB HTML error page (IE
+ * conditional comments and all). Surfacing the raw HTML in error
+ * messages buries the actual cause. Detect HTML, return a clean
+ * one-line summary, otherwise truncate the body sensibly.
+ */
+function summariseUpstreamBody(body: string, status: number): string {
+  const trimmed = body.trim();
+  if (/^<!DOCTYPE\s+html|^<html/i.test(trimmed)) {
+    // Try to pull the <title> for context if present, else use status.
+    const title = /<title[^>]*>([^<]+)<\/title>/i.exec(trimmed)?.[1]?.trim();
+    if (title) return `${title} (HTTP ${status} from upstream gateway — likely transient)`;
+    return `upstream gateway returned an HTML error page (HTTP ${status} — likely transient)`;
+  }
+  return trimmed.slice(0, 300);
+}
+
+/**
+ * Run an async operation that returns a Response, retrying on
+ * transient HTTP statuses (5xx + 429) and network errors with
+ * exponential backoff. Non-retryable errors (4xx other than 429,
+ * auth, validation, AbortError from caller's timeout) propagate
+ * immediately so they don't waste the retry budget.
+ *
+ * The factory closure pattern (() => fetch(...)) means each retry
+ * gets a fresh Response — we can't re-read the previous body.
+ */
+async function fetchWithRetry(
+  opName: string,
+  factory: () => Promise<Response>,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const resp = await factory();
+      // Auth + 4xx (other than 429) must NOT retry — they're terminal.
+      if (resp.ok || (resp.status >= 400 && resp.status < 500 && resp.status !== 429)) {
+        return resp;
+      }
+      if (!RETRYABLE_STATUS.has(resp.status)) return resp;
+      // Retryable — read body for diagnostics, then back off.
+      const body = await resp.text().catch(() => "");
+      lastErr = new Error(
+        `${opName}: ${resp.status} ${resp.statusText} (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}) — ${summariseUpstreamBody(body, resp.status)}`,
+      );
+      process.stderr.write(`${(lastErr as Error).message}\n`);
+    } catch (err) {
+      // Network errors (DNS, connection reset, timeout from caller's
+      // AbortController) all surface here. AbortError = explicit
+      // user-driven cancel — never retry.
+      if ((err as Error).name === "AbortError") throw err;
+      lastErr = err;
+      process.stderr.write(
+        `${opName}: network error attempt ${attempt}/${RETRY_MAX_ATTEMPTS} — ${(err as Error).message}\n`,
+      );
+    }
+    if (attempt < RETRY_MAX_ATTEMPTS) {
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      await sleep(delay);
+    }
+  }
+  throw lastErr ?? new Error(`${opName}: exhausted retries`);
+}
+
 export interface PortkeyMetadata {
   project_id?: string;
   step_name: string;
@@ -149,25 +228,27 @@ export async function callPortkey(params: {
 
   let response: Response;
   try {
-    response = await fetch("https://api.portkey.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization":                    `Bearer ${apiKey}`,
-        "X-Portkey-Config":                 configId,
-        "x-portkey-strict-open-ai-compliance": "false",
-        "X-Portkey-Metadata":               JSON.stringify(metadata),
-        "Content-Type":                     "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user",   content: userPrompt },
-        ],
-        max_tokens: maxTokens,
+    response = await fetchWithRetry("Portkey chat/completions", () =>
+      fetch("https://api.portkey.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization":                    `Bearer ${apiKey}`,
+          "X-Portkey-Config":                 configId,
+          "x-portkey-strict-open-ai-compliance": "false",
+          "X-Portkey-Metadata":               JSON.stringify(metadata),
+          "Content-Type":                     "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user",   content: userPrompt },
+          ],
+          max_tokens: maxTokens,
+        }),
+        signal: controller.signal,
       }),
-      signal: controller.signal,
-    });
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -179,7 +260,7 @@ export async function callPortkey(params: {
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(`Portkey error ${response.status}: ${body.slice(0, 300)}`);
+    throw new Error(`Portkey error ${response.status}: ${summariseUpstreamBody(body, response.status)}`);
   }
 
   const json = (await response.json()) as Record<string, unknown> & {
@@ -242,20 +323,22 @@ export async function callPortkeyStoredPrompt(params: {
 
   let response: Response;
   try {
-    response = await fetch(
-      `https://api.portkey.ai/v1/prompts/${encodeURIComponent(promptId)}/completions`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization":                       `Bearer ${apiKey}`,
-          "X-Portkey-Config":                    configId,
-          "x-portkey-strict-open-ai-compliance": "false",
-          "X-Portkey-Metadata":                  JSON.stringify(metadata),
-          "Content-Type":                        "application/json",
+    response = await fetchWithRetry(`Portkey stored-prompt ${promptId}`, () =>
+      fetch(
+        `https://api.portkey.ai/v1/prompts/${encodeURIComponent(promptId)}/completions`,
+        {
+          method: "POST",
+          headers: {
+            "Authorization":                       `Bearer ${apiKey}`,
+            "X-Portkey-Config":                    configId,
+            "x-portkey-strict-open-ai-compliance": "false",
+            "X-Portkey-Metadata":                  JSON.stringify(metadata),
+            "Content-Type":                        "application/json",
+          },
+          body: JSON.stringify({ variables }),
+          signal: controller.signal,
         },
-        body: JSON.stringify({ variables }),
-        signal: controller.signal,
-      }
+      ),
     );
   } finally {
     clearTimeout(timeout);
@@ -273,7 +356,7 @@ export async function callPortkeyStoredPrompt(params: {
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(`Portkey stored-prompt error ${response.status}: ${body.slice(0, 300)}`);
+    throw new Error(`Portkey stored-prompt error ${response.status}: ${summariseUpstreamBody(body, response.status)}`);
   }
 
   const json = (await response.json()) as Record<string, unknown> & {
