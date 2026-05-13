@@ -42,7 +42,7 @@ export function loadRetentionConfig(): RetentionConfig {
   const repl = Number.parseFloat(process.env.REPLICATE_URL_TTL_HOURS ?? "");
   return {
     retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 168, // 7 days
-    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 10,
+    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 50,
     replicateUrlTtlHours: Number.isFinite(repl) && repl > 0 ? repl : 1,
   };
 }

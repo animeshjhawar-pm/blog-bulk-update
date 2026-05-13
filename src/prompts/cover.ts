@@ -31,7 +31,7 @@ The prompt receives these inputs at generation time:
 - <style_guide> — extracted brand style JSON (graphic_token)
 - <business_context> — business_profile JSON describing inventory_nature, 
   business_identity, primary_verticals, and explicit_out_of_scope
-- <blog_post> — the blog_title and optional subtitle and category_label for this cover
+- <blog_post> — the blog_title for this cover
 - <context> — a JSON object containing { aspect_ratio: "16:9" | "3:2" }
 
 The company logo is attached separately to the image generation call as a reference 
@@ -434,9 +434,7 @@ Expected output format:
 export const BLOG_COVER_USER_TEMPLATE_NEW = `
 <blog_post>
 {
-  "blog_title": "{{placeholder_description}}",
-  "subtitle": "{{subtitle}}",
-  "category_label": "{{category_label}}"
+  "blog_title": "{{placeholder_description}}"
 }
 </blog_post>
 

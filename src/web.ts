@@ -279,6 +279,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .recent-row td { padding: 11px 14px; font-size: 13px; }
   .recent-row a.recent-link { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 8px; }
   .recent-row a.recent-link:hover { text-decoration: none; }
+  .ts-ist { font-size: 12px; color: var(--ink-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .fav { width: 16px; height: 16px; border-radius: 3px; object-fit: contain; flex: 0 0 16px; background: #f1f5f9; }
   .combobox .opt-name { display: flex; align-items: center; gap: 8px; }
   .combobox .opt-name strong { font-weight: 500; }
@@ -883,6 +884,31 @@ function buildPublishedUrl(project: ProjectRow, pageType: string, slug: string |
   return `${base}/${pageType}/${slug}`;
 }
 
+/**
+ * Format an ISO timestamp as IST ("Asia/Kolkata") for display in the
+ * recent-runs list. Returns "—" for missing / unparseable inputs so
+ * the column never renders an awkward "Invalid Date" cell. Uses
+ * Intl.DateTimeFormat directly so the conversion happens in the
+ * server's locale-independent stdlib path (no Date.toLocaleString
+ * locale-dependent surprises).
+ */
+function formatIst(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  // Example output: "13 May 2026, 14:32 IST"
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${fmt.format(d)} IST`;
+}
+
 function faviconFor(rawUrl: string | null | undefined): string {
   const u = (rawUrl ?? "").trim();
   if (!u) return FAVICON_FALLBACK;
@@ -1022,12 +1048,12 @@ async function homePage(res: ServerResponse) {
     envOk
       ? loadClientPickerEntries()
       : Promise.resolve(CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }))),
-    envOk ? loadRecentRuns(6) : Promise.resolve([] as RecentRunSummary[]),
+    envOk ? loadRecentRuns(50) : Promise.resolve([] as RecentRunSummary[]),
   ]);
   const featuredJson = JSON.stringify(featured);
   const recentRows = recent
     .map((r) => {
-      const started = (r.started_at ?? "").slice(0, 19).replace("T", " ");
+      const istLabel = formatIst(r.started_at);
       const status = !r.finished_at
         ? `<span class="pill infographic">running</span>`
         : r.failed > 0
@@ -1037,19 +1063,23 @@ async function homePage(res: ServerResponse) {
       // the run link, no duplicate "open run / CSV" cell. Rows missing a
       // run_id (very old manifests) just render unlinked.
       const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
-      const nameCell = `${fav}<span>${esc(r.client_name ?? r.client)}</span>`;
+      const displayName = r.client_name ?? r.client;
+      const nameCell = `${fav}<span>${esc(displayName)}</span>`;
+      // data-search holds the lowercased client name so the client-side
+      // search filter can hide non-matching rows in O(1) per row.
+      const searchKey = (displayName ?? "").toLowerCase();
       if (r.run_id) {
         return `
-<tr class="recent-row" onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer">
+<tr class="recent-row" data-search="${esc(searchKey)}" onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer">
   <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${nameCell}</a></td>
-  <td><a href="/runs/${esc(r.run_id)}" class="recent-link"><code style="font-size:11px">${esc(started)}</code></a></td>
+  <td><a href="/runs/${esc(r.run_id)}" class="recent-link"><span class="ts-ist">${esc(istLabel)}</span></a></td>
   <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${status}</a></td>
 </tr>`;
       }
       return `
-<tr class="recent-row">
+<tr class="recent-row" data-search="${esc(searchKey)}">
   <td>${nameCell}</td>
-  <td><code style="font-size:11px">${esc(started)}</code></td>
+  <td><span class="ts-ist">${esc(istLabel)}</span></td>
   <td>${status}</td>
 </tr>`;
     })
@@ -1092,9 +1122,36 @@ ${recent.length > 0 ? `
 <section class="card" style="padding:0;margin-top:18px">
   <div class="recent-head">
     <h2 style="margin:0">Recent runs</h2>
-    <span class="sub" style="margin-left:auto">click a row to open</span>
+    <span class="sub" style="margin-left:6px;color:var(--ink-faint)" id="recent-count">${recent.length}</span>
+    <input type="search"
+           id="recent-search"
+           placeholder="Filter by client name…"
+           autocomplete="off"
+           style="margin-left:auto;max-width:260px;font-size:13px;padding:6px 10px"
+           oninput="filterRecentRuns(this.value)">
   </div>
-  <table class="cluster-list"><tbody>${recentRows}</tbody></table>
+  <table class="cluster-list"><tbody id="recent-tbody">${recentRows}</tbody></table>
+  <div id="recent-empty" class="sub" style="display:none;padding:16px 18px;text-align:center">No runs match that search.</div>
+  <script>
+    // Client-side filter — works on the data-search attribute we
+    // stamped on each <tr>. Cheap even at 50 rows; instant feedback.
+    function filterRecentRuns(q) {
+      const needle = (q || '').toLowerCase().trim();
+      const rows = document.querySelectorAll('#recent-tbody tr.recent-row');
+      let visible = 0;
+      for (const tr of rows) {
+        const hit = !needle || (tr.dataset.search || '').includes(needle);
+        tr.style.display = hit ? '' : 'none';
+        if (hit) visible++;
+      }
+      const total = rows.length;
+      document.getElementById('recent-count').textContent = needle
+        ? visible + ' / ' + total
+        : total;
+      document.getElementById('recent-empty').style.display =
+        (needle && visible === 0) ? 'block' : 'none';
+    }
+  </script>
 </section>` : `
 <section class="card" style="margin-top:18px;text-align:center;padding:32px">
   <div class="sub">No runs yet. Pick a client above to get started.</div>
