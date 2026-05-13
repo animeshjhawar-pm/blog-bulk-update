@@ -1,0 +1,36 @@
+# Nixpacks build config — keeps the build phase free of runtime
+# secrets. Without this, Nixpacks auto-discovers every env var
+# attached to the Railway service and bakes them into the generated
+# Dockerfile via ARG + ENV. BuildKit then warns:
+#     SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for
+#     sensitive data (ARG "AWS_ACCESS_KEY_ID") …
+#
+# More than a warning, it leaves the secrets in image layers visible
+# to anyone with `docker history <image>` or `docker inspect`. The
+# fix is to be explicit about what the build phase needs (nothing —
+# `npm install` is enough on its own) so Nixpacks doesn't include
+# anything else.
+#
+# The actual runtime secrets are still injected by Railway at
+# container-start time via the normal env, exactly as before.
+
+providers = ["node"]
+
+[phases.setup]
+# Node version. Matches package.json "engines": { "node": ">=20" }.
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm install --no-audit --no-fund --prefer-offline"]
+
+# No [phases.build] — we run TypeScript via tsx at runtime, no compile
+# step is needed. (Leaving the section out is the canonical way to
+# tell Nixpacks "skip the build phase entirely".)
+
+[start]
+cmd = "npm start"
+
+# Empty by design — anything listed here gets baked into the image
+# at build time. Runtime secrets live in Railway's variable store
+# and are injected at container start.
+[variables]
