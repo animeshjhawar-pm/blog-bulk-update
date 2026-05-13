@@ -22,6 +22,11 @@ export const CSV_HEADER = [
   // / MDX fallback). Lets the runs-page Compare modal show old-vs-new
   // without a separate DB round-trip.
   "previous_image_url",
+  // Replicate prediction id. Captured for BOTH successful and failed
+  // rows so a later regenerate can opportunistically resume the
+  // original prediction (predictions often finish on Replicate's side
+  // after our polling budget expires).
+  "prediction_id",
 ] as const;
 
 export type CsvHeader = (typeof CSV_HEADER)[number];

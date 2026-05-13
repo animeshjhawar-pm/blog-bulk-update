@@ -154,6 +154,10 @@ program
     "--extra-instructions-file <path>",
     "merge this file's text into the per-image top-priority block (treated like additional_instructions for this run only — does NOT mutate the saved graphic_token)",
   )
+  .option(
+    "--resume-prediction-id <id>",
+    "before generating, poll Replicate for this prediction id. If it has succeeded, use that URL and skip the new generation (recovers predictions that completed after a prior timeout).",
+  )
   .action(
     async (opts: {
       client: string;
@@ -169,6 +173,7 @@ program
       concurrency: string;
       promptOverrideFile?: string;
       extraInstructionsFile?: string;
+      resumePredictionId?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
@@ -213,6 +218,7 @@ program
           concurrency,
           promptOverride,
           extraInstructions,
+          resumePredictionId: opts.resumePredictionId,
         });
       } catch (err) {
         process.stderr.write(

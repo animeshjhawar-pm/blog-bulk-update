@@ -10,11 +10,21 @@ export interface GenerateParams {
   imageInput: string[];
   /** Override the env-resolved default. */
   provider?: Provider;
+  /**
+   * If set AND provider is Replicate, the call first asks Replicate
+   * whether this prediction id has completed. If yes → return its
+   * URL with zero new model-spend (the recovery path used by the
+   * regenerate-on-failed flow). If no → fall through to a fresh
+   * generation. Ignored for fal.
+   */
+  resumePredictionId?: string;
 }
 
 export interface GenerateResult {
   imageUrl: string;
   provider: Provider;
+  /** Replicate prediction id. Only set when provider="replicate". */
+  predictionId?: string;
 }
 
 export async function generate(params: GenerateParams): Promise<GenerateResult> {
@@ -35,6 +45,7 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
     aspectRatio: params.aspectRatio,
     imageInput: params.imageInput,
     model: "google/nano-banana-pro",
+    resumePredictionId: params.resumePredictionId,
   });
-  return { imageUrl: r.image_url, provider };
+  return { imageUrl: r.image_url, provider, predictionId: r.prediction_id };
 }

@@ -21,6 +21,10 @@ export const DEFAULT_IMAGE_MODEL: ImageModel = "google/nano-banana-pro";
 
 export interface ReplicateResult {
   image_url: string;
+  /** Replicate's prediction id. Captured even when generation fails or
+   *  times out, so a later "regenerate" can poll-and-recover instead of
+   *  paying for a fresh prediction. */
+  prediction_id?: string;
 }
 
 export interface GenerateImageParams {
@@ -32,13 +36,45 @@ export interface GenerateImageParams {
   imageSearch?: boolean;
   /** nano-banana-2 only. */
   googleSearch?: boolean;
+  /**
+   * When set, the call FIRST asks Replicate whether this prediction
+   * has completed. If it has, we return its URL and skip creating a
+   * new one — exact same image, zero new spend. If it hasn't (still
+   * running, failed, or unknown), the call falls through to a fresh
+   * generation as usual. Used by the web UI's regenerate flow to
+   * recover predictions that completed after our original 280s
+   * polling budget expired.
+   */
+  resumePredictionId?: string;
 }
 
-// Default polling budget — Vercel function timeout is 300s, leave ~15s
-// headroom for the POST + final serialization. Most models settle well
-// within this: nano-banana-pro is usually 10–30s, nano-banana-2 ~40s,
-// seedream-4 ~40s, gpt-image-2 ~60–120s.
-const DEFAULT_MAX_WAIT_MS = 280_000; // 280s
+/**
+ * Error subclass that carries the Replicate prediction id when a
+ * generation fails mid-flight. Lets the caller persist the id even on
+ * the failure path so a later regenerate can try to recover.
+ */
+export class ReplicateGenerationError extends Error {
+  prediction_id?: string;
+  constructor(message: string, prediction_id?: string) {
+    super(message);
+    this.name = "ReplicateGenerationError";
+    this.prediction_id = prediction_id;
+  }
+}
+
+// Polling budget. Historically this was 280s — tuned to fit inside
+// Vercel's 300s function cap. Railway has no such constraint and
+// nano-banana-pro can spike past 280s under Replicate load; failing
+// at that boundary means the prediction may still complete on
+// Replicate's side but we throw the error away. Bumping to 540s
+// (matches gpt-image-2's existing leash) catches the long tail.
+//
+// REPLICATE_MAX_WAIT_MS overrides this per-deployment if you need
+// something tighter or longer than the default.
+const DEFAULT_MAX_WAIT_MS = (() => {
+  const env = Number.parseInt(process.env.REPLICATE_MAX_WAIT_MS ?? "", 10);
+  return Number.isFinite(env) && env > 0 ? env : 540_000;
+})();
 // gpt-image-2 routinely takes 2–5 min for img2img with two reference
 // images (its OpenAI backend is slower than Gemini's, and content
 // moderation adds latency). Give it a longer leash so we don't bail
@@ -189,12 +225,57 @@ function buildModelInput(
   throw new Error(`Unknown image model: ${model}`);
 }
 
+/**
+ * One-shot GET against an existing prediction id. Returns the image
+ * URL if the prediction has succeeded by now, null otherwise. Used by
+ * the regenerate-recovery path — predictions that timed out on our
+ * side often complete shortly after on Replicate's side, and the URL
+ * is still fetchable. Costs nothing if it succeeds (no new prediction).
+ */
+export async function pollPredictionOnce(
+  predictionId: string,
+): Promise<ReplicateResult | null> {
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) return null;
+  try {
+    const resp = await fetch(`https://api.replicate.com/v1/predictions/${predictionId}`, {
+      headers: { Authorization: `Token ${token}` },
+    });
+    if (!resp.ok) return null;
+    const json = (await resp.json()) as {
+      status?: string;
+      output?: string | string[];
+    };
+    if (json.status !== "succeeded") return null;
+    const raw = json.output;
+    const image_url = Array.isArray(raw) ? raw[0] : (raw ?? "");
+    if (!image_url) return null;
+    return { image_url, prediction_id: predictionId };
+  } catch {
+    return null;
+  }
+}
+
 export async function generateImage(params: GenerateImageParams): Promise<ReplicateResult> {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) {
     throw new Error(
       "REPLICATE_API_TOKEN is not set. Local: add to .env.local and restart `npm run dev`. Vercel: add in Project Settings → Environment Variables, then redeploy."
     );
+  }
+
+  // Resume path — if the caller passed a prediction id from a prior
+  // attempt, see if Replicate has finished it since we last polled.
+  // Hits cost is one GET; happy path returns the image with zero new
+  // model-spend.
+  if (params.resumePredictionId) {
+    const recovered = await pollPredictionOnce(params.resumePredictionId);
+    if (recovered) {
+      process.stderr.write(
+        `replicate: recovered prediction ${params.resumePredictionId} — skipping new generation\n`,
+      );
+      return recovered;
+    }
   }
 
   const model = params.model ?? DEFAULT_IMAGE_MODEL;
@@ -238,16 +319,22 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
       if (!json.id)   throw new Error("Replicate returned no prediction ID");
       // Happy path: `Prefer: wait` held the connection until the prediction
       // completed — no polling needed.
+      predictionId = json.id;
       if (json.status === "succeeded") {
         const image_url = Array.isArray(json.output) ? json.output[0] : (json.output ?? "");
-        if (!image_url) throw new Error("Replicate succeeded but output was empty");
-        immediateResult = { image_url };
+        if (!image_url) {
+          throw new ReplicateGenerationError(
+            "Replicate succeeded but output was empty",
+            predictionId,
+          );
+        }
+        immediateResult = { image_url, prediction_id: predictionId };
       } else if (json.status === "failed" || json.status === "canceled") {
-        throw new Error(
-          `Replicate prediction ${json.status}: ${json.error ?? "no error message"}`
+        throw new ReplicateGenerationError(
+          `Replicate prediction ${json.status}: ${json.error ?? "no error message"}`,
+          predictionId,
         );
       }
-      predictionId = json.id;
       break;
     } catch (err) {
       if (attempt === MAX_RETRIES) throw err;
@@ -285,17 +372,29 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
     if (status.status === "succeeded") {
       const raw = status.output;
       const image_url = Array.isArray(raw) ? raw[0] : (raw ?? "");
-      if (!image_url) throw new Error("Replicate succeeded but output was empty");
-      return { image_url };
+      if (!image_url) {
+        throw new ReplicateGenerationError(
+          "Replicate succeeded but output was empty",
+          predictionId,
+        );
+      }
+      return { image_url, prediction_id: predictionId };
     }
 
     if (status.status === "failed" || status.status === "canceled") {
-      throw new Error(
-        `Replicate prediction ${status.status}: ${status.error ?? "no error message"}`
+      throw new ReplicateGenerationError(
+        `Replicate prediction ${status.status}: ${status.error ?? "no error message"}`,
+        predictionId,
       );
     }
     // status === 'starting' | 'processing' → keep polling
   }
 
-  throw new Error(`Replicate prediction timed out after ${maxWaitMs / 1000}s`);
+  // Timed out on our side. The prediction id is still valid on
+  // Replicate's side — surface it through the error so processOne
+  // can write it to the CSV. A subsequent regenerate will resume.
+  throw new ReplicateGenerationError(
+    `Replicate prediction timed out after ${maxWaitMs / 1000}s (prediction_id=${predictionId}; a later regenerate will try to recover it)`,
+    predictionId,
+  );
 }

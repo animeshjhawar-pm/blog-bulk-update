@@ -2299,28 +2299,30 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   const parent = RUNS.get(runId);
   if (!parent) return sendJson(res, 404, { error: `run ${runId} not found` });
 
-  // If we don't have a cluster_id, recover it from the parent run's CSV.
-  if (!clusterId && parent.csvPath) {
-    const rows = await readRunCsv(parent.csvPath);
-    const row = rows.find((r) => r.image_id === imageId);
-    if (row) clusterId = row.cluster_id;
-  }
-  if (!clusterId) return sendJson(res, 400, { error: "cluster_id required (and not found in parent CSV)" });
-
-  // Speed up: reuse the parent's prompt for this image_id, skipping the
-  // Portkey round-trip in the child run. Saves ~5–10s. Falls through to
-  // a normal Portkey build if the parent CSV doesn't carry a prompt.
+  // Read the parent CSV row once and pull out everything we need:
+  // cluster_id (if not supplied), the prompt_used we want to reuse
+  // (saves the Portkey round-trip), and any prediction_id from the
+  // prior attempt (lets us recover a prediction that completed after
+  // our 280s polling budget expired).
   let promptOverrideFile: string | undefined;
+  let resumePredictionId: string | undefined;
   if (parent.csvPath) {
     const rows = await readRunCsv(parent.csvPath);
     const row = rows.find((r) => r.image_id === imageId);
-    if (row && row.prompt_used && row.prompt_used.trim().length > 0) {
-      const tmpDir = path.resolve(process.cwd(), "out");
-      const fname = `prompt-override-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
-      promptOverrideFile = path.join(tmpDir, fname);
-      await fs.writeFile(promptOverrideFile, row.prompt_used, "utf8");
+    if (row) {
+      if (!clusterId) clusterId = row.cluster_id;
+      if (row.prompt_used && row.prompt_used.trim().length > 0) {
+        const tmpDir = path.resolve(process.cwd(), "out");
+        const fname = `prompt-override-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
+        promptOverrideFile = path.join(tmpDir, fname);
+        await fs.mkdir(tmpDir, { recursive: true });
+        await fs.writeFile(promptOverrideFile, row.prompt_used, "utf8");
+      }
+      const pid = row.prediction_id?.trim();
+      if (pid) resumePredictionId = pid;
     }
   }
+  if (!clusterId) return sendJson(res, 400, { error: "cluster_id required (and not found in parent CSV)" });
 
   // Operator-supplied one-off instructions for this regen only — the
   // workspace UI's "Regenerate (custom instructions)" flow. Written
@@ -2336,6 +2338,11 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     await fs.writeFile(extraInstructionsFile, customInstructions, "utf8");
   }
 
+  // Resumption only makes sense when the regen is meant to be the
+  // SAME image — custom instructions are a deliberate ask for a new
+  // image, so we suppress the resume path in that case.
+  const effectiveResumeId = customInstructions.length === 0 ? resumePredictionId : undefined;
+
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
   // We reuse the parent's client/page_type so the subprocess loads the
   // identical graphic_token + project context.
@@ -2350,6 +2357,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     provider: extractProviderFromArgs(parent.args),
     promptOverrideFile,
     extraInstructionsFile,
+    resumePredictionId: effectiveResumeId,
   });
 
   // Wait for the subprocess to finish, then read its CSV for the new URL.
@@ -2565,6 +2573,11 @@ function startRegen(opts: {
    *  regen only — merged into the top-priority directives block at
    *  generation time. Never mutates the saved graphic_token. */
   extraInstructionsFile?: string;
+  /** Replicate prediction id from a prior attempt. The CLI's
+   *  --resume-prediction-id flag polls this id first and uses its
+   *  URL if it has succeeded since — recovers predictions that
+   *  completed after a previous timeout. */
+  resumePredictionId?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
   const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client, "--run-id", id];
@@ -2578,6 +2591,7 @@ function startRegen(opts: {
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.promptOverrideFile) args.push("--prompt-override-file", opts.promptOverrideFile);
   if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
+  if (opts.resumePredictionId) args.push("--resume-prediction-id", opts.resumePredictionId);
 
   const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
 
@@ -2861,6 +2875,11 @@ interface CsvRowParsed {
    * column existed will have it undefined; we fall back to a
    * media_registry batch lookup in that case. */
   previous_image_url?: string;
+  /** Replicate prediction id from this row's generation attempt
+   * (set for both successful and failed rows). Lets a later
+   * regenerate poll-and-recover instead of paying for a fresh call.
+   * Undefined for rows from CSVs written before this column existed. */
+  prediction_id?: string;
 }
 
 async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {

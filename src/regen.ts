@@ -70,6 +70,14 @@ export interface RegenOptions {
    * from the token (both go into the same block).
    */
   extraInstructions?: string;
+  /**
+   * When set, the generation call first polls Replicate for THIS
+   * prediction id. If it has succeeded since the prior attempt, we
+   * use its URL with zero new spend — recovers predictions that
+   * completed after the parent run's 280s polling budget. Single-
+   * image regen sets this from the parent CSV row's prediction_id.
+   */
+  resumePredictionId?: string;
 }
 
 function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
@@ -199,6 +207,7 @@ async function processOne(args: {
         image_local_path: "",
         status: "completed",
         error: "",
+        prediction_id: "",
       },
     };
   }
@@ -263,6 +272,7 @@ async function processOne(args: {
           image_local_path: "",
           status: "dry-run",
           error: "",
+          prediction_id: "",
         },
       };
     }
@@ -273,6 +283,7 @@ async function processOne(args: {
       aspectRatio: record.aspectRatio,
       imageInput,
       provider: options.provider,
+      resumePredictionId: options.resumePredictionId,
     });
 
     const localPath = await downloadImage({
@@ -283,7 +294,7 @@ async function processOne(args: {
     });
 
     process.stderr.write(
-      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=completed\n`,
+      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=completed${gen.predictionId ? ` pred=${gen.predictionId}` : ""}\n`,
     );
 
     return {
@@ -295,12 +306,21 @@ async function processOne(args: {
         image_local_path: localPath,
         status: "completed",
         error: "",
+        prediction_id: gen.predictionId ?? "",
       },
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // ReplicateGenerationError (and any other thrower attaching
+    // prediction_id) lets us record the in-flight prediction id on
+    // the failed row, so a later regenerate can resume it instead of
+    // paying for a fresh prediction.
+    const failedPredictionId =
+      err && typeof err === "object" && "prediction_id" in err
+        ? (err as { prediction_id?: string }).prediction_id
+        : undefined;
     process.stderr.write(
-      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=failed error=${message.slice(0, 200)}\n`,
+      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=failed error=${message.slice(0, 200)}${failedPredictionId ? ` pred=${failedPredictionId}` : ""}\n`,
     );
     return {
       status: "failed",
@@ -311,6 +331,7 @@ async function processOne(args: {
         image_local_path: "",
         status: "failed",
         error: message,
+        prediction_id: failedPredictionId ?? "",
       },
     };
   }
