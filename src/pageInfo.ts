@@ -316,8 +316,16 @@ function thumbnailRecord(cluster: ClusterRow): ImageRecord {
 // real CDN URL.)
 // ────────────────────────────────────────────────────────────────────────
 
-const MDX_IMAGE_TAG_RE =
-  /<Image\b[^>]*?\bimageId\s*=\s*"([^"]+)"[^>]*?(?:alt\s*=\s*"([^"]*)")?[^>]*?\/>/gi;
+// MDX <Image .../> tag scanner — robust to attribute order. The
+// previous regex assumed `alt` came after `imageId`, which is fine
+// for some templates but breaks for any tag that lists attributes
+// in a different order (alt-first, custom attributes between them,
+// etc.). We now extract attributes independently from each tag's
+// attribute span: first pluck the whole tag, then pull imageId and
+// alt out by name regardless of where they sit.
+const MDX_IMAGE_TAG_RE = /<Image\b([^>]*)\/>/gi;
+const MDX_ATTR_IMAGE_ID = /\bimageId\s*=\s*"([^"]+)"/i;
+const MDX_ATTR_ALT      = /\balt\s*=\s*"([^"]*)"/i;
 
 interface MdxImageTag {
   imageId: string;
@@ -327,9 +335,11 @@ interface MdxImageTag {
 function scanMdxImageTags(md: string): MdxImageTag[] {
   const out: MdxImageTag[] = [];
   for (const m of md.matchAll(MDX_IMAGE_TAG_RE)) {
-    const imageId = (m[1] ?? "").trim();
+    const attrs = m[1] ?? "";
+    const imageId = (MDX_ATTR_IMAGE_ID.exec(attrs)?.[1] ?? "").trim();
     if (!imageId) continue;
-    out.push({ imageId, alt: (m[2] ?? "").trim() });
+    const alt = (MDX_ATTR_ALT.exec(attrs)?.[1] ?? "").trim();
+    out.push({ imageId, alt });
   }
   return out;
 }
@@ -365,7 +375,33 @@ async function inlineRecordsForCluster(
   stagingSubdomain: string | null,
   cache: Map<string, string | null>,
 ): Promise<ImageRecord[]> {
-  // 1. S3 markdown (canonical for the IMAGE_PLACEHOLDER flow).
+  // 1. MDX (page_info.blog_text.md <Image imageId="UUID"/>) — Sentinel /
+  //    SpecGas-style blogs. Promoted from "fallback shape" to "primary"
+  //    because each MDX tag's UUID maps DIRECTLY to media_registry,
+  //    yielding the published image URL without any guesswork. Previous
+  //    behaviour preferred S3-markdown placeholders and used MDX only
+  //    as a fallback for unresolved hashes — the trouble being that
+  //    the S3 markdown is a pre-publish BLUEPRINT and the rendering
+  //    pipeline doesn't preserve placeholder-index ↔ MDX-tag-index.
+  //    Result: the "old" image in Compare could be a completely
+  //    different illustration from the description shown to the
+  //    operator (real example: SpecGas cluster b39b12ce had the
+  //    S3 markdown describing an "intact vs torn PTFE membrane"
+  //    comparison while MDX[3] at the paired position was "torn
+  //    PTFE membrane only" — two different images).
+  //
+  //    MDX-first means the description is the alt text (terser than
+  //    the S3 markdown) but it's the alt of the IMAGE THAT'S ACTUALLY
+  //    ON THE PUBLISHED PAGE. Drawer previews + Compare-modal "old"
+  //    pane + Apply-to-S3 target all line up.
+  const md = blogTextMd(cluster.page_info ?? {});
+  if (md) {
+    const mdxTags = scanMdxImageTags(md);
+    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags);
+  }
+
+  // 2. S3 markdown <image_requirement> placeholders — for clusters
+  //    that don't ship blog_text.md (legacy / non-Sentinel templates).
   if (stagingSubdomain) {
     let body: string | null;
     if (cache.has(cluster.id)) {
@@ -389,22 +425,13 @@ async function inlineRecordsForCluster(
     }
   }
 
-  // 2. DB Shape A: <image_requirement> tags inside page_info::text
+  // 3. DB Shape A — <image_requirement> tags embedded inside the
+  //    page_info JSONB (some templates inline the markdown).
   const piText = JSON.stringify(cluster.page_info ?? {});
   const dbTags = scanRequirementTags(piText);
   if (dbTags.length > 0) return shapeAToRecords(cluster, dbTags, "db-shape-A");
 
-  // 3. MDX shape — page_info.blog_text.md with <Image imageId="…"/> tags.
-  // This is Sentinel's actual template. Each tag's UUID maps to
-  // media_registry for a real CDN URL; the per-cluster classifier
-  // below makes the 1st MDX Image the "cover".
-  const md = blogTextMd(cluster.page_info ?? {});
-  if (md) {
-    const mdxTags = scanMdxImageTags(md);
-    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags);
-  }
-
-  // 4. Shape B: tree walk for image-shaped objects
+  // 4. Shape B — tree walk for image-shaped objects (very legacy).
   const bHits = walkShapeB(cluster.page_info);
   if (bHits.length > 0) return shapeBToRecords(cluster, bHits);
 
@@ -660,66 +687,18 @@ export async function collectImageRecords(
     }
   }
 
-  // MDX fallback for inline records whose S3-markdown hash ids didn't
-  // resolve in media_registry (Sentinel/SpecGas-style). Group the
-  // missing records per cluster, scan each cluster's MDX
-  // <Image imageId="…"/> tags, and do ONE big media_registry batch
-  // across every cluster's MDX UUIDs. Pair by document-order index
-  // per cluster.
-  //
-  // OFF-BY-ONE: when blog_text.md exists, MDX tags[0] is consumed by
-  // coverRecord (it becomes the cover image's UUID). The inline
-  // infographic records that end up in `missing` therefore correspond
-  // to MDX tags[1..N], NOT tags[0..N-1]. We carry an `offset` per
-  // cluster — 1 when the cover's imageId matches tags[0], else 0 —
-  // so the pairing aligns with the actual document order.
-  const stillMissing = records.filter((r) => !r.previewUrl && !r.imageId.includes("/"));
-  if (stillMissing.length > 0) {
-    const byCluster = new Map<string, ImageRecord[]>();
-    for (const r of stillMissing) {
-      if (!byCluster.has(r.cluster.id)) byCluster.set(r.cluster.id, []);
-      byCluster.get(r.cluster.id)!.push(r);
-    }
-
-    const mdxByCluster = new Map<string, MdxImageTag[]>();
-    const offsetByCluster = new Map<string, number>();
-    const allMdxIds: string[] = [];
-    for (const [cid, missing] of byCluster) {
-      const cluster = missing[0]!.cluster;
-      const md = blogTextMd(cluster.page_info ?? {});
-      if (!md) continue;
-      const tags = scanMdxImageTags(md);
-      if (tags.length === 0) continue;
-      mdxByCluster.set(cid, tags);
-
-      // Detect whether tags[0] is the cover image by looking at the
-      // cluster's cover record (asset === "cover"). If its imageId
-      // equals tags[0].imageId, the inline records map to tags[1..N].
-      const coverRec = records.find(
-        (r) => r.cluster.id === cid && r.asset === "cover",
-      );
-      const coverIsTag0 = !!coverRec && coverRec.imageId === tags[0]!.imageId;
-      offsetByCluster.set(cid, coverIsTag0 ? 1 : 0);
-
-      for (const t of tags) allMdxIds.push(t.imageId);
-    }
-    if (allMdxIds.length > 0) {
-      const mdxUrls = await lookupImageUrls(allMdxIds);
-      for (const [cid, missing] of byCluster) {
-        const tags = mdxByCluster.get(cid);
-        if (!tags) continue;
-        const offset = offsetByCluster.get(cid) ?? 0;
-        for (let i = 0; i < missing.length; i++) {
-          const tag = tags[i + offset];
-          if (!tag) break;
-          const urls = mdxUrls.get(tag.imageId);
-          if (!urls) continue;
-          missing[i]!.previewUrl =
-            urls["720"] ?? urls["1080"] ?? urls["360"] ?? undefined;
-        }
-      }
-    }
-  }
+  // (Previously this is where an MDX-pair fallback ran for clusters
+  // whose S3-markdown hash IDs didn't resolve in media_registry. It
+  // paired `missing[i]` ↔ `tags[i + cover-offset]` by document order
+  // — which turned out to be unreliable: the S3 markdown is a
+  // pre-publish blueprint and the rendering pipeline doesn't
+  // preserve placeholder-index ↔ MDX-tag-index. Result was that
+  // the "old" image in Compare could show a different illustration
+  // from the one matching the description. The fallback is now gone
+  // — `inlineRecordsForCluster` prefers MDX directly when
+  // blog_text.md is present, so each record's imageId is the MDX
+  // UUID and its previewUrl resolves via the first batch above with
+  // no guesswork.)
 
   return records;
 }
