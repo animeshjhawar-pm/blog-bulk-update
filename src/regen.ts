@@ -80,6 +80,27 @@ export interface RegenOptions {
   resumePredictionId?: string;
 }
 
+/**
+ * Aspect-specific layout wireframes served as the SECOND reference
+ * image on cover + thumbnail generations. The cover prompt's
+ * <wireframe_handling> block expects exactly this — a clean
+ * structural blueprint with the 50/50 split, logo position, pill,
+ * title block, and visual area marked out (but no annotation
+ * styling, see the prompt's "must NOT render" list).
+ *
+ * Hosted in the imagegen-playground repo so the URL is stable and
+ * cacheable by Replicate. Note: must be the RAW form
+ * (raw.githubusercontent.com) — /blob/ URLs return HTML, not bytes.
+ *
+ * Returned for asset === "cover" (16:9) and "thumbnail" (3:2)
+ * only. Other asset types skip the wireframe (their prompts don't
+ * reference one).
+ */
+const WIREFRAME_URLS: Partial<Record<AssetType, string>> = {
+  cover: "https://raw.githubusercontent.com/animeshjhawar-pm/imagegen-playground/main/public/cover.png",
+  thumbnail: "https://raw.githubusercontent.com/animeshjhawar-pm/imagegen-playground/main/public/thumbnail.png",
+};
+
 function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
   // Operator-edited override always wins.
   if (override && override.startsWith("http")) return override;
@@ -277,7 +298,21 @@ async function processOne(args: {
       };
     }
 
-    const imageInput = logoUrl ? [logoUrl] : [];
+    // Reference-image order is contractual with the cover prompt:
+    //   [0] = brand logo (kept as first per <wireframe_handling>: the
+    //         "FIRST REFERENCE IMAGE" referenced in the logo
+    //         placement clause)
+    //   [1] = layout wireframe for cover/thumbnail only (the "SECOND
+    //         REFERENCE IMAGE" in the same block) — supplies the
+    //         50/50 split + zone positions as a structural blueprint
+    // If there's no logo, the wireframe still slots into position
+    // [0]; the prompt only differentiates by ordinal, so a single
+    // attached wireframe is still readable.
+    const imageInput: string[] = [];
+    if (logoUrl) imageInput.push(logoUrl);
+    const wireframe = WIREFRAME_URLS[record.asset];
+    if (wireframe) imageInput.push(wireframe);
+
     const gen = await generate({
       prompt: promptUsed,
       aspectRatio: record.aspectRatio,
