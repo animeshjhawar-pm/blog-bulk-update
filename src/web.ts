@@ -436,6 +436,13 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .info-grid .v { word-break: break-word; }
   .json-dump { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font: 11.5px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; max-height: 320px; overflow: auto; color: #334155; }
   .json-edit { font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace; background: #f8fafc; color: #334155; min-height: 280px; }
+  /* Per-group prompt editor blocks inside the "Are you sure you want
+     to generate?" modal. One <details> per group; the textarea uses
+     the same .json-edit styling so multi-line prompts read well. */
+  .gen-group { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: #fff; }
+  .gen-group > summary { padding: 10px 14px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 4px; }
+  .gen-group[open] > summary { border-bottom: 1px solid var(--border); }
+  .gen-group textarea.gen-system { width: 100%; min-height: 320px; box-sizing: border-box; }
 
   /* Whole-row clickable cluster table */
   table.cluster-list tr.cluster-row { cursor: pointer; }
@@ -2017,7 +2024,33 @@ async function saveToken(e) {
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
   </div>
   <div class="right">
-    <button class="primary" id="bar-generate-btn" onclick="runRegen()" disabled title="Generate replacement images for the selected items via Portkey + Replicate.">Generate →</button>
+    <button class="primary" id="bar-generate-btn" onclick="openGenerateConfirm()" disabled title="Review prompts before running the generation pipeline.">Generate →</button>
+  </div>
+</div>
+
+<!-- Generate confirmation modal — opens when the operator clicks
+     "Generate →". Lets them preview (and optionally edit, per-run
+     only) each system prompt that will be used in the upcoming run. -->
+<div class="cmp-overlay" id="gen-overlay" onclick="genBackdrop(event)">
+  <div class="cmp-modal" role="dialog" aria-modal="true" style="max-width:900px">
+    <header class="cmp-head">
+      <strong>Are you sure you want to generate images?</strong>
+      <span class="sub" id="gen-summary" style="margin-left:auto"></span>
+      <button class="cmp-x" onclick="closeGenerateConfirm()" aria-label="Close">×</button>
+    </header>
+    <div style="padding:14px 18px 6px 18px">
+      <div class="sub" id="gen-help">
+        Each prompt below is collapsed by default. Expand to view; edit if you want a one-off tweak just for this run. Edits are <strong>not</strong> saved back to the repo — they only apply to the images you're about to generate.
+      </div>
+    </div>
+    <div id="gen-prompts" style="padding:0 18px 6px 18px;overflow-y:auto;flex:1">
+      <div class="sub" id="gen-prompts-loading">Loading prompts…</div>
+    </div>
+    <footer style="padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end;align-items:center">
+      <span class="sub" id="gen-overrides-count" style="margin-right:auto"></span>
+      <button type="button" onclick="closeGenerateConfirm()">Cancel</button>
+      <button type="button" class="primary" id="gen-submit-btn" onclick="genConfirmSubmit()">Generate →</button>
+    </footer>
   </div>
 </div>
 `;
@@ -2252,6 +2285,8 @@ function openLogoLightbox(src) {
 }
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    const gen = document.getElementById('gen-overlay');
+    if (gen && gen.classList.contains('open')) { closeGenerateConfirm(); return; }
     if (document.getElementById('lightbox').classList.contains('open')) { closeLightbox(); return; }
     if (document.getElementById('drawer').classList.contains('open')) closeDrawer();
   }
@@ -2305,16 +2340,166 @@ async function saveBrand(e) {
   }
 }
 
-// Live generation: posts the selected items to /regen, which spawns a
-// real CLI subprocess (Portkey + Replicate). Server redirects to the
-// /runs/<id> page so the operator can stream logs and review results.
-async function runRegen() {
+// ── Generate-confirmation modal ──
+// Replaces the old direct-submit path. Operator clicks Generate →
+// modal opens with a per-prompt-group collapsible editor → on submit
+// we POST /regen with both the selected items AND any per-run prompt
+// overrides the operator typed. The server writes the overrides to a
+// JSON temp file and the CLI re-reads it (matches how
+// extra-instructions-file / prompt-override-file already work).
+
+// Maps asset_type to its underlying prompt group. Mirrors
+// promptGroupFor() in src/buildPrompt.ts so the modal can show only
+// the groups whose prompts will actually run.
+function promptGroupForAsset(asset) {
+  if (asset === 'cover' || asset === 'thumbnail') return 'cover';
+  if (asset === 'infographic') return 'infographic';
+  if (asset === 'internal' || asset === 'external'
+      || asset === 'service_h1' || asset === 'service_body'
+      || asset === 'category_industry') return 'page';
+  if (asset === 'generic') return 'generic';
+  return 'generic';
+}
+
+// Selection summary computed at modal-open time: how many images,
+// across how many clusters, mapped to which prompt groups.
+function summariseSelection() {
+  let imgs = 0, cls = 0;
+  const groupsSeen = new Set();
+  for (const [cid, set] of selection.entries()) {
+    if (!set || set.size === 0) continue;
+    cls++;
+    imgs += set.size;
+    const cluster = clusterById(cid);
+    if (!cluster) continue;
+    const wantedIds = new Set(set);
+    for (const img of cluster.images) {
+      if (!wantedIds.has(img.id)) continue;
+      groupsSeen.add(promptGroupForAsset(img.asset));
+    }
+  }
+  return { imgs, cls, groups: [...groupsSeen] };
+}
+
+// We render every group the API surfaces and let the operator browse
+// any of them; the ones in groupsInUse get a "used by this run"
+// pill so the relevant prompts stand out at a glance.
+let GENERATE_DEFAULTS = null; // populated on first modal open: [{group,label,system,user},…]
+
+async function openGenerateConfirm() {
+  const { imgs, cls, groups } = summariseSelection();
+  if (imgs === 0) return;
+  document.getElementById('gen-summary').textContent =
+    imgs + ' image' + (imgs === 1 ? '' : 's') +
+    ' across ' + cls + ' cluster' + (cls === 1 ? '' : 's');
+
+  const overlay = document.getElementById('gen-overlay');
+  overlay.classList.add('open');
+
+  const host = document.getElementById('gen-prompts');
+  if (!GENERATE_DEFAULTS) {
+    host.innerHTML = '<div class="sub" id="gen-prompts-loading"><span class="spinner"></span> Loading prompts…</div>';
+    try {
+      const r = await fetch('/api/prompts');
+      const j = await r.json();
+      GENERATE_DEFAULTS = (j && j.groups) || [];
+    } catch (err) {
+      host.innerHTML = '<div class="banner err">Failed to load prompts: ' + (err && err.message ? err.message : String(err)) + '</div>';
+      return;
+    }
+  }
+  renderGeneratePrompts(groups);
+}
+function genBackdrop(ev) { if (ev.target === ev.currentTarget) closeGenerateConfirm(); }
+function closeGenerateConfirm() { document.getElementById('gen-overlay').classList.remove('open'); }
+
+function renderGeneratePrompts(usedGroups) {
+  const host = document.getElementById('gen-prompts');
+  const used = new Set(usedGroups);
+  // Sort: used groups first, then the rest.
+  const sorted = GENERATE_DEFAULTS.slice().sort((a, b) => {
+    const au = used.has(a.group), bu = used.has(b.group);
+    return (bu ? 1 : 0) - (au ? 1 : 0);
+  });
+  host.innerHTML = sorted.map((p) => {
+    const isUsed = used.has(p.group);
+    return ''
+      + '<details class="gen-group" data-group="' + p.group + '" ' + (isUsed ? '' : '') + '>'
+      + '  <summary>'
+      + '    <strong>' + escapeHtmlBasic(p.label) + '</strong>'
+      + (isUsed ? ' <span class="pill internal" style="font-size:10px;margin-left:6px">used by this run</span>'
+                : ' <span class="sub" style="margin-left:6px">(not used by this run)</span>')
+      + '    <span class="sub gen-edit-flag" style="margin-left:8px;display:none;color:var(--brand)">edited</span>'
+      + '  </summary>'
+      + '  <div style="padding:10px 12px 12px">'
+      + '    <label style="font-size:11.5px;color:var(--ink-muted)">System prompt</label>'
+      + '    <textarea class="gen-system json-edit" data-default="' + escapeHtmlBasic(p.system) + '" oninput="genFlagEdit(this)">' + escapeHtmlBasic(p.system) + '</textarea>'
+      + '    <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+      + '      <button type="button" class="ghost" onclick="genResetSystem(this)">Reset to default</button>'
+      + '      <span class="sub gen-status"></span>'
+      + '    </div>'
+      + '  </div>'
+      + '</details>';
+  }).join('');
+  recountGenOverrides();
+}
+function escapeHtmlBasic(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function genFlagEdit(ta) {
+  const det = ta.closest('details');
+  if (!det) return;
+  const flag = det.querySelector('.gen-edit-flag');
+  const dirty = ta.value !== ta.dataset.default;
+  if (flag) flag.style.display = dirty ? 'inline' : 'none';
+  recountGenOverrides();
+}
+function genResetSystem(btn) {
+  const det = btn.closest('details');
+  if (!det) return;
+  const ta = det.querySelector('.gen-system');
+  if (!ta) return;
+  // The dataset.default attribute went through HTML entity encoding;
+  // textContent of a temp div decodes it back to the original string.
+  const decoder = document.createElement('div');
+  decoder.innerHTML = ta.dataset.default;
+  ta.value = decoder.textContent || '';
+  genFlagEdit(ta);
+}
+function recountGenOverrides() {
+  let n = 0;
+  for (const ta of document.querySelectorAll('#gen-prompts .gen-system')) {
+    const decoder = document.createElement('div');
+    decoder.innerHTML = ta.dataset.default;
+    const def = decoder.textContent || '';
+    if (ta.value !== def) n++;
+  }
+  const lbl = document.getElementById('gen-overrides-count');
+  lbl.textContent = n === 0 ? '' : n + ' prompt' + (n === 1 ? '' : 's') + ' overridden for this run';
+}
+
+async function genConfirmSubmit() {
   const items = [];
   for (const [cid, set] of selection.entries()) {
-    if (set.size === 0) continue;
+    if (!set || set.size === 0) continue;
     items.push({ cluster_id: cid, image_ids: [...set] });
   }
   if (items.length === 0) return;
+
+  // Collect only the prompt groups the operator actually edited. An
+  // unmodified textarea is identity-equal to its default — we ship
+  // those as "no override".
+  const overrides = {};
+  for (const det of document.querySelectorAll('#gen-prompts .gen-group')) {
+    const ta = det.querySelector('.gen-system');
+    if (!ta) continue;
+    const decoder = document.createElement('div');
+    decoder.innerHTML = ta.dataset.default;
+    const def = decoder.textContent || '';
+    if (ta.value !== def && ta.value.trim().length > 0) {
+      overrides[det.dataset.group] = { system: ta.value };
+    }
+  }
 
   const fd = new FormData();
   fd.set('client', SLUG);
@@ -2324,11 +2509,22 @@ async function runRegen() {
     for (const id of it.image_ids) fd.append('image_id', id);
   }
   fd.set('provider', 'replicate');
+  if (Object.keys(overrides).length > 0) {
+    fd.set('prompt_overrides', JSON.stringify(overrides));
+  }
+
+  const btn = document.getElementById('gen-submit-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…'; }
   const r = await fetch('/regen', { method: 'POST', body: fd });
   if (r.redirected) { window.location.href = r.url; return; }
   const t = await r.text();
   alert(t || 'regen submitted');
+  if (btn) { btn.disabled = false; btn.innerHTML = 'Generate →'; }
 }
+
+// Legacy entry point — anything still wired to runRegen() now goes
+// through the confirm modal first.
+function runRegen() { openGenerateConfirm(); }
 
 refreshTotals();
 </script>`;
@@ -2890,6 +3086,11 @@ function startRegen(opts: {
    *  URL if it has succeeded since — recovers predictions that
    *  completed after a previous timeout. */
   resumePredictionId?: string;
+  /** Path to a JSON file with per-run system+user template
+   *  overrides keyed by prompt group ("cover" | "infographic" |
+   *  "page" | "generic"). Forwarded to the CLI's
+   *  --prompt-overrides-file flag. */
+  promptOverridesFile?: string;
 }): RunState {
   const id = randomUUID().slice(0, 8);
   const args = ["tsx", "src/cli.ts", "regen", "--client", opts.client, "--run-id", id];
@@ -2904,6 +3105,7 @@ function startRegen(opts: {
   if (opts.promptOverrideFile) args.push("--prompt-override-file", opts.promptOverrideFile);
   if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
   if (opts.resumePredictionId) args.push("--resume-prediction-id", opts.resumePredictionId);
+  if (opts.promptOverridesFile) args.push("--prompt-overrides-file", opts.promptOverridesFile);
 
   const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
 
@@ -2959,6 +3161,44 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     .map((s) => s.trim())
     .filter((s) => validTypes.has(s));
   const pageTypeArg = ptList.length > 0 ? ptList.join(",") : "blog";
+
+  // prompt_overrides arrives as a JSON-encoded string from the
+  // workspace's "Are you sure you want to generate?" modal. Shape:
+  //   { "<group>": { "system"?: string, "user"?: string }, … }
+  // where <group> ∈ "cover" | "infographic" | "page" | "generic".
+  // We validate, then drop to disk as a temp file for the CLI to
+  // re-read (matching how prompt-override-file / extra-instructions-
+  // file already work — keeps multi-line text away from argv).
+  let promptOverridesFile: string | undefined;
+  const overridesRaw = (body.get("prompt_overrides") ?? "").trim();
+  if (overridesRaw.length > 0) {
+    try {
+      const parsed = JSON.parse(overridesRaw) as Record<string, unknown>;
+      // Whitelist groups; ignore anything else so a poisoned payload
+      // can't reach the CLI.
+      const allowed = new Set(["cover", "infographic", "page", "generic"]);
+      const cleaned: Record<string, { system?: string; user?: string }> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (!allowed.has(k) || !v || typeof v !== "object") continue;
+        const inner = v as Record<string, unknown>;
+        const entry: { system?: string; user?: string } = {};
+        if (typeof inner.system === "string" && inner.system.trim().length > 0) entry.system = inner.system;
+        if (typeof inner.user   === "string" && inner.user.trim().length   > 0) entry.user   = inner.user;
+        if (Object.keys(entry).length > 0) cleaned[k] = entry;
+      }
+      if (Object.keys(cleaned).length > 0) {
+        const tmpDir = path.resolve(process.cwd(), "out");
+        await fs.mkdir(tmpDir, { recursive: true });
+        promptOverridesFile = path.join(tmpDir, `prompt-overrides-${Date.now()}.json`);
+        await fs.writeFile(promptOverridesFile, JSON.stringify(cleaned), "utf8");
+      }
+    } catch (err) {
+      process.stderr.write(
+        `regenPostHandler: ignoring malformed prompt_overrides: ${(err as Error).message}\n`,
+      );
+    }
+  }
+
   const state = startRegen({
     client,
     clusterIds,
@@ -2969,6 +3209,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     assetTypes: body.get("asset_types") || undefined,
     pageType: pageTypeArg,
     provider: body.get("provider") || undefined,
+    promptOverridesFile,
   });
   res.writeHead(303, { location: `/runs/${state.id}` });
   res.end();
@@ -4545,6 +4786,20 @@ export function startWebServer(port: number): void {
         } catch (err) {
           return sendJson(res, 500, { error: (err as Error).message });
         }
+      }
+      // Returns the current system+user template text for each prompt
+      // group ("cover" | "infographic" | "page" | "generic"), so the
+      // workspace's confirm-and-edit modal can pre-populate textareas
+      // with what would otherwise run.
+      if (method === "GET" && p === "/api/prompts") {
+        const { defaultTemplatesForGroup, promptGroupLabel } = await import("./buildPrompt.js");
+        const groups = ["cover", "infographic", "page", "generic"] as const;
+        const out = groups.map((g) => ({
+          group: g,
+          label: promptGroupLabel(g),
+          ...defaultTemplatesForGroup(g),
+        }));
+        return sendJson(res, 200, { groups: out });
       }
       if (method === "GET" && p === "/flows") return await flowsPage(res);
       if (method === "GET" && p === "/runs") return runListPage(res);

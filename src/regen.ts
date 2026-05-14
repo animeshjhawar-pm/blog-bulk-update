@@ -15,6 +15,7 @@ import {
   applyAdditionalInstructions,
   stripAdditionalInstructions,
   extractAdditionalInstructions,
+  type PromptOverrides,
 } from "./buildPrompt.js";
 import { generate, type Provider } from "./generate.js";
 import { downloadImage } from "./rehost.js";
@@ -78,6 +79,16 @@ export interface RegenOptions {
    * image regen sets this from the parent CSV row's prediction_id.
    */
   resumePredictionId?: string;
+  /**
+   * Per-run system+user prompt template overrides keyed by prompt
+   * group ("cover" | "infographic" | "page" | "generic"). When
+   * supplied, buildImagePrompt uses these instead of the defaults
+   * baked into prompts/*.ts — but ONLY for this run. The disk-level
+   * prompt files are never touched. Used by the workspace UI's
+   * "Are you sure you want to generate?" confirm modal so the
+   * operator can tweak a prompt right before a run.
+   */
+  promptOverrides?: PromptOverrides;
 }
 
 /**
@@ -271,6 +282,7 @@ async function processOne(args: {
         graphicToken,
         clientHomepageUrl: project.url ?? "",
         projectId: project.id,
+        promptOverrides: options.promptOverrides,
       });
       // buildImagePrompt already prepended the saved-token directives.
       // When per-run extras are present, we re-apply with the merged

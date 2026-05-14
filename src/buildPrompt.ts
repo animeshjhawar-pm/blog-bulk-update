@@ -13,30 +13,92 @@ import { EXTERNAL_SYSTEM_PROMPT, EXTERNAL_USER_TEMPLATE } from "./prompts/extern
 import { GENERIC_SYSTEM_PROMPT, GENERIC_USER_TEMPLATE } from "./prompts/generic.js";
 import type { AssetType } from "./pageInfo.js";
 
-function templatesFor(asset: AssetType): { system: string; user: string } {
+/**
+ * Logical "prompt family" that an asset type maps to. Several asset
+ * types share the same underlying system+user templates (e.g.
+ * internal/external/service_h1/service_body/category_industry all
+ * route to the page prompt pair), so the override surface is keyed
+ * by group rather than by raw asset type — fewer duplicate textareas
+ * in the operator's confirm-and-edit modal.
+ */
+export type PromptGroup = "cover" | "infographic" | "page" | "generic";
+
+export function promptGroupFor(asset: AssetType): PromptGroup {
   switch (asset) {
+    case "cover":
+    case "thumbnail":
+      return "cover";
+    case "infographic":
+      return "infographic";
+    case "internal":
+    case "external":
+    case "service_h1":
+    case "service_body":
+    case "category_industry":
+      return "page";
+    case "generic":
+      return "generic";
+  }
+}
+
+/**
+ * The "as-shipped" prompt pair for a given group. Used by both the
+ * /api/prompts endpoint (to surface current text to the modal) and
+ * templatesForWithOverride (to fall back when a group has no
+ * operator override for this run).
+ */
+export function defaultTemplatesForGroup(
+  group: PromptGroup,
+): { system: string; user: string } {
+  switch (group) {
+    case "cover":
+      return { system: BLOG_COVER_SYSTEM_PROMPT_NEW, user: BLOG_COVER_USER_TEMPLATE_NEW };
     case "infographic":
       return {
         system: GENERATE_INFOGRAPHIC_SYSTEM_PROMPT_NEW,
         user: GENERATE_INFOGRAPHIC_USER_TEMPLATE_NEW,
       };
-    case "cover":
-    case "thumbnail":
-      return { system: BLOG_COVER_SYSTEM_PROMPT_NEW, user: BLOG_COVER_USER_TEMPLATE_NEW };
-    case "internal":
+    case "page":
       return { system: INTERNAL_SYSTEM_PROMPT, user: INTERNAL_USER_TEMPLATE };
-    case "external":
-      return { system: EXTERNAL_SYSTEM_PROMPT, user: EXTERNAL_USER_TEMPLATE };
     case "generic":
       return { system: GENERIC_SYSTEM_PROMPT, user: GENERIC_USER_TEMPLATE };
-    // Service + category assets all route to the generic page-image
-    // prompt pair — same shape as `internal`. The asset_type is still
-    // preserved in the CSV for downstream observability.
-    case "service_h1":
-    case "service_body":
-    case "category_industry":
-      return { system: INTERNAL_SYSTEM_PROMPT, user: INTERNAL_USER_TEMPLATE };
   }
+}
+
+/** Human-readable label for the modal heading. */
+export function promptGroupLabel(group: PromptGroup): string {
+  switch (group) {
+    case "cover":       return "Blog cover & thumbnail";
+    case "infographic": return "Blog infographic / inline images";
+    case "page":        return "Service H1, service body, category, internal & external";
+    case "generic":     return "Generic page image";
+  }
+}
+
+/**
+ * Per-run prompt overrides keyed by group. Either system, user, or
+ * both may be omitted; missing fields fall back to the defaults. An
+ * empty string is treated as "no override" (we don't let an
+ * accidentally-cleared textarea silently send an empty prompt to
+ * Claude — that would explode).
+ */
+export type PromptOverrides = Partial<Record<PromptGroup, {
+  system?: string;
+  user?: string;
+}>>;
+
+function templatesForWithOverride(
+  asset: AssetType,
+  overrides: PromptOverrides | undefined,
+): { system: string; user: string } {
+  const group = promptGroupFor(asset);
+  const fallback = defaultTemplatesForGroup(group);
+  const o = overrides?.[group];
+  if (!o) return fallback;
+  return {
+    system: (o.system && o.system.trim().length > 0) ? o.system : fallback.system,
+    user:   (o.user   && o.user.trim().length   > 0) ? o.user   : fallback.user,
+  };
 }
 
 function extractAdditionalInstructions(token: unknown): string | null {
@@ -85,6 +147,13 @@ export interface BuildPromptParams {
   /** Optional cover/thumbnail extras. Undefined fields collapse to "". */
   subtitle?: string;
   categoryLabel?: string;
+  /**
+   * Per-run system+user prompt overrides keyed by prompt group. When
+   * the asset's group has an override, those texts replace the
+   * defaults baked into prompts/*.ts — but only for THIS call.
+   * Empty / whitespace-only fields are treated as "no override".
+   */
+  promptOverrides?: PromptOverrides;
 }
 
 export interface BuildPromptResult {
@@ -153,7 +222,7 @@ export { extractAdditionalInstructions };
 
 export async function buildImagePrompt(params: BuildPromptParams): Promise<BuildPromptResult> {
   const { asset } = params;
-  const { system, user } = templatesFor(asset);
+  const { system, user } = templatesForWithOverride(asset, params.promptOverrides);
 
   // The operator's additional_instructions are NOT injected into the
   // Claude system prompt anymore — Claude is left to do its job, and

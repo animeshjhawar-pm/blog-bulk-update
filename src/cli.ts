@@ -158,6 +158,10 @@ program
     "--resume-prediction-id <id>",
     "before generating, poll Replicate for this prediction id. If it has succeeded, use that URL and skip the new generation (recovers predictions that completed after a prior timeout).",
   )
+  .option(
+    "--prompt-overrides-file <path>",
+    "JSON file with per-run system+user template overrides keyed by prompt group (cover/infographic/page/generic). Shape: { \"<group>\": { \"system\"?: string, \"user\"?: string } }. Used by the workspace's confirm modal; never mutates prompts/*.ts.",
+  )
   .action(
     async (opts: {
       client: string;
@@ -174,6 +178,7 @@ program
       promptOverrideFile?: string;
       extraInstructionsFile?: string;
       resumePredictionId?: string;
+      promptOverridesFile?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
@@ -184,13 +189,24 @@ program
 
         let promptOverride: string | undefined;
         let extraInstructions: string | undefined;
-        if (opts.promptOverrideFile || opts.extraInstructionsFile) {
+        let promptOverrides: import("./buildPrompt.js").PromptOverrides | undefined;
+        if (opts.promptOverrideFile || opts.extraInstructionsFile || opts.promptOverridesFile) {
           const fs = await import("node:fs/promises");
           if (opts.promptOverrideFile) {
             promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
           }
           if (opts.extraInstructionsFile) {
             extraInstructions = (await fs.readFile(opts.extraInstructionsFile, "utf8")).trim();
+          }
+          if (opts.promptOverridesFile) {
+            const raw = await fs.readFile(opts.promptOverridesFile, "utf8");
+            try {
+              promptOverrides = JSON.parse(raw);
+            } catch (err) {
+              process.stderr.write(
+                `regen: ignoring --prompt-overrides-file (invalid JSON): ${(err as Error).message}\n`,
+              );
+            }
           }
         }
 
@@ -219,6 +235,7 @@ program
           promptOverride,
           extraInstructions,
           resumePredictionId: opts.resumePredictionId,
+          promptOverrides,
         });
       } catch (err) {
         process.stderr.write(
