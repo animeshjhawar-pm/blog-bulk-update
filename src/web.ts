@@ -2687,6 +2687,78 @@ async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
   return applyImageHandler(req, res);
 }
 
+/**
+ * GET /api/apply/probe — verify S3 credentials & write access.
+ * Does a HeadBucket + small PutObject + DeleteObject against a
+ * sentinel key under `_probe/`. Returns the AWS error verbatim when
+ * the credentials are missing, wrong, or lack PutObject permission
+ * on the bucket. Use this immediately after dropping creds into the
+ * env to confirm everything is wired before running a real apply.
+ */
+async function applyProbeHandler(_req: IncomingMessage, res: ServerResponse) {
+  const { HeadBucketCommand, PutObjectCommand, DeleteObjectCommand, S3Client } = await import("@aws-sdk/client-s3");
+  const env = (await import("./env.js")).loadEnv();
+  const bucket = env.S3_CONTENT_BUCKET;
+  if (!bucket) return sendJson(res, 500, { ok: false, step: "config", error: "S3_CONTENT_BUCKET not set" });
+
+  const haveExplicit = !!(env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY);
+  const client = new S3Client({
+    region: env.AWS_REGION ?? "us-east-1",
+    credentials: haveExplicit
+      ? { accessKeyId: env.AWS_ACCESS_KEY_ID!, secretAccessKey: env.AWS_SECRET_ACCESS_KEY! }
+      : undefined,
+  });
+  const probeKey = `_probe/credential-check-${Date.now()}.txt`;
+
+  try {
+    await client.send(new HeadBucketCommand({ Bucket: bucket }));
+  } catch (err) {
+    const e = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+    return sendJson(res, 200, {
+      ok: false,
+      step: "HeadBucket",
+      error: e.message,
+      aws_error_name: e.name,
+      http_status: e.$metadata?.httpStatusCode,
+      bucket,
+      credentials_source: haveExplicit ? "env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)" : "default credential chain",
+      region: env.AWS_REGION ?? "us-east-1",
+    });
+  }
+  try {
+    await client.send(new PutObjectCommand({
+      Bucket: bucket, Key: probeKey, Body: Buffer.from("probe"),
+      ContentType: "text/plain", CacheControl: "no-store",
+    }));
+  } catch (err) {
+    const e = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+    return sendJson(res, 200, {
+      ok: false,
+      step: "PutObject",
+      error: e.message,
+      aws_error_name: e.name,
+      http_status: e.$metadata?.httpStatusCode,
+      bucket,
+      probe_key: probeKey,
+      hint: e.name === "AccessDenied"
+        ? `The credentials reach S3 but lack PutObject on s3://${bucket}/${probeKey}. Grant s3:PutObject + s3:DeleteObject on arn:aws:s3:::${bucket}/website/*/assets/* (and the probe path) on the IAM principal.`
+        : undefined,
+    });
+  }
+  // Best-effort cleanup. A failure here doesn't fail the probe.
+  try {
+    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: probeKey }));
+  } catch { /* leave the probe object; tiny and harmless */ }
+
+  return sendJson(res, 200, {
+    ok: true,
+    bucket,
+    region: env.AWS_REGION ?? "us-east-1",
+    credentials_source: haveExplicit ? "env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)" : "default credential chain",
+    message: `s3://${bucket} is reachable and PutObject + DeleteObject succeeded. Apply-to-S3 is ready to run.`,
+  });
+}
+
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -3814,6 +3886,7 @@ ${clusterSections}
   </div>
   <div class="right">
     <a class="btn" id="download-all-btn" href="/runs/${esc(id)}/download.zip" title="Stream a ZIP of every generated image, organised by cluster topic. Images are not re-encoded." download>⬇ Download all (ZIP)</a>
+    <button id="verify-s3-btn" onclick="verifyS3Access()" title="HeadBucket + tiny test PutObject + DeleteObject against gw-content-store. Use this right after dropping AWS credentials into the env to confirm Apply-to-S3 is wired correctly.">🔒 Verify S3 access</button>
     <button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
     <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Apply selected →</button>
   </div>
@@ -4070,6 +4143,58 @@ function applyBusyGuard() {
     return true;
   }
   return false;
+}
+
+// Hits /api/apply/probe and shows the result in a modal — the
+// fastest way to confirm AWS credentials are wired correctly the
+// moment they land in the env. Surfaces the exact AWS error name
+// (AccessDenied / NoSuchBucket / InvalidAccessKeyId / …) so the
+// fix is obvious.
+async function verifyS3Access() {
+  const btn = document.getElementById('verify-s3-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '… probing'; }
+  let payload;
+  try {
+    const r = await fetch('/api/apply/probe');
+    payload = await r.json();
+  } catch (err) {
+    payload = { ok: false, step: 'fetch', error: err && err.message ? err.message : String(err) };
+  }
+  if (btn) { btn.disabled = false; btn.textContent = '🔒 Verify S3 access'; }
+  showS3ProbeModal(payload);
+}
+
+function showS3ProbeModal(p) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:10002;';
+  const badge = p.ok
+    ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">READY</span>'
+    : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">' + escapeHtml(p.step || 'FAIL') + ' FAILED</span>';
+  const rows = [
+    ['bucket', p.bucket],
+    ['region', p.region],
+    ['credentials', p.credentials_source],
+    ['aws error', p.aws_error_name],
+    ['http status', p.http_status],
+    ['probe key', p.probe_key],
+    ['error', p.error],
+    ['hint', p.hint],
+    ['message', p.message],
+  ].filter(([, v]) => v != null && v !== '')
+   .map(([k, v]) => '<div style="display:grid;grid-template-columns:110px 1fr;gap:10px;padding:5px 0;border-bottom:1px dashed #eee;font-family:ui-monospace,Menlo,monospace;font-size:12px;"><div style="color:#666;">' + k + '</div><div style="word-break:break-all;">' + escapeHtml(String(v)) + '</div></div>')
+   .join('');
+  overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:640px;width:92%;max-height:86vh;border-radius:8px;padding:22px 24px;box-shadow:0 18px 48px rgba(0,0,0,0.32);font-family:ui-sans-serif,system-ui,sans-serif;overflow:auto;">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;">'
+    + '<div style="font-weight:600;font-size:15px;display:flex;gap:10px;align-items:center;">S3 access probe ' + badge + '</div>'
+    + '<button id="s3p-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button>'
+    + '</div>'
+    + rows
+    + (p.ok ? '<div style="margin-top:14px;font-size:12px;color:#0a7;">Apply-to-S3 will now overwrite the existing media_registry keys in place.</div>'
+            : '<div style="margin-top:14px;font-size:12px;color:#92400e;">Fix the issue above, then click Verify again. Apply-to-S3 will fail with the same error until this probe passes.</div>')
+    + '</div>';
+  document.body.appendChild(overlay);
+  overlay.querySelector('#s3p-close').addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 }
 
 // Counts cards eligible for bulk apply. Cover/thumbnail/synthetic
@@ -5131,6 +5256,7 @@ export function startWebServer(port: number): void {
       if (method === "POST" && p === "/api/apply/image")   return await applyImageHandler(req, res);
       if (method === "POST" && p === "/api/apply/cluster") return await applyClusterHandler(req, res);
       if (method === "POST" && p === "/api/apply/run")     return await applyRunHandler(req, res);
+      if (method === "GET"  && p === "/api/apply/probe")   return await applyProbeHandler(req, res);
       if (method === "GET" && p === "/api/projects/search") {
         try {
           loadEnv();

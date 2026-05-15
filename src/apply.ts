@@ -244,7 +244,17 @@ export async function applyOne(args: {
         ),
       );
     } catch (err) {
-      return fail(`S3 overwrite failed: ${(err as Error).message}`);
+      const e = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+      const code = e.name ? `[${e.name}] ` : "";
+      const status = e.$metadata?.httpStatusCode ? ` (HTTP ${e.$metadata.httpStatusCode})` : "";
+      const hint = e.name === "AccessDenied"
+        ? " — IAM principal needs s3:PutObject on this prefix. Click 'Verify S3 access' to run a sentinel probe."
+        : e.name === "InvalidAccessKeyId" || e.name === "SignatureDoesNotMatch"
+          ? " — credentials are wrong; check AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the env."
+          : e.name === "NoSuchBucket"
+            ? ` — bucket '${bucket}' does not exist in region ${env.AWS_REGION ?? "us-east-1"}.`
+            : "";
+      return fail(`S3 overwrite failed: ${code}${e.message}${status}${hint}`);
     }
     push(
       "PUT to S3",
