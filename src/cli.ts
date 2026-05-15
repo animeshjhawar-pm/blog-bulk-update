@@ -4,6 +4,9 @@ import { loadEnvOrExit } from "./env.js";
 import { closePool, lookupProjectById } from "./db.js";
 import { runExtractTokenCli } from "./extractToken.js";
 import { runRegen } from "./regen.js";
+import { runUpload } from "./upload.js";
+import { runRepoint } from "./repoint.js";
+import { runRevert } from "./revert.js";
 import { inspectForSlug } from "./inspectPageInfo.js";
 import { findClient, clientSlugList } from "./clients.js";
 import { startWebServer } from "./web.js";
@@ -240,6 +243,200 @@ program
       } catch (err) {
         process.stderr.write(
           `regen failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+        await closePool();
+      }
+    },
+  );
+
+/**
+ * Load a Gushwork bearer token from a file (default ~/.gushwork_token)
+ * and reject early if it's missing, empty, or an already-expired JWT —
+ * so the operator finds out before every API row 401s. Shared by the
+ * `upload` and `repoint` commands.
+ */
+async function loadTokenOrExit(tokenFileOpt?: string): Promise<string> {
+  const os = await import("node:os");
+  const fsp = await import("node:fs/promises");
+  const tokenFile = tokenFileOpt ?? `${os.homedir()}/.gushwork_token`;
+  let token: string;
+  try {
+    token = (await fsp.readFile(tokenFile, "utf8")).trim();
+  } catch {
+    process.stderr.write(
+      `error: token file not found: ${tokenFile}\n` +
+        `Put a fresh token there (1h TTL) from https://platform.gushwork.ai/api/auth/token\n`,
+    );
+    process.exit(2);
+  }
+  if (!token) {
+    process.stderr.write(`error: token file ${tokenFile} is empty\n`);
+    process.exit(2);
+  }
+  try {
+    const payload = JSON.parse(
+      Buffer.from(token.split(".")[1] ?? "", "base64").toString("utf8"),
+    ) as { exp?: number };
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      process.stderr.write(
+        `error: token in ${tokenFile} is EXPIRED (exp ${new Date(payload.exp * 1000).toISOString()}). Fetch a fresh one.\n`,
+      );
+      process.exit(2);
+    }
+  } catch {
+    /* not a decodable JWT — let the API reject it */
+  }
+  return token;
+}
+
+program
+  .command("upload")
+  .description(
+    "Upload every generated image in a regen CSV through the Gushwork media API; " +
+      "emit a mapping CSV (old image_id -> new image_id / refined key / CDN urls). " +
+      "Does NOT touch page_info.",
+  )
+  .requiredOption("--csv <path>", "regen CSV to consume (out/<slug>-<utc>.csv)")
+  .option(
+    "--token-file <path>",
+    "file holding a FRESH bearer token (1h TTL; from https://platform.gushwork.ai/api/auth/token). Default: ~/.gushwork_token",
+  )
+  .option("--out <path>", "mapping CSV output path (default: alongside the input CSV)")
+  .option("--base-url <url>", "override the API base (default: prod seo-v2 project base)")
+  .option("--no-refine", "send refine=false to the presign call (default: refine=true)")
+  .option("--fail-fast", "abort the whole run on the first row failure (default: record + continue)", false)
+  .option("--concurrency <n>", "parallel uploads", "4")
+  .action(
+    async (opts: {
+      csv: string;
+      tokenFile?: string;
+      out?: string;
+      baseUrl?: string;
+      refine: boolean;
+      failFast: boolean;
+      concurrency: string;
+    }) => {
+      try {
+        const token = await loadTokenOrExit(opts.tokenFile);
+        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 4);
+        await runUpload({
+          csvPath: opts.csv,
+          token,
+          baseUrl: opts.baseUrl,
+          refine: opts.refine !== false,
+          failFast: Boolean(opts.failFast),
+          concurrency,
+          outPath: opts.out,
+        });
+      } catch (err) {
+        process.stderr.write(
+          `upload failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+        await closePool();
+      }
+    },
+  );
+
+program
+  .command("repoint")
+  .description(
+    "Per-cluster: rewrite page_info so each cluster references the NEW images " +
+      "from an upload mapping CSV. DRY-RUN by default (preview + backup, no write); " +
+      "pass --apply to actually PUT.",
+  )
+  .requiredOption("--csv <path>", "upload mapping CSV (output of the `upload` command)")
+  .option(
+    "--token-file <path>",
+    "file holding a FRESH bearer token (1h TTL). Default: ~/.gushwork_token. Only needed with --apply.",
+  )
+  .option("--apply", "actually PUT the new page_info (default: dry-run only)", false)
+  .option("--out <path>", "report CSV output path (default: alongside the input CSV)")
+  .option("--base-url <url>", "override the API base (default: prod seo-v2 project base)")
+  .option("--fail-fast", "abort the whole run on the first skipped/failed cluster", false)
+  .option("--concurrency <n>", "parallel clusters", "4")
+  .action(
+    async (opts: {
+      csv: string;
+      tokenFile?: string;
+      apply: boolean;
+      out?: string;
+      baseUrl?: string;
+      failFast: boolean;
+      concurrency: string;
+    }) => {
+      try {
+        // Token is only required for a real write. Dry-run needs no API.
+        const token = opts.apply ? await loadTokenOrExit(opts.tokenFile) : "";
+        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 4);
+        await runRepoint({
+          csvPath: opts.csv,
+          token,
+          baseUrl: opts.baseUrl,
+          apply: Boolean(opts.apply),
+          failFast: Boolean(opts.failFast),
+          concurrency,
+          outPath: opts.out,
+        });
+      } catch (err) {
+        process.stderr.write(
+          `repoint failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+        await closePool();
+      }
+    },
+  );
+
+program
+  .command("revert")
+  .description(
+    "Restore a cluster's page_info from a repoint backup. DRY-RUN by " +
+      "default; --apply to PUT. Snapshots current page_info first so the " +
+      "revert is itself reversible.",
+  )
+  .option("--file <path>", "revert exactly this backup JSON (out/repoint-backups/<cid>-<stamp>.json)")
+  .option("--cluster <id>", "revert the LATEST backup for this cluster id")
+  .option("--all", "revert the latest backup for every cluster in the backups dir", false)
+  .option("--apply", "actually PUT the prior page_info (default: dry-run only)", false)
+  .option("--token-file <path>", "fresh bearer token file (only needed with --apply). Default: ~/.gushwork_token")
+  .option("--backups-dir <path>", "where repoint backups live (default: out/repoint-backups)")
+  .option("--out <path>", "report CSV output path")
+  .option("--base-url <url>", "override the API base")
+  .option("--fail-fast", "abort on the first failed/skipped revert", false)
+  .option("--concurrency <n>", "parallel reverts", "4")
+  .action(
+    async (opts: {
+      file?: string;
+      cluster?: string;
+      all: boolean;
+      apply: boolean;
+      tokenFile?: string;
+      backupsDir?: string;
+      out?: string;
+      baseUrl?: string;
+      failFast: boolean;
+      concurrency: string;
+    }) => {
+      try {
+        const token = opts.apply ? await loadTokenOrExit(opts.tokenFile) : "";
+        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 4);
+        await runRevert({
+          file: opts.file,
+          cluster: opts.cluster,
+          all: Boolean(opts.all),
+          apply: Boolean(opts.apply),
+          token,
+          baseUrl: opts.baseUrl,
+          backupsDir: opts.backupsDir,
+          concurrency,
+          failFast: Boolean(opts.failFast),
+          outPath: opts.out,
+        });
+      } catch (err) {
+        process.stderr.write(
+          `revert failed: ${err instanceof Error ? err.message : String(err)}\n`,
         );
         process.exitCode = 1;
         await closePool();
