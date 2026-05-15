@@ -4053,7 +4053,7 @@ function paintCard(imageId, opts) {
 // would-PUT targets) so the operator can verify the plan before any
 // real write goes out. When write creds land, flip DRY_RUN to false
 // here and the same trace will be shown after the actual PUT.
-const APPLY_DRY_RUN = true;
+const APPLY_DRY_RUN = false;
 
 // Run-level mutex. Only ONE apply op (single/cluster/run/picked) can
 // be in flight at a time — protects against double-clicks and against
