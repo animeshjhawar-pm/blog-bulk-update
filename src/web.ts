@@ -33,6 +33,9 @@ import {
 import { promises as fs } from "node:fs";
 import { parse as csvParse } from "csv-parse/sync";
 import { uploadBlogImage } from "./s3.js";
+import { uploadRows } from "./upload.js";
+import { repointMappingRows, type MapRow } from "./repoint.js";
+import { latestBackupForCluster, revertBackups, DEFAULT_BACKUPS_DIR } from "./revert.js";
 // archiver is CommonJS. Node's ESM loader refuses `import archiver
 // from "archiver"` because the CJS module has no static `default`
 // export — so we go through `createRequire` to load it. The types
@@ -2594,13 +2597,170 @@ async function readApplyBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// In-memory bearer-token store (operator pastes a fresh 1h token in the
+// run-page panel; held in process memory until it expires or the
+// process restarts — never written to disk, never echoed back in full).
+// Decision: server-side in-memory, no auth gate (operator's call).
+// ────────────────────────────────────────────────────────────────────────
+interface ApiTokenState { value: string; exp: number | null; email: string | null; setAt: number }
+let API_TOKEN: ApiTokenState | null = null;
+
+function decodeJwt(tok: string): { exp: number | null; email: string | null } {
+  try {
+    const p = JSON.parse(Buffer.from(tok.split(".")[1] ?? "", "base64").toString("utf8")) as {
+      exp?: unknown;
+      email?: unknown;
+    };
+    return {
+      exp: typeof p.exp === "number" ? p.exp : null,
+      email: typeof p.email === "string" ? p.email : null,
+    };
+  } catch {
+    return { exp: null, email: null };
+  }
+}
+
+function apiTokenStatus() {
+  if (!API_TOKEN) return { present: false as const };
+  const expired = API_TOKEN.exp != null && API_TOKEN.exp * 1000 < Date.now();
+  return {
+    present: true as const,
+    expired,
+    email: API_TOKEN.email,
+    expires_at: API_TOKEN.exp ? new Date(API_TOKEN.exp * 1000).toISOString() : null,
+    set_at: new Date(API_TOKEN.setAt).toISOString(),
+  };
+}
+
+function requireApiToken(): { ok: true; token: string } | { ok: false; error: string } {
+  if (!API_TOKEN)
+    return { ok: false, error: "no bearer token set — paste a fresh token in the token panel first" };
+  if (API_TOKEN.exp != null && API_TOKEN.exp * 1000 < Date.now())
+    return {
+      ok: false,
+      error: `stored token expired at ${new Date(API_TOKEN.exp * 1000).toISOString()} — paste a fresh one`,
+    };
+  return { ok: true, token: API_TOKEN.value };
+}
+
+async function tokenSetHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { token?: string } | null;
+  if (!body || typeof body.token !== "string" || !body.token.trim())
+    return sendJson(res, 400, { error: "body.token required" });
+  const tok = body.token.trim();
+  const { exp, email } = decodeJwt(tok);
+  if (exp != null && exp * 1000 < Date.now())
+    return sendJson(res, 400, {
+      error: `that token is already expired (exp ${new Date(exp * 1000).toISOString()}) — fetch a fresh one from https://platform.gushwork.ai/api/auth/token`,
+    });
+  API_TOKEN = { value: tok, exp, email, setAt: Date.now() };
+  return sendJson(res, 200, { ok: true, status: apiTokenStatus() });
+}
+
+async function tokenClearHandler(_req: IncomingMessage, res: ServerResponse) {
+  API_TOKEN = null;
+  return sendJson(res, 200, { ok: true, status: apiTokenStatus() });
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// upload → repoint pipeline (replaces the old in-place S3 apply).
+// Each scope (image / cluster / run) gathers the run CSV rows, uploads
+// them through the Gushwork media API, then repoints page_info.
+// dry_run still UPLOADS (new ids are needed to preview the repoint) —
+// only the page_info PUT is skipped. The UI states this explicitly.
+// ────────────────────────────────────────────────────────────────────────
+async function resolveRunRows(
+  runId: string,
+): Promise<{ rows: CsvRowParsed[] } | { error: string; code: number }> {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return { error: `run ${runId} or its csv not found`, code: 404 };
+  return { rows: await readRunCsv(state.csvPath) };
+}
+
+async function runRepointPipeline(
+  res: ServerResponse,
+  scopeRows: CsvRowParsed[],
+  dryRun: boolean,
+  scopeLabel: string,
+) {
+  const tk = requireApiToken();
+  if (!tk.ok) return sendJson(res, 400, { error: tk.error });
+  if (scopeRows.length === 0) return sendJson(res, 404, { error: "no rows in scope" });
+
+  const up = await uploadRows(scopeRows, {
+    csvPath: "",
+    token: tk.token,
+    refine: true,
+    concurrency: 4,
+    failFast: false,
+  });
+  const rep = await repointMappingRows(up.mapping, {
+    token: tk.token,
+    apply: !dryRun,
+    concurrency: 4,
+    failFast: false,
+  });
+  // Shape the response to the EXISTING client contract (per-image
+  // `results[]` with `image_id_old/new`, `steps[]`, `ok`, `dry_run`,
+  // `reason`) so the run-page rendering keeps working unchanged. Each
+  // image's outcome = its upload step + its cluster's repoint step.
+  const ocByCluster = new Map(rep.outcomes.map((o) => [o.cluster_id, o]));
+  const results = up.mapping.map((m) => {
+    const oc = ocByCluster.get(m.cluster_id);
+    const uploaded = m.upload_status === "uploaded";
+    const repOk = oc ? oc.status === "applied" || oc.status === "dry-run" : false;
+    const ok = uploaded && repOk;
+    const uploadStep = {
+      n: 1,
+      name: "upload image → Gushwork media API",
+      status: uploaded ? "ok" : m.upload_status === "uploaded_unconfirmed" ? "skipped" : "error",
+      detail: uploaded
+        ? `new image_id=${m.new_image_id} key=${m.new_refined_key}`
+        : `${m.upload_status}: ${m.upload_error || "see logs"}`,
+    };
+    const repStep = {
+      n: 2,
+      name: dryRun ? "repoint page_info (DRY-RUN — no write)" : "repoint page_info (PUT)",
+      status: !oc
+        ? "error"
+        : oc.status === "applied"
+          ? "ok"
+          : oc.status === "dry-run"
+            ? "skipped"
+            : "error",
+      detail: oc ? oc.reason : "no cluster outcome (upload failed?)",
+    };
+    return {
+      ok,
+      dry_run: dryRun,
+      image_id_old: m.old_image_id,
+      image_id_new: m.new_image_id,
+      key_prefix: m.new_refined_key,
+      reason: ok ? "" : oc ? oc.reason : uploadStep.detail,
+      asset_type: m.asset_type,
+      cluster_id: m.cluster_id,
+      steps: [uploadStep, repStep],
+    };
+  });
+  const okN = results.filter((r) => r.ok).length;
+  const payload = {
+    ok: results.every((r) => r.ok),
+    dry_run: dryRun,
+    scope: scopeLabel,
+    summary: { total: results.length, applied: okN, failed: results.length - okN },
+    results,
+    // Single-scope (one image) clients read these top-level fields.
+    ...(results.length === 1 ? results[0] : {}),
+  };
+  return sendJson(res, 200, payload);
+}
+
 /**
- * POST /api/apply/image — apply ONE image.
- * Body: { run_id: string, image_id: string }
- *
- * Resolves the CSV row for that image_id, runs the canonical
- * apply pipeline (resize → 3 S3 PutObjects → media_registry insert
- * → page_info update), returns the new media_registry UUID + URLs.
+ * POST /api/repoint/image (alias /api/apply/image) — upload ONE image
+ * via the Gushwork media API, then repoint page_info. Body:
+ * { run_id, image_id, dry_run }. dry_run still uploads.
  */
 async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
   const body = (await readApplyBody(req)) as { run_id?: string; image_id?: string; dry_run?: boolean } | null;
@@ -2609,29 +2769,20 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
   const imageId = body.image_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
+  const tk = requireApiToken();
+  if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
-  let state = RUNS.get(runId) ?? null;
-  if (!state) state = await tryReconstructRunFromDisk(runId);
-  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
-
-  const rows = await readRunCsv(state.csvPath);
-  const row = rows.find((r) => r.image_id === imageId);
-  if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
-
-  // Pull the apply pipeline in lazily so an import-time failure
-  // (e.g. sharp's native binary on a build without the right
-  // platform support) doesn't kill the whole web process.
-  const { applyOne } = await import("./apply.js");
-  const result = await applyOne({ row, dryRun });
-  sendJson(res, result.ok ? 200 : 500, result);
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+  const scope = r.rows.filter((x) => x.image_id === imageId);
+  if (scope.length === 0) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
+  return runRepointPipeline(res, scope, dryRun, `image ${imageId}`);
 }
 
 /**
- * POST /api/apply/cluster — apply every supported image in ONE
- * cluster of a run. Body: { run_id, cluster_id }.
- * Partial-success tolerant: applies what it can, returns per-image
- * outcomes. Cover/thumbnail rows in the cluster are skipped with a
- * clear reason (no support yet — see blueprint §3.5).
+ * POST /api/repoint/cluster (alias /api/apply/cluster) — upload every
+ * image in ONE cluster, then repoint that cluster's page_info in a
+ * single atomic PUT. Body: { run_id, cluster_id, dry_run }.
  */
 async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const body = (await readApplyBody(req)) as { run_id?: string; cluster_id?: string; dry_run?: boolean } | null;
@@ -2640,29 +2791,20 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const clusterId = body.cluster_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId || !clusterId) return sendJson(res, 400, { error: "run_id and cluster_id required" });
+  const tk = requireApiToken();
+  if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
-  let state = RUNS.get(runId) ?? null;
-  if (!state) state = await tryReconstructRunFromDisk(runId);
-  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
-
-  const rows = (await readRunCsv(state.csvPath)).filter((r) => r.cluster_id === clusterId);
-  if (rows.length === 0) {
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+  const scope = r.rows.filter((x) => x.cluster_id === clusterId);
+  if (scope.length === 0)
     return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
-  }
-  const { applyMany } = await import("./apply.js");
-  const results = await applyMany(rows, { dryRun });
-  const applied = results.filter((r) => r.ok);
-  const failed = results.filter((r) => !r.ok);
-  sendJson(res, 200, {
-    ok: failed.length === 0,
-    summary: { total: results.length, applied: applied.length, failed: failed.length },
-    results,
-  });
+  return runRepointPipeline(res, scope, dryRun, `cluster ${clusterId}`);
 }
 
 /**
- * POST /api/apply/run — apply every supported image across every
- * cluster in the run. Body: { run_id }.
+ * POST /api/repoint/run (alias /api/apply/run) — upload + repoint
+ * every cluster in the run. Body: { run_id, dry_run }.
  */
 async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
   const body = (await readApplyBody(req)) as { run_id?: string; dry_run?: boolean } | null;
@@ -2670,103 +2812,106 @@ async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
   const runId = body.run_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId) return sendJson(res, 400, { error: "run_id required" });
+  const tk = requireApiToken();
+  if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
-  let state = RUNS.get(runId) ?? null;
-  if (!state) state = await tryReconstructRunFromDisk(runId);
-  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
-
-  const rows = await readRunCsv(state.csvPath);
-  if (rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
-  const { applyMany } = await import("./apply.js");
-  const results = await applyMany(rows, { dryRun });
-  const applied = results.filter((r) => r.ok);
-  const failed = results.filter((r) => !r.ok);
-  sendJson(res, 200, {
-    ok: failed.length === 0,
-    summary: { total: results.length, applied: applied.length, failed: failed.length },
-    results,
-  });
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+  if (r.rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
+  return runRepointPipeline(res, r.rows, dryRun, `run ${runId}`);
 }
 
-/**
- * Legacy /api/apply-one — kept for the existing per-card "Apply to
- * S3" button while we transition the UI. Internally delegates to
- * the same applyImageHandler so behaviour matches exactly.
- */
-async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
-  return applyImageHandler(req, res);
-}
+// ────────────────────────────────────────────────────────────────────────
+// Revert: restore page_info from the per-cluster backups repoint wrote.
+// Dry-run (default) needs no token (no API call). --apply PUTs the
+// prior page_info and needs the token. Response is shaped to the same
+// client modal contract (results[] with steps[]).
+// ────────────────────────────────────────────────────────────────────────
+async function runRevertAndRespond(
+  res: ServerResponse,
+  backupFiles: string[],
+  dryRun: boolean,
+  scopeLabel: string,
+) {
+  let token = "";
+  if (!dryRun) {
+    const tk = requireApiToken();
+    if (!tk.ok) return sendJson(res, 400, { error: tk.error });
+    token = tk.token;
+  }
+  if (backupFiles.length === 0)
+    return sendJson(res, 404, { error: `no repoint backups found for ${scopeLabel}` });
 
-/**
- * GET /api/apply/probe — verify S3 credentials & write access.
- * Does a HeadBucket + small PutObject + DeleteObject against a
- * sentinel key under `_probe/`. Returns the AWS error verbatim when
- * the credentials are missing, wrong, or lack PutObject permission
- * on the bucket. Use this immediately after dropping creds into the
- * env to confirm everything is wired before running a real apply.
- */
-async function applyProbeHandler(_req: IncomingMessage, res: ServerResponse) {
-  const { HeadBucketCommand, PutObjectCommand, DeleteObjectCommand, S3Client } = await import("@aws-sdk/client-s3");
-  const env = (await import("./env.js")).loadEnv();
-  const bucket = env.S3_CONTENT_BUCKET;
-  if (!bucket) return sendJson(res, 500, { ok: false, step: "config", error: "S3_CONTENT_BUCKET not set" });
-
-  const haveExplicit = !!(env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY);
-  const client = new S3Client({
-    region: env.AWS_REGION ?? "us-east-1",
-    credentials: haveExplicit
-      ? { accessKeyId: env.AWS_ACCESS_KEY_ID!, secretAccessKey: env.AWS_SECRET_ACCESS_KEY! }
-      : undefined,
+  const { outcomes } = await revertBackups(backupFiles, {
+    token,
+    apply: !dryRun,
+    concurrency: 4,
+    failFast: false,
   });
-  const probeKey = `_probe/credential-check-${Date.now()}.txt`;
-
-  try {
-    await client.send(new HeadBucketCommand({ Bucket: bucket }));
-  } catch (err) {
-    const e = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
-    return sendJson(res, 200, {
-      ok: false,
-      step: "HeadBucket",
-      error: e.message,
-      aws_error_name: e.name,
-      http_status: e.$metadata?.httpStatusCode,
-      bucket,
-      credentials_source: haveExplicit ? "env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)" : "default credential chain",
-      region: env.AWS_REGION ?? "us-east-1",
-    });
-  }
-  try {
-    await client.send(new PutObjectCommand({
-      Bucket: bucket, Key: probeKey, Body: Buffer.from("probe"),
-      ContentType: "text/plain", CacheControl: "no-store",
-    }));
-  } catch (err) {
-    const e = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
-    return sendJson(res, 200, {
-      ok: false,
-      step: "PutObject",
-      error: e.message,
-      aws_error_name: e.name,
-      http_status: e.$metadata?.httpStatusCode,
-      bucket,
-      probe_key: probeKey,
-      hint: e.name === "AccessDenied"
-        ? `The credentials reach S3 but lack PutObject on s3://${bucket}/${probeKey}. Grant s3:PutObject + s3:DeleteObject on arn:aws:s3:::${bucket}/website/*/assets/* (and the probe path) on the IAM principal.`
-        : undefined,
-    });
-  }
-  // Best-effort cleanup. A failure here doesn't fail the probe.
-  try {
-    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: probeKey }));
-  } catch { /* leave the probe object; tiny and harmless */ }
-
+  const results = outcomes.map((o) => ({
+    ok: o.status === "applied" || o.status === "dry-run" || o.status === "noop",
+    dry_run: dryRun,
+    image_id_old: o.cluster_id,
+    image_id_new: "",
+    key_prefix: o.backup_file,
+    reason: o.reason,
+    cluster_id: o.cluster_id,
+    steps: [
+      {
+        n: 1,
+        name: dryRun ? "revert page_info (DRY-RUN — no write)" : "revert page_info (PUT)",
+        status:
+          o.status === "applied" || o.status === "dry-run"
+            ? "ok"
+            : o.status === "noop"
+              ? "skipped"
+              : "error",
+        detail: o.reason + (o.prerevert_snapshot ? ` | snapshot: ${o.prerevert_snapshot}` : ""),
+      },
+    ],
+  }));
+  const okN = results.filter((r) => r.ok).length;
   return sendJson(res, 200, {
-    ok: true,
-    bucket,
-    region: env.AWS_REGION ?? "us-east-1",
-    credentials_source: haveExplicit ? "env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)" : "default credential chain",
-    message: `s3://${bucket} is reachable and PutObject + DeleteObject succeeded. Apply-to-S3 is ready to run.`,
+    ok: results.every((r) => r.ok),
+    dry_run: dryRun,
+    scope: scopeLabel,
+    summary: { total: results.length, applied: okN, failed: results.length - okN },
+    results,
+    ...(results.length === 1 ? results[0] : {}),
   });
+}
+
+/** POST /api/revert/cluster — restore ONE cluster's latest backup. */
+async function revertClusterHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { cluster_id?: string; dry_run?: boolean } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const clusterId = body.cluster_id ?? "";
+  const dryRun = body.dry_run === true;
+  if (!clusterId) return sendJson(res, 400, { error: "cluster_id required" });
+  const dir = path.resolve(process.cwd(), DEFAULT_BACKUPS_DIR);
+  const f = await latestBackupForCluster(dir, clusterId);
+  if (!f) return sendJson(res, 404, { error: `no repoint backup for cluster ${clusterId}` });
+  return runRevertAndRespond(res, [f], dryRun, `cluster ${clusterId}`);
+}
+
+/** POST /api/revert/run — restore the latest backup of every cluster
+ * in a run that has one. */
+async function revertRunHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { run_id?: string; dry_run?: boolean } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const runId = body.run_id ?? "";
+  const dryRun = body.dry_run === true;
+  if (!runId) return sendJson(res, 400, { error: "run_id required" });
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+  const clusterIds = [...new Set(r.rows.map((x) => x.cluster_id).filter(Boolean))];
+  const dir = path.resolve(process.cwd(), DEFAULT_BACKUPS_DIR);
+  const files: string[] = [];
+  for (const cid of clusterIds) {
+    const f = await latestBackupForCluster(dir, cid);
+    if (f) files.push(f);
+  }
+  return runRevertAndRespond(res, files, dryRun, `run ${runId}`);
 }
 
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
@@ -3758,19 +3903,16 @@ async function runPage(res: ServerResponse, id: string) {
             // CDN URL through to here, so this is true for every card
             // on any run created after that change shipped.
             const canCompare = !!r.image_url_new && !!oldUrl;
-            // Cover & thumbnail go through a separate stormbreaker
-            // flow (FinalizeBlogService) and aren't wired into the
-            // /api/apply/* pipeline yet — disable Apply for them
-            // and include the row in bulk-pick selection but skip
-            // it server-side. See docs/apply-api-blueprint.md §3.5.
-            const applyUnsupported = synthetic
-              || r.asset_type === "cover"
-              || r.asset_type === "thumbnail";
-            const applyDisabledReason = synthetic
-              ? "Apply not yet supported for synthetic cover/thumbnail IDs"
-              : (r.asset_type === "cover" || r.asset_type === "thumbnail")
-                ? "Apply for cover/thumbnail uses a separate stormbreaker flow — not wired yet"
-                : "";
+            // The upload→repoint pipeline DOES handle cover &
+            // thumbnail (cover = 1st <Image> UUID; thumbnail = the
+            // live page_info.thumbnail URL string). Only truly
+            // synthetic non-cover/thumbnail ids (e.g. blog-images/<id>
+            // placeholders) have no resolvable reference site.
+            const applyUnsupported =
+              synthetic && r.asset_type !== "cover" && r.asset_type !== "thumbnail";
+            const applyDisabledReason = applyUnsupported
+              ? "No resolvable page_info reference for this synthetic id — regenerate from a real cluster image"
+              : "";
             return `
 <div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${applyUnsupported ? esc(applyDisabledReason) : "Include in bulk actions (Apply / Regenerate)"}">
@@ -3796,7 +3938,7 @@ async function runPage(res: ServerResponse, id: string) {
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
       <span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : ""}>
-        <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled aria-disabled="true"` : `title="Dry-run trace: lookup media_registry → resize 3 WebP variants → derive S3 keys → preview would-PUT targets. Real overwrite happens once write credentials land."`}>Apply to S3</button>
+        <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled aria-disabled="true"` : `title="Upload this image via the Gushwork media API, then repoint page_info to the new id. Dry-run still uploads (preview only, no page_info PUT)."`}>Upload + Repoint</button>
       </span>
     </div>
   </div>
@@ -3816,7 +3958,8 @@ async function runPage(res: ServerResponse, id: string) {
     </div>
     <div class="cs-actions">
       ${publishedUrl ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Open the live page in a new tab">View current page →</a>` : ""}
-      <button onclick="applyCluster('${esc(clusterId)}')">Apply all in this cluster</button>
+      <button onclick="applyCluster('${esc(clusterId)}')">Upload + Repoint this cluster</button>
+      <button onclick="revertCluster('${esc(clusterId)}')" title="Restore this cluster's page_info from the latest repoint backup. Dry-run previews; current state is snapshotted first.">↩ Revert this cluster</button>
     </div>
   </header>
   <div class="result-grid">${cards}</div>
@@ -3896,9 +4039,14 @@ ${clusterSections}
   </div>
   <div class="right">
     <a class="btn" id="download-all-btn" href="/runs/${esc(id)}/download.zip" title="Stream a ZIP of every generated image, organised by cluster topic. Images are not re-encoded." download>⬇ Download all (ZIP)</a>
-    <button id="verify-s3-btn" onclick="verifyS3Access()" title="HeadBucket + tiny test PutObject + DeleteObject against gw-content-store. Use this right after dropping AWS credentials into the env to confirm Apply-to-S3 is wired correctly.">🔒 Verify S3 access</button>
+    <span id="tok-chip" title="Bearer token used for upload + repoint. Pasted here, held in server memory until it expires (~1h) or the process restarts." style="font:12px/1 ui-sans-serif,system-ui;padding:6px 10px;border:1px solid var(--border);border-radius:6px;color:#a33;">🔑 no token</span>
+    <button id="tok-set-btn" onclick="setToken()" title="Paste a fresh bearer token from https://platform.gushwork.ai/api/auth/token">🔑 Set token</button>
+    <label style="font:12px/1 ui-sans-serif,system-ui;display:flex;align-items:center;gap:5px" title="Dry-run still UPLOADS images (new ids are needed to preview) — it only skips the page_info PUT.">
+      <input type="checkbox" id="dry-toggle" checked onchange="APPLY_DRY_RUN=this.checked"> dry-run
+    </label>
     <button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
-    <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Apply selected →</button>
+    <button id="revert-all-btn" onclick="revertRun()" title="Restore EVERY cluster in this run from its latest repoint backup. Dry-run previews; each current state is snapshotted first.">↩ Revert run</button>
+    <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Upload + Repoint selected →</button>
   </div>
 </div>
 `;
@@ -4121,7 +4269,7 @@ function paintCard(imageId, opts) {
     if (s === 'applied') { applyBtn.textContent = 'Applied ✓'; applyBtn.disabled = true; }
     else if (s === 'applying') { applyBtn.textContent = 'Applying…'; applyBtn.disabled = true; }
     else if (s === 'failed') { applyBtn.textContent = 'Retry apply'; applyBtn.disabled = false; }
-    else { applyBtn.textContent = 'Apply to S3'; applyBtn.disabled = card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1'; }
+    else { applyBtn.textContent = 'Upload + Repoint'; applyBtn.disabled = card.dataset.applyUnsupported === '1'; }
   }
   const errLine = card.querySelector('.rc-status-line');
   if (errLine) {
@@ -4136,7 +4284,7 @@ function paintCard(imageId, opts) {
 // would-PUT targets) so the operator can verify the plan before any
 // real write goes out. When write creds land, flip DRY_RUN to false
 // here and the same trace will be shown after the actual PUT.
-const APPLY_DRY_RUN = false;
+let APPLY_DRY_RUN = true;
 
 // Run-level mutex. Only ONE apply op (single/cluster/run/picked) can
 // be in flight at a time — protects against double-clicks and against
@@ -4155,57 +4303,53 @@ function applyBusyGuard() {
   return false;
 }
 
-// Hits /api/apply/probe and shows the result in a modal — the
-// fastest way to confirm AWS credentials are wired correctly the
-// moment they land in the env. Surfaces the exact AWS error name
-// (AccessDenied / NoSuchBucket / InvalidAccessKeyId / …) so the
-// fix is obvious.
-async function verifyS3Access() {
-  const btn = document.getElementById('verify-s3-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '… probing'; }
-  let payload;
-  try {
-    const r = await fetch('/api/apply/probe');
-    payload = await r.json();
-  } catch (err) {
-    payload = { ok: false, step: 'fetch', error: err && err.message ? err.message : String(err) };
+// Bearer-token panel. The token is pasted here, POSTed to /api/token,
+// and held in server memory until it expires (~1h) or the process
+// restarts. Both dry-run and apply need it (dry-run still uploads).
+function paintTokenChip(status) {
+  const chip = document.getElementById('tok-chip');
+  if (!chip) return;
+  if (!status || !status.present) {
+    chip.textContent = '🔑 no token';
+    chip.style.color = '#a33';
+    chip.title = 'No bearer token set — paste one before upload/repoint.';
+  } else if (status.expired) {
+    chip.textContent = '🔑 token EXPIRED';
+    chip.style.color = '#a33';
+    chip.title = 'Stored token expired at ' + status.expires_at + ' — paste a fresh one.';
+  } else {
+    chip.textContent = '🔑 ' + (status.email || 'token set');
+    chip.style.color = '#0a7';
+    chip.title = 'Valid until ' + (status.expires_at || 'unknown') + ' (set ' + status.set_at + ').';
   }
-  if (btn) { btn.disabled = false; btn.textContent = '🔒 Verify S3 access'; }
-  showS3ProbeModal(payload);
 }
 
-function showS3ProbeModal(p) {
-  const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:10002;';
-  const badge = p.ok
-    ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">READY</span>'
-    : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">' + escapeHtml(p.step || 'FAIL') + ' FAILED</span>';
-  const rows = [
-    ['bucket', p.bucket],
-    ['region', p.region],
-    ['credentials', p.credentials_source],
-    ['aws error', p.aws_error_name],
-    ['http status', p.http_status],
-    ['probe key', p.probe_key],
-    ['error', p.error],
-    ['hint', p.hint],
-    ['message', p.message],
-  ].filter(([, v]) => v != null && v !== '')
-   .map(([k, v]) => '<div style="display:grid;grid-template-columns:110px 1fr;gap:10px;padding:5px 0;border-bottom:1px dashed #eee;font-family:ui-monospace,Menlo,monospace;font-size:12px;"><div style="color:#666;">' + k + '</div><div style="word-break:break-all;">' + escapeHtml(String(v)) + '</div></div>')
-   .join('');
-  overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:640px;width:92%;max-height:86vh;border-radius:8px;padding:22px 24px;box-shadow:0 18px 48px rgba(0,0,0,0.32);font-family:ui-sans-serif,system-ui,sans-serif;overflow:auto;">'
-    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;">'
-    + '<div style="font-weight:600;font-size:15px;display:flex;gap:10px;align-items:center;">S3 access probe ' + badge + '</div>'
-    + '<button id="s3p-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button>'
-    + '</div>'
-    + rows
-    + (p.ok ? '<div style="margin-top:14px;font-size:12px;color:#0a7;">Apply-to-S3 will now overwrite the existing media_registry keys in place.</div>'
-            : '<div style="margin-top:14px;font-size:12px;color:#92400e;">Fix the issue above, then click Verify again. Apply-to-S3 will fail with the same error until this probe passes.</div>')
-    + '</div>';
-  document.body.appendChild(overlay);
-  overlay.querySelector('#s3p-close').addEventListener('click', () => overlay.remove());
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+async function tokenRefresh() {
+  try {
+    const r = await fetch('/api/token/status');
+    const j = await r.json();
+    paintTokenChip(j.status);
+  } catch { /* leave chip as-is */ }
 }
+
+async function setToken() {
+  const tok = prompt('Paste a FRESH bearer token (1h TTL) from\\nhttps://platform.gushwork.ai/api/auth/token');
+  if (tok == null) return;
+  const t = tok.trim();
+  if (!t) return;
+  try {
+    const r = await fetch('/api/token', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: t })
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Token rejected: ' + (j.error || ('HTTP ' + r.status))); return; }
+    paintTokenChip(j.status);
+  } catch (err) {
+    alert('Token set failed: ' + (err && err.message ? err.message : String(err)));
+  }
+}
+if (document.getElementById('tok-chip')) tokenRefresh();
 
 // Counts cards eligible for bulk apply. Cover/thumbnail/synthetic
 // rows are excluded server-side; already-applied / currently-applying
@@ -4242,12 +4386,12 @@ function confirmBulkApply(scopeLabel, counts) {
       ? '<ul style="margin:8px 0 0 18px;padding:0;color:#666;font-size:12px;">' + skipLines.map((l) => '<li>' + escapeHtml(l) + '</li>').join('') + '</ul>'
       : '';
     overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:480px;width:92%;border-radius:8px;padding:22px 24px;box-shadow:0 18px 48px rgba(0,0,0,0.32);font-family:ui-sans-serif,system-ui,sans-serif;">'
-      + '<div style="font-weight:600;font-size:15px;margin-bottom:10px;">Apply to S3 — ' + escapeHtml(scopeLabel) + '</div>'
+      + '<div style="font-weight:600;font-size:15px;margin-bottom:10px;">Upload + Repoint — ' + escapeHtml(scopeLabel) + '</div>'
       + '<div style="font-size:13px;color:#222;">'
       + '<strong style="color:#0a7;">' + counts.eligible + '</strong> of ' + counts.total + ' image' + (counts.total === 1 ? '' : 's') + ' will be processed.'
       + skipHtml
       + '</div>'
-      + (APPLY_DRY_RUN ? '<div style="margin-top:12px;background:#fef3c7;color:#92400e;padding:8px 10px;border-radius:4px;font-size:12px;">DRY RUN — no S3 writes will occur. You\'ll see the would-PUT trace per image.</div>' : '')
+      + (APPLY_DRY_RUN ? '<div style="margin-top:12px;background:#fef3c7;color:#92400e;padding:8px 10px;border-radius:4px;font-size:12px;">DRY-RUN — images ARE uploaded (new ids needed to preview), but page_info is NOT written. Backups + preview JSON are saved to out/.</div>' : '<div style="margin-top:12px;background:#fee2e2;color:#991b1b;padding:8px 10px;border-radius:4px;font-size:12px;">APPLY — this WILL PUT new page_info to production. A backup is saved per cluster first.</div>')
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">'
       + '<button id="bca-cancel" style="padding:7px 14px;border:1px solid #d4d4d8;background:#fff;border-radius:4px;cursor:pointer;">Cancel</button>'
       + '<button id="bca-go" style="padding:7px 14px;border:0;background:#0a7;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;"' + (counts.eligible === 0 ? ' disabled style="opacity:.5;cursor:not-allowed;"' : '') + '>' + (counts.eligible === 0 ? 'Nothing to apply' : (APPLY_DRY_RUN ? 'Run dry-run' : 'Apply')) + '</button>'
@@ -4278,7 +4422,7 @@ function showApplySummaryModal(scopeLabel, results) {
   }).join('');
   overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;display:flex;flex-direction:column;box-shadow:0 18px 48px rgba(0,0,0,0.32);overflow:hidden;font-family:ui-sans-serif,system-ui,sans-serif;">'
     + '<div style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;">'
-    + '<div style="font-weight:600;font-size:14px;">Apply to S3 — ' + escapeHtml(scopeLabel) + ' (' + results.length + ' image' + (results.length === 1 ? '' : 's') + ')</div>'
+    + '<div style="font-weight:600;font-size:14px;">Upload + Repoint — ' + escapeHtml(scopeLabel) + ' (' + results.length + ' image' + (results.length === 1 ? '' : 's') + ')</div>'
     + '<button id="bca-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button>'
     + '</div>'
     + '<div style="padding:8px 18px;font-size:12px;color:#555;border-bottom:1px solid #f0f0f0;">'
@@ -4307,15 +4451,12 @@ async function applyOne(imageId, opts) {
   if (cur === 'applying') return;
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
-  // Cover/thumbnail rows + legacy synthetic IDs aren't supported by
-  // /api/apply/* — the server would 4xx with a clean reason but we
-  // short-circuit client-side so the card flags as failed instantly.
-  if (card.dataset.applyUnsupported === '1' || card.dataset.synthetic === '1') {
-    const msg = card.dataset.synthetic === '1'
-      ? 'Apply not yet supported for synthetic cover/thumbnail IDs.'
-      : 'Apply for cover/thumbnail uses a separate stormbreaker flow — not wired yet.';
+  // Only truly synthetic non-cover/thumbnail ids have no resolvable
+  // page_info reference site; the server flags these too, but we
+  // short-circuit so the card fails instantly with a clear reason.
+  if (card.dataset.applyUnsupported === '1') {
     stateOf.set(imageId, 'failed');
-    paintCard(imageId, { error: msg });
+    paintCard(imageId, { error: 'No resolvable page_info reference for this synthetic id.' });
     refreshTotals();
     return;
   }
@@ -4363,7 +4504,7 @@ function showApplyTraceModal(imageId, payload) {
     overlay = document.createElement('div');
     overlay.id = 'apply-trace-overlay';
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:none;align-items:center;justify-content:center;z-index:10000;';
-    overlay.innerHTML = '<div id="apply-trace-modal" style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;box-shadow:0 18px 48px rgba(0,0,0,0.32);display:flex;flex-direction:column;overflow:hidden;font:13px/1.45 ui-monospace,Menlo,monospace;"><div id="apply-trace-head" style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;font-family:ui-sans-serif,system-ui,sans-serif;"><div style="font-weight:600;font-size:14px;">Apply to S3 — execution trace</div><button id="apply-trace-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button></div><div id="apply-trace-body" style="padding:14px 18px;overflow:auto;flex:1;"></div><div id="apply-trace-foot" style="padding:10px 18px;border-top:1px solid #e5e7eb;background:#fafafa;font-family:ui-sans-serif,system-ui,sans-serif;font-size:12px;color:#444;display:flex;justify-content:space-between;align-items:center;gap:12px;"></div></div>';
+    overlay.innerHTML = '<div id="apply-trace-modal" style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;box-shadow:0 18px 48px rgba(0,0,0,0.32);display:flex;flex-direction:column;overflow:hidden;font:13px/1.45 ui-monospace,Menlo,monospace;"><div id="apply-trace-head" style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;font-family:ui-sans-serif,system-ui,sans-serif;"><div style="font-weight:600;font-size:14px;">Upload + Repoint — execution trace</div><button id="apply-trace-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button></div><div id="apply-trace-body" style="padding:14px 18px;overflow:auto;flex:1;"></div><div id="apply-trace-foot" style="padding:10px 18px;border-top:1px solid #e5e7eb;background:#fafafa;font-family:ui-sans-serif,system-ui,sans-serif;font-size:12px;color:#444;display:flex;justify-content:space-between;align-items:center;gap:12px;"></div></div>';
     document.body.appendChild(overlay);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
     overlay.querySelector('#apply-trace-close').addEventListener('click', () => { overlay.style.display = 'none'; });
@@ -4392,9 +4533,9 @@ function showApplyTraceModal(imageId, payload) {
     + '</div>'
     + (rows || '<div style="color:#888;">No steps recorded.</div>');
   const footMsg = payload.dry_run
-    ? 'No S3 writes occurred. AWS write credentials must be provisioned before flipping APPLY_DRY_RUN off in web.ts.'
+    ? 'Image uploaded (new media id minted); page_info NOT written. Backup + preview JSON saved under out/repoint-*.'
     : payload.ok
-      ? 'Bytes overwritten in-place at the existing media_registry key. CDN cache TTL is 60s.'
+      ? 'page_info repointed to the new image id and PUT to production. Per-cluster backup saved under out/repoint-backups.'
       : ('Failed: ' + escapeHtml(payload.reason || 'unknown'));
   foot.innerHTML = '<div>' + footMsg + '</div><div style="color:#888;">' + (payload.elapsed_ms != null ? payload.elapsed_ms + 'ms' : '') + '</div>';
   overlay.style.display = 'flex';
@@ -4470,6 +4611,39 @@ async function applyCluster(clusterId) {
     setApplyBusy(false);
   }
   refreshTotals();
+}
+
+// Revert restores page_info from the latest repoint backup. It shares
+// the apply mutex (both write page_info — never run concurrently) and
+// renders through the same summary/trace modal.
+async function revertScope(url, payloadKey, scopeId, scopeLabel) {
+  if (applyBusyGuard()) return;
+  if (!APPLY_DRY_RUN &&
+      !confirm('REVERT ' + scopeLabel + ' to its latest repoint backup?\\n\\nThis PUTs the prior page_info back to production. The current state is snapshotted first (out/repoint-backups/*-prerevert-*).')) {
+    return;
+  }
+  setApplyBusy(true);
+  try {
+    const body = { dry_run: APPLY_DRY_RUN };
+    body[payloadKey] = scopeId;
+    const r = await fetch(url, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    showApplySummaryModal('revert ' + scopeLabel, j.results || []);
+  } catch (err) {
+    alert('Revert failed: ' + (err && err.message ? err.message : String(err)));
+  } finally {
+    setApplyBusy(false);
+  }
+}
+function revertCluster(clusterId) {
+  return revertScope('/api/revert/cluster', 'cluster_id', clusterId, 'cluster ' + clusterId);
+}
+function revertRun() {
+  return revertScope('/api/revert/run', 'run_id', RUN_ID, 'run ' + RUN_ID);
 }
 
 async function applyAll() {
@@ -5262,11 +5436,20 @@ export function startWebServer(port: number): void {
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
-      if (method === "POST" && p === "/api/apply-one")     return await applyOneHandler(req, res);
-      if (method === "POST" && p === "/api/apply/image")   return await applyImageHandler(req, res);
-      if (method === "POST" && p === "/api/apply/cluster") return await applyClusterHandler(req, res);
-      if (method === "POST" && p === "/api/apply/run")     return await applyRunHandler(req, res);
-      if (method === "GET"  && p === "/api/apply/probe")   return await applyProbeHandler(req, res);
+      // Pipeline endpoints. /api/apply/* kept as back-compat aliases
+      // for the existing client JS; /api/repoint/* are the canonical
+      // names. All run the upload→repoint pipeline now.
+      if (method === "POST" && (p === "/api/apply-one" || p === "/api/apply/image" || p === "/api/repoint/image"))
+        return await applyImageHandler(req, res);
+      if (method === "POST" && (p === "/api/apply/cluster" || p === "/api/repoint/cluster"))
+        return await applyClusterHandler(req, res);
+      if (method === "POST" && (p === "/api/apply/run" || p === "/api/repoint/run"))
+        return await applyRunHandler(req, res);
+      if (method === "POST" && p === "/api/revert/cluster") return await revertClusterHandler(req, res);
+      if (method === "POST" && p === "/api/revert/run")     return await revertRunHandler(req, res);
+      if (method === "POST" && p === "/api/token")        return await tokenSetHandler(req, res);
+      if (method === "POST" && p === "/api/token/clear")  return await tokenClearHandler(req, res);
+      if (method === "GET"  && p === "/api/token/status") return sendJson(res, 200, { status: apiTokenStatus() });
       if (method === "GET" && p === "/api/projects/search") {
         try {
           loadEnv();
