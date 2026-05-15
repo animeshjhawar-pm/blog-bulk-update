@@ -277,7 +277,10 @@ function formatBytes(n: number): string {
  * Convenience: apply every row in parallel (capped). Cluster + run
  * handlers both go through here.
  */
-export async function applyMany(rows: CsvRowParsed[]): Promise<Array<ApplyResult | ApplyError>> {
+export async function applyMany(
+  rows: CsvRowParsed[],
+  opts: { dryRun?: boolean } = {},
+): Promise<Array<ApplyResult | ApplyError>> {
   const CONCURRENCY = 5;
   const out: Array<ApplyResult | ApplyError> = new Array(rows.length);
   let cursor = 0;
@@ -285,7 +288,7 @@ export async function applyMany(rows: CsvRowParsed[]): Promise<Array<ApplyResult
     while (true) {
       const i = cursor++;
       if (i >= rows.length) break;
-      out[i] = await applyOne({ row: rows[i]! });
+      out[i] = await applyOne({ row: rows[i]!, dryRun: opts.dryRun });
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, rows.length) }, worker));

@@ -597,6 +597,30 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .rc-actions button { font-size: 12px; padding: 5px 10px; }
   .result-card .rc-status-line { font-size: 11px; color: var(--err); margin-top: 6px; display: none; }
   .result-card[data-synthetic="1"] .btn-apply { opacity: .5; }
+
+  /* Custom hover tooltip for disabled Apply buttons. The native
+     title attribute is suppressed by some browsers on disabled
+     buttons, so we wrap the button in a tooltip span. */
+  .apply-tip { position: relative; display: inline-block; }
+  .apply-tip[data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%);
+    background: #111; color: #fff; padding: 5px 9px; border-radius: 4px;
+    font-size: 11px; line-height: 1.35; white-space: normal; width: max-content; max-width: 280px;
+    z-index: 1000; pointer-events: none;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.18);
+  }
+  .apply-tip[data-tip]:hover::before {
+    content: ""; position: absolute; bottom: calc(100% + 1px); left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent; border-top-color: #111;
+    z-index: 1000; pointer-events: none;
+  }
+  /* While a run-level apply is in flight, dim every apply control. */
+  body[data-apply-busy="1"] .btn-apply,
+  body[data-apply-busy="1"] #apply-all-btn,
+  body[data-apply-busy="1"] button[onclick^="applyCluster"] { opacity: .55; pointer-events: none; }
   .result-card .state-pill { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; font-weight: 500; }
   .result-card .state-pill.state-applying { background: var(--accent-bg); color: var(--brand); }
   .result-card .state-pill.state-applied  { background: var(--ok); color: #fff; }
@@ -2600,10 +2624,11 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
  * clear reason (no support yet — see blueprint §3.5).
  */
 async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
-  const body = (await readApplyBody(req)) as { run_id?: string; cluster_id?: string } | null;
+  const body = (await readApplyBody(req)) as { run_id?: string; cluster_id?: string; dry_run?: boolean } | null;
   if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
   const runId = body.run_id ?? "";
   const clusterId = body.cluster_id ?? "";
+  const dryRun = body.dry_run === true;
   if (!runId || !clusterId) return sendJson(res, 400, { error: "run_id and cluster_id required" });
 
   let state = RUNS.get(runId) ?? null;
@@ -2615,7 +2640,7 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
     return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
   }
   const { applyMany } = await import("./apply.js");
-  const results = await applyMany(rows);
+  const results = await applyMany(rows, { dryRun });
   const applied = results.filter((r) => r.ok);
   const failed = results.filter((r) => !r.ok);
   sendJson(res, 200, {
@@ -2630,9 +2655,10 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
  * cluster in the run. Body: { run_id }.
  */
 async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
-  const body = (await readApplyBody(req)) as { run_id?: string } | null;
+  const body = (await readApplyBody(req)) as { run_id?: string; dry_run?: boolean } | null;
   if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
   const runId = body.run_id ?? "";
+  const dryRun = body.dry_run === true;
   if (!runId) return sendJson(res, 400, { error: "run_id required" });
 
   let state = RUNS.get(runId) ?? null;
@@ -2642,7 +2668,7 @@ async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
   const rows = await readRunCsv(state.csvPath);
   if (rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
   const { applyMany } = await import("./apply.js");
-  const results = await applyMany(rows);
+  const results = await applyMany(rows, { dryRun });
   const applied = results.filter((r) => r.ok);
   const failed = results.filter((r) => !r.ok);
   sendJson(res, 200, {
@@ -3687,7 +3713,9 @@ async function runPage(res: ServerResponse, id: string) {
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
-      <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled title="${esc(applyDisabledReason)}"` : `title="Resize to 1080/720/360 WebP, upload to S3, insert media_registry, update page_info to point at the new media_registry id."`}>Apply to S3</button>
+      <span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : ""}>
+        <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled aria-disabled="true"` : `title="Dry-run trace: lookup media_registry → resize 3 WebP variants → derive S3 keys → preview would-PUT targets. Real overwrite happens once write credentials land."`}>Apply to S3</button>
+      </span>
     </div>
   </div>
 </div>`;
@@ -4027,7 +4055,119 @@ function paintCard(imageId, opts) {
 // here and the same trace will be shown after the actual PUT.
 const APPLY_DRY_RUN = true;
 
-async function applyOne(imageId) {
+// Run-level mutex. Only ONE apply op (single/cluster/run/picked) can
+// be in flight at a time — protects against double-clicks and against
+// two concurrent operators colliding on the same run. Tracks via a
+// body data attribute so CSS can dim every Apply control at once.
+let APPLY_BUSY = false;
+function setApplyBusy(busy) {
+  APPLY_BUSY = busy;
+  document.body.setAttribute('data-apply-busy', busy ? '1' : '0');
+}
+function applyBusyGuard() {
+  if (APPLY_BUSY) {
+    alert('An apply is already in progress for this run. Wait for it to finish before starting another.');
+    return true;
+  }
+  return false;
+}
+
+// Counts cards eligible for bulk apply. Cover/thumbnail/synthetic
+// rows are excluded server-side; already-applied / currently-applying
+// rows are skipped here so the count matches what will actually run.
+function countApplicable(cards) {
+  let eligible = 0, skippedUnsupported = 0, skippedAlreadyApplied = 0;
+  for (const card of cards) {
+    if (!card.dataset.imageId) continue;
+    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') {
+      skippedUnsupported++;
+      continue;
+    }
+    const s = stateOf.get(card.dataset.imageId) ?? 'pending';
+    if (s === 'applied' || s === 'applying') {
+      skippedAlreadyApplied++;
+      continue;
+    }
+    eligible++;
+  }
+  return { eligible, skippedUnsupported, skippedAlreadyApplied, total: cards.length };
+}
+
+// Asks the operator to confirm a bulk apply. Resolves to true on
+// confirm, false on cancel. The count line tells them exactly how
+// many images will be processed and why others are skipped.
+function confirmBulkApply(scopeLabel, counts) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:10001;';
+    const skipLines = [];
+    if (counts.skippedUnsupported > 0) skipLines.push(counts.skippedUnsupported + ' skipped (cover / thumbnail / synthetic — separate stormbreaker flow)');
+    if (counts.skippedAlreadyApplied > 0) skipLines.push(counts.skippedAlreadyApplied + ' skipped (already applied or currently applying)');
+    const skipHtml = skipLines.length
+      ? '<ul style="margin:8px 0 0 18px;padding:0;color:#666;font-size:12px;">' + skipLines.map((l) => '<li>' + escapeHtml(l) + '</li>').join('') + '</ul>'
+      : '';
+    overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:480px;width:92%;border-radius:8px;padding:22px 24px;box-shadow:0 18px 48px rgba(0,0,0,0.32);font-family:ui-sans-serif,system-ui,sans-serif;">'
+      + '<div style="font-weight:600;font-size:15px;margin-bottom:10px;">Apply to S3 — ' + escapeHtml(scopeLabel) + '</div>'
+      + '<div style="font-size:13px;color:#222;">'
+      + '<strong style="color:#0a7;">' + counts.eligible + '</strong> of ' + counts.total + ' image' + (counts.total === 1 ? '' : 's') + ' will be processed.'
+      + skipHtml
+      + '</div>'
+      + (APPLY_DRY_RUN ? '<div style="margin-top:12px;background:#fef3c7;color:#92400e;padding:8px 10px;border-radius:4px;font-size:12px;">DRY RUN — no S3 writes will occur. You\'ll see the would-PUT trace per image.</div>' : '')
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">'
+      + '<button id="bca-cancel" style="padding:7px 14px;border:1px solid #d4d4d8;background:#fff;border-radius:4px;cursor:pointer;">Cancel</button>'
+      + '<button id="bca-go" style="padding:7px 14px;border:0;background:#0a7;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;"' + (counts.eligible === 0 ? ' disabled style="opacity:.5;cursor:not-allowed;"' : '') + '>' + (counts.eligible === 0 ? 'Nothing to apply' : (APPLY_DRY_RUN ? 'Run dry-run' : 'Apply')) + '</button>'
+      + '</div></div>';
+    document.body.appendChild(overlay);
+    const close = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelector('#bca-cancel').addEventListener('click', () => close(false));
+    overlay.querySelector('#bca-go').addEventListener('click', () => close(counts.eligible > 0));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(false); });
+  });
+}
+
+// Summary modal for cluster/run/picked apply — one row per image,
+// click a row to drill into its full step trace.
+function showApplySummaryModal(scopeLabel, results) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:10001;';
+  const ok = results.filter((r) => r.ok).length;
+  const failed = results.length - ok;
+  const rows = results.map((r, i) => {
+    const status = r.ok ? (r.dry_run ? 'DRY OK' : 'APPLIED') : 'FAILED';
+    const colour = r.ok ? (r.dry_run ? '#b45309' : '#16a34a') : '#dc2626';
+    return '<div class="bca-row" data-i="' + i + '" style="display:flex;justify-content:space-between;gap:10px;padding:7px 10px;border-bottom:1px solid #eee;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12px;">'
+      + '<span style="color:#666;flex:0 0 28px;">' + (i + 1) + '.</span>'
+      + '<span style="flex:1;word-break:break-all;">' + escapeHtml(r.image_id_old || '?') + '</span>'
+      + '<span style="font-weight:600;color:' + colour + ';">' + status + '</span>'
+      + '</div>';
+  }).join('');
+  overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;display:flex;flex-direction:column;box-shadow:0 18px 48px rgba(0,0,0,0.32);overflow:hidden;font-family:ui-sans-serif,system-ui,sans-serif;">'
+    + '<div style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;">'
+    + '<div style="font-weight:600;font-size:14px;">Apply to S3 — ' + escapeHtml(scopeLabel) + ' (' + results.length + ' image' + (results.length === 1 ? '' : 's') + ')</div>'
+    + '<button id="bca-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button>'
+    + '</div>'
+    + '<div style="padding:8px 18px;font-size:12px;color:#555;border-bottom:1px solid #f0f0f0;">'
+    + '<span style="color:#16a34a;font-weight:600;">' + ok + ' ok</span>'
+    + ' &middot; '
+    + '<span style="color:#dc2626;font-weight:600;">' + failed + ' failed</span>'
+    + ' &middot; click a row to see its step-by-step trace'
+    + '</div>'
+    + '<div style="overflow:auto;flex:1;">' + (rows || '<div style="padding:14px;color:#888;">No results.</div>') + '</div>'
+    + '</div>';
+  document.body.appendChild(overlay);
+  overlay.querySelector('#bca-close').addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelectorAll('.bca-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      const i = Number(row.getAttribute('data-i'));
+      const r = results[i];
+      if (r) showApplyTraceModal(r.image_id_old || '?', r);
+    });
+  });
+}
+
+async function applyOne(imageId, opts) {
+  opts = opts || {};
   const cur = stateOf.get(imageId) ?? 'pending';
   if (cur === 'applying') return;
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
@@ -4044,6 +4184,11 @@ async function applyOne(imageId) {
     refreshTotals();
     return;
   }
+  // Single-card clicks honour the run-level mutex; bulk callers
+  // (cluster / run / picked) already hold the mutex and pass
+  // opts.bulk=true to bypass this re-check.
+  if (!opts.bulk && applyBusyGuard()) return;
+  if (!opts.bulk) setApplyBusy(true);
   stateOf.set(imageId, 'applying'); paintCard(imageId);
   try {
     const r = await fetch('/api/apply/image', {
@@ -4069,6 +4214,8 @@ async function applyOne(imageId) {
   } catch (err) {
     stateOf.set(imageId, 'failed');
     paintCard(imageId, { error: 'apply failed: ' + err.message });
+  } finally {
+    if (!opts.bulk) setApplyBusy(false);
   }
   refreshTotals();
 }
@@ -4129,13 +4276,23 @@ function escapeHtml(s) {
  * or
  *   { ok: false, image_id_old, reason }.
  */
-function applyServerResults(results) {
+function applyServerResults(results, opts) {
+  opts = opts || {};
   for (const r of results) {
     const oldId = r.image_id_old || '';
     if (!oldId) continue;
     if (r.ok) {
-      stateOf.set(oldId, 'applied');
-      paintCard(oldId);
+      // Dry-run successes don't flip a card to 'applied' — nothing
+      // was actually written to S3. Revert it to its prior state so
+      // the operator can re-run for real once creds land.
+      if (opts.dryRun || r.dry_run) {
+        const prior = stateOf.get(oldId);
+        if (prior === 'applying') stateOf.set(oldId, 'pending');
+        paintCard(oldId);
+      } else {
+        stateOf.set(oldId, 'applied');
+        paintCard(oldId);
+      }
     } else {
       stateOf.set(oldId, 'failed');
       paintCard(oldId, { error: 'apply failed: ' + (r.reason || 'unknown') });
@@ -4144,10 +4301,11 @@ function applyServerResults(results) {
 }
 
 async function applyCluster(clusterId) {
-  // Mark every applicable card 'applying' up front so the whole
-  // cluster spins simultaneously — the server fans out internally
-  // and returns all results in one response.
+  if (applyBusyGuard()) return;
   const cards = [...document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]')];
+  const counts = countApplicable(cards);
+  if (!(await confirmBulkApply('cluster ' + clusterId, counts))) return;
+  setApplyBusy(true);
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
@@ -4159,11 +4317,12 @@ async function applyCluster(clusterId) {
   try {
     const r = await fetch('/api/apply/cluster', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: RUN_ID, cluster_id: clusterId })
+      body: JSON.stringify({ run_id: RUN_ID, cluster_id: clusterId, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    applyServerResults(j.results || []);
+    applyServerResults(j.results || [], { dryRun: APPLY_DRY_RUN });
+    showApplySummaryModal('cluster ' + clusterId, j.results || []);
   } catch (err) {
     for (const card of cards) {
       const id = card.dataset.imageId;
@@ -4172,13 +4331,18 @@ async function applyCluster(clusterId) {
       stateOf.set(id, 'failed');
       paintCard(id, { error: 'apply failed: ' + err.message });
     }
+  } finally {
+    setApplyBusy(false);
   }
   refreshTotals();
 }
 
 async function applyAll() {
-  // One POST → server applies every supported row in the run.
+  if (applyBusyGuard()) return;
   const cards = [...document.querySelectorAll('.result-card[data-image-id]')];
+  const counts = countApplicable(cards);
+  if (!(await confirmBulkApply('entire run', counts))) return;
+  setApplyBusy(true);
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
@@ -4190,11 +4354,12 @@ async function applyAll() {
   try {
     const r = await fetch('/api/apply/run', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: RUN_ID })
+      body: JSON.stringify({ run_id: RUN_ID, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    applyServerResults(j.results || []);
+    applyServerResults(j.results || [], { dryRun: APPLY_DRY_RUN });
+    showApplySummaryModal('entire run', j.results || []);
   } catch (err) {
     for (const card of cards) {
       const id = card.dataset.imageId;
@@ -4203,6 +4368,8 @@ async function applyAll() {
       stateOf.set(id, 'failed');
       paintCard(id, { error: 'apply failed: ' + err.message });
     }
+  } finally {
+    setApplyBusy(false);
   }
   refreshTotals();
 }
@@ -4271,17 +4438,37 @@ function refreshPickedCount() {
   if (regen) regen.disabled = n === 0;
 }
 async function applyAllPicked() {
-  const picked = [];
+  if (applyBusyGuard()) return;
+  const pickedCards = [];
   for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
     const cb = card.querySelector('.rc-pick-cb');
     if (!cb || cb.disabled || !cb.checked) continue;
-    const id = card.dataset.imageId;
-    if (!id) continue;
-    const s = stateOf.get(id) ?? 'pending';
-    if (s === 'applied' || s === 'applying') continue;
-    picked.push(id);
+    pickedCards.push(card);
   }
-  await Promise.all(picked.map((id) => applyOne(id)));
+  const counts = countApplicable(pickedCards);
+  if (!(await confirmBulkApply(counts.total + ' selected', counts))) return;
+  setApplyBusy(true);
+  try {
+    const ids = pickedCards
+      .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
+      .map((c) => c.dataset.imageId)
+      .filter((id) => {
+        const s = stateOf.get(id) ?? 'pending';
+        return s !== 'applied' && s !== 'applying';
+      });
+    // Each picked card hits /api/apply/image individually (re-using
+    // the single-card endpoint) so the trace fan-out is identical
+    // to clicking each card. opts.bulk=true means applyOne won't
+    // try to acquire the mutex (we already hold it).
+    const settled = await Promise.allSettled(ids.map((id) => applyOne(id, { bulk: true })));
+    // No aggregated trace modal here — each card already opened its
+    // own trace modal in sequence. Just surface a short toast-style
+    // summary so the operator knows the bulk finished.
+    const failed = settled.filter((s) => s.status === 'rejected').length;
+    if (failed > 0) alert(failed + ' of ' + ids.length + ' picked applies failed. Check the failed cards for details.');
+  } finally {
+    setApplyBusy(false);
+  }
 }
 async function regenAllPicked() {
   const picked = [];
