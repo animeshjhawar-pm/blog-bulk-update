@@ -2,43 +2,53 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import axios from "axios";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { resizeToWebpVariants, VARIANT_WIDTHS, type ImageVariant } from "./imageResize.js";
-import {
-  getClusterForApply,
-  insertMediaRegistry,
-  updateClusterPageInfo,
-  type ClusterForApply,
-} from "./db.js";
+import { resizeToWebpVariants, type ImageVariant } from "./imageResize.js";
+import { lookupMediaRegistryForId, type MediaRegistryRow } from "./db.js";
 import { loadEnv } from "./env.js";
 import type { CsvRowParsed } from "./web-types.js";
 
 /**
- * Asset types this apply pipeline currently supports. Cover and
- * thumbnail use a different upstream flow (the blog-cover/thumbnail
- * MDX is written by stormbreaker's `FinalizeBlogService` and tied to
- * the cluster's published_at timestamp, not just the media_registry
- * id) — surfacing them here would risk an out-of-band mutation, so
- * the apply endpoints reject them with a clear error. Engineering
- * decision in §3.5/§6 of docs/apply-api-blueprint.md tracks the
- * follow-up.
+ * In-place overwrite model (per operator direction, 2026-05-15):
+ *   "we just need to update the asset that is stored against the ID.
+ *    No URL changes anywhere, no image or UID changes anywhere, no new
+ *    images, new image placeholder is introduced. It's just updation
+ *    or force overwrite of already stored S3 bucket of image object."
+ *
+ * For each image_id we:
+ *   1. Look up its existing media_registry row (UUID by id, hash by key
+ *      suffix) — this gives us the AUTHORITATIVE S3 key prefix.
+ *   2. Resize the new source bytes to the 3 canonical WebP variants.
+ *   3. PUT each variant to the SAME key the row already points at.
+ *
+ * We do NOT insert a new media_registry row, mint a new hash, or
+ * mutate page_info. The image_id stays exactly the same.
+ *
+ * Asset types are NOT gated here — whichever flow originally generated
+ * the image (blog-images / generated-images / refined-images / cover /
+ * thumbnail), we overwrite at the same key. The single gate is whether
+ * a media_registry row exists. If it doesn't (some thumbnails fall in
+ * this bucket), we surface a clear error and skip.
+ *
+ * CDN caching note: the stormbreaker uploader sets
+ *   Cache-Control: public, max-age=31536000, immutable
+ * because every "new" image lands at a fresh key. With in-place
+ * overwrite that header would freeze the OLD bytes at the CDN edge for
+ * up to a year. We override with a short TTL so the rewrite becomes
+ * visible without a manual CDN purge.
  */
-export const APPLY_SUPPORTED_ASSETS = new Set([
-  "infographic",
-  "internal",
-  "external",
-  "generic",
-  "service_h1",
-  "service_body",
-  "category_industry",
-]);
 
 export interface ApplyResult {
   ok: true;
+  /** The image_id that was applied. Same value, before and after — we don't mint a new id. */
   image_id_old: string;
-  image_id_new: string;       // new media_registry.id (uuid)
-  key_prefix: string;         // e.g. "blog-images/<cluster>/<new-hash>"
-  urls: Record<"360" | "720" | "1080", string>;
-  bytes: number;              // sum of all three variants — for log line
+  /** Echoes image_id_old. Kept for response-shape compatibility with the UI's applyServerResults(). */
+  image_id_new: string;
+  /** media_registry.key — what we overwrote. */
+  key_prefix: string;
+  /** Unchanged urls (we overwrote the bytes at the existing URLs). */
+  urls: Record<string, string>;
+  /** Sum of all variant byte sizes — for log line. */
+  bytes: number;
   elapsed_ms: number;
 }
 
@@ -65,86 +75,10 @@ function s3(): S3Client {
   return _s3;
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// Pure helpers — no IO. Easier to unit-test, easier to reason about.
-// ────────────────────────────────────────────────────────────────────────
-
-/**
- * Stormbreaker's image-hash format is `<unix_ms_with_subms>_<32 hex>`
- * (16 + 1 + 32 = 49 chars). Examples from live data:
- *   1776666141368784_cd83a691b9c049569783f421fc57b6b0
- *   1776666118944439_3f4568b796944f229d5166173d22b9cb
- *
- * The 32-hex tail is the source-image identity hash in stormbreaker
- * (md5/sha truncated, doesn't really matter — uniqueness, not
- * cryptographic security). For our use case, random 32-hex is
- * sufficient — we just need a fresh path per apply so we never
- * overwrite an in-use image.
- */
-export function newStormbreakerHash(now: number = Date.now()): string {
-  // Pad timestamp to 16 chars by appending 0-3 sub-ms digits.
-  // Date.now() is ms; stormbreaker uses sub-ms via time.time_ns().
-  // Reproducing exactly isn't necessary — uniqueness within a
-  // millisecond is — so we use crypto.randomInt for the last 3 chars.
-  const ts = String(now).padStart(13, "0");
-  // 3 random digits to bring total to 16. (Math.random is fine here —
-  // not used for security; collisions across the same millisecond
-  // are vanishingly unlikely with a 32-hex tail right after.)
-  const subMs = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
-  // 32 hex chars (16 bytes).
-  let hex = "";
-  for (let i = 0; i < 32; i++) hex += Math.floor(Math.random() * 16).toString(16);
-  return `${ts}${subMs}_${hex}`;
-}
-
-/**
- * Resolve the S3 folder prefix + media_registry key prefix for a
- * given asset_type. The prefix is JUST the cluster/hash segment —
- * the caller appends `/<size>.webp` per variant.
- *
- *   blog inline (infographic, internal, external) →
- *     S3: website/<sub>/assets/blog-images/<cluster>/<hash>
- *     media_registry.key: blog-images/<cluster>/<hash>
- *
- *   service H1/body, category-industry, generic →
- *     S3: website/<sub>/assets/generated-images/<hash>
- *     media_registry.key: generated-images/<hash>
- *
- * (Cover/thumbnail share the blog-images folder but the apply
- * pipeline gates them out via APPLY_SUPPORTED_ASSETS, so they
- * don't reach this function.)
- */
-export function s3LayoutFor(args: {
-  assetType: string;
-  stagingSubdomain: string;
-  clusterId: string;
-  hash: string;
-}): { s3Prefix: string; registryKey: string } {
-  const { assetType, stagingSubdomain, clusterId, hash } = args;
-  if (assetType === "infographic" || assetType === "internal" || assetType === "external") {
-    return {
-      s3Prefix: `website/${stagingSubdomain}/assets/blog-images/${clusterId}/${hash}`,
-      registryKey: `blog-images/${clusterId}/${hash}`,
-    };
-  }
-  // service_h1 | service_body | category_industry | generic
-  return {
-    s3Prefix: `website/${stagingSubdomain}/assets/generated-images/${hash}`,
-    registryKey: `generated-images/${hash}`,
-  };
-}
-
-/**
- * Build the per-size CDN-public URL given an S3 prefix. CDN domain
- * is environment-specific; we match what media_registry stores live
- * (file-host.link for prod, cdn-dev.gushwork.ai for dev). Env-derived
- * but defaults to file-host.link since this app currently only ships
- * to prod data.
- */
-export function publicUrlFor(s3Prefix: string, size: "360" | "720" | "1080"): string {
-  const base = process.env.CDN_BASE_URL ?? "https://file-host.link";
-  return `${base}/${s3Prefix}/${size}.webp`;
-}
+// Short TTL on overwrite so the CDN picks up the new bytes within
+// minutes. Production CDN respects this. If a faster turnaround is
+// needed, add an explicit purge call here (flagged for engineering).
+const OVERWRITE_CACHE_CONTROL = "public, max-age=60, must-revalidate";
 
 // ────────────────────────────────────────────────────────────────────────
 // Source bytes — prefer the local file (no Replicate URL expiry risk),
@@ -178,144 +112,37 @@ async function readSourceBytes(row: Pick<CsvRowParsed, "image_local_path" | "ima
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// page_info mutation — swaps the OLD image_id (uuid OR hash) for the
-// NEW media_registry uuid, in whichever field the asset type uses.
-//
-// The structure differs per page_type — mirrors what pageInfo.ts
-// EXTRACTS:
-//   blog inline (infographic/internal/external):
-//     blog_text.md MDX <Image imageId="OLD_UUID" /> → "NEW_UUID"
-//   service_h1:
-//     page_info.images[0].image_id
-//   service_body:
-//     page_info.fold_data.service_steps.images[0].image_id   OR
-//     page_info.fold_data.service_description.images[0].image_id
-//   category_industry:
-//     page_info.fold_data.industries.items[?].image.image_id
-//
-// Returns true when SOMETHING was mutated. False means we walked
-// every supported location and didn't find a match — in which case
-// the apply rolls back the S3 + media_registry write would be ideal,
-// but for now we report the orphan and surface it in the response.
+// One image, in-place. Cluster / run scopes fan out via applyMany.
 // ────────────────────────────────────────────────────────────────────────
-function mutatePageInfo(
-  pageInfo: unknown,
-  assetType: string,
-  oldImageId: string,
-  newImageId: string,
-): { touched: boolean; field: string | null } {
-  if (!pageInfo || typeof pageInfo !== "object") return { touched: false, field: null };
-  const pi = pageInfo as Record<string, unknown>;
-
-  // Blog inline: replace inside blog_text.md (or blog_text.md sub-object)
-  if (assetType === "infographic" || assetType === "internal" || assetType === "external") {
-    let md: string | null = null;
-    let getter: "string" | "object" | null = null;
-    if (typeof pi.blog_text === "string") { md = pi.blog_text; getter = "string"; }
-    else if (pi.blog_text && typeof pi.blog_text === "object") {
-      const inner = (pi.blog_text as { md?: unknown }).md;
-      if (typeof inner === "string") { md = inner; getter = "object"; }
-    }
-    if (!md) return { touched: false, field: null };
-    if (!md.includes(oldImageId)) return { touched: false, field: null };
-    const updated = md.split(oldImageId).join(newImageId);
-    if (getter === "string") pi.blog_text = updated;
-    else (pi.blog_text as Record<string, unknown>).md = updated;
-    return { touched: true, field: "blog_text.md" };
-  }
-
-  // service_h1: top-level images[0]
-  if (assetType === "service_h1") {
-    const imgs = pi.images;
-    if (Array.isArray(imgs) && imgs[0] && typeof imgs[0] === "object") {
-      const obj = imgs[0] as Record<string, unknown>;
-      if (typeof obj.image_id === "string" && obj.image_id === oldImageId) {
-        obj.image_id = newImageId;
-        return { touched: true, field: "page_info.images[0].image_id" };
-      }
-    }
-    return { touched: false, field: null };
-  }
-
-  // service_body: fold_data.service_steps OR fold_data.service_description
-  if (assetType === "service_body") {
-    const fd = pi.fold_data;
-    if (fd && typeof fd === "object") {
-      for (const key of ["service_steps", "service_description"] as const) {
-        const node = (fd as Record<string, unknown>)[key];
-        if (node && typeof node === "object") {
-          const imgs = (node as { images?: unknown }).images;
-          if (Array.isArray(imgs) && imgs[0] && typeof imgs[0] === "object") {
-            const obj = imgs[0] as Record<string, unknown>;
-            if (typeof obj.image_id === "string" && obj.image_id === oldImageId) {
-              obj.image_id = newImageId;
-              return { touched: true, field: `page_info.fold_data.${key}.images[0].image_id` };
-            }
-          }
-        }
-      }
-    }
-    return { touched: false, field: null };
-  }
-
-  // category_industry: fold_data.industries.items[*].image.image_id
-  if (assetType === "category_industry") {
-    const fd = pi.fold_data;
-    if (fd && typeof fd === "object") {
-      const ind = (fd as Record<string, unknown>).industries;
-      if (ind && typeof ind === "object") {
-        const items = (ind as { items?: unknown }).items;
-        if (Array.isArray(items)) {
-          for (let i = 0; i < items.length; i++) {
-            const it = items[i];
-            if (!it || typeof it !== "object") continue;
-            const img = (it as { image?: unknown }).image;
-            if (img && typeof img === "object") {
-              const obj = img as Record<string, unknown>;
-              if (typeof obj.image_id === "string" && obj.image_id === oldImageId) {
-                obj.image_id = newImageId;
-                return { touched: true, field: `page_info.fold_data.industries.items[${i}].image.image_id` };
-              }
-            }
-          }
-        }
-      }
-    }
-    return { touched: false, field: null };
-  }
-
-  // generic: no canonical page_info field we own — caller still
-  // wrote the S3 + media_registry row so it's available for whatever
-  // consumer happens to want it; just report nothing got rewritten.
-  return { touched: false, field: null };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// The main pipeline. One call applies one image. Cluster / run
-// scopes fan out via Promise.all in the HTTP handlers.
-// ────────────────────────────────────────────────────────────────────────
-export async function applyOne(args: {
-  row: CsvRowParsed;
-}): Promise<ApplyResult | ApplyError> {
+export async function applyOne(args: { row: CsvRowParsed }): Promise<ApplyResult | ApplyError> {
   const t0 = Date.now();
   const { row } = args;
   const oldImageId = row.image_id;
 
-  if (!APPLY_SUPPORTED_ASSETS.has(row.asset_type)) {
+  // 1. Resolve the existing media_registry row — the only authoritative
+  //    source of the S3 key we're allowed to overwrite. Without this
+  //    row, we have no key to write to and must skip.
+  let mr: MediaRegistryRow | null;
+  try {
+    mr = await lookupMediaRegistryForId(oldImageId);
+  } catch (err) {
+    return { ok: false, image_id_old: oldImageId, reason: `media_registry lookup failed: ${(err as Error).message}` };
+  }
+  if (!mr) {
     return {
       ok: false,
       image_id_old: oldImageId,
-      reason: `asset_type "${row.asset_type}" is not yet supported by the apply API. Cover & thumbnail use a separate upstream flow (FinalizeBlogService) and need engineering review before being applied via this path.`,
+      reason: `no media_registry row for image_id "${oldImageId}" — can't determine which S3 key to overwrite. (Thumbnails and a few orphan UUIDs fall in this bucket; their original upload path needs to be mapped before in-place apply is possible.)`,
     };
   }
 
-  const cluster: ClusterForApply | null = await getClusterForApply(row.cluster_id);
-  if (!cluster) return { ok: false, image_id_old: oldImageId, reason: `cluster ${row.cluster_id} not found` };
-  if (!cluster.staging_subdomain) {
-    return { ok: false, image_id_old: oldImageId, reason: `project has no staging_subdomain — can't compute S3 path` };
+  const env = loadEnv();
+  const bucket = env.S3_CONTENT_BUCKET;
+  if (!bucket) {
+    return { ok: false, image_id_old: oldImageId, reason: "S3_CONTENT_BUCKET env is not set" };
   }
 
-  // 1. Read the source bytes (local first, remote fallback).
+  // 2. Read source bytes (local first, remote fallback).
   let sourceBytes: Buffer;
   try {
     sourceBytes = await readSourceBytes(row);
@@ -323,7 +150,7 @@ export async function applyOne(args: {
     return { ok: false, image_id_old: oldImageId, reason: (err as Error).message };
   }
 
-  // 2. Resize to 3 variants in parallel.
+  // 3. Resize to 3 variants.
   let variants: ImageVariant[];
   try {
     variants = await resizeToWebpVariants(sourceBytes);
@@ -331,97 +158,58 @@ export async function applyOne(args: {
     return { ok: false, image_id_old: oldImageId, reason: `resize failed: ${(err as Error).message}` };
   }
 
-  // 3. Generate a NEW hash + layout. Matches stormbreaker's "new
-  //    hash per apply, never overwrite" semantics.
-  const hash = newStormbreakerHash();
-  const { s3Prefix, registryKey } = s3LayoutFor({
-    assetType: row.asset_type,
-    stagingSubdomain: cluster.staging_subdomain,
-    clusterId: row.cluster_id,
-    hash,
-  });
-
-  // 4. Upload all 3 variants. Parallelised; one failure aborts.
-  const env = loadEnv();
-  const bucket = env.S3_CONTENT_BUCKET;
-  if (!bucket) {
-    return { ok: false, image_id_old: oldImageId, reason: "S3_CONTENT_BUCKET env is not set" };
+  // 4. Reconstruct the absolute S3 key for each variant from the
+  //    media_registry key + staging-prefixed `website/<sub>/assets/`.
+  //    We derive the staging-subdomain from the existing urls[*] in
+  //    the row — it's the only place this is reliably stored without
+  //    a second DB hop. Pattern is:
+  //      https://<cdn>/website/<sub>/assets/<registry-key>/<size>.webp
+  const sampleUrl = Object.values(mr.urls).find((u): u is string => typeof u === "string");
+  if (!sampleUrl) {
+    return { ok: false, image_id_old: oldImageId, reason: `media_registry row has no usable urls — can't recover staging-subdomain` };
   }
+  const m = sampleUrl.match(/\/(website\/[^/]+\/assets\/[^/].*?)\/\d+\.webp$/);
+  if (!m) {
+    return { ok: false, image_id_old: oldImageId, reason: `unexpected media_registry url shape "${sampleUrl}" — can't recover S3 key prefix` };
+  }
+  const s3KeyPrefix = m[1]!; // website/<sub>/assets/<registry-key>
+
+  // 5. Overwrite each variant at its EXISTING key.
   try {
     await Promise.all(
       variants.map((v) =>
         s3().send(
           new PutObjectCommand({
             Bucket: bucket,
-            Key: `${s3Prefix}/${v.width}.webp`,
+            Key: `${s3KeyPrefix}/${v.width}.webp`,
             Body: v.bytes,
             ContentType: "image/webp",
-            CacheControl: "public, max-age=31536000, immutable",
+            CacheControl: OVERWRITE_CACHE_CONTROL,
           }),
         ),
       ),
     );
   } catch (err) {
-    return { ok: false, image_id_old: oldImageId, reason: `S3 upload failed: ${(err as Error).message}` };
-  }
-
-  // 5. Build the urls JSONB exactly as stormbreaker does.
-  const urls: Record<"360" | "720" | "1080", string> = {
-    "360": publicUrlFor(s3Prefix, "360"),
-    "720": publicUrlFor(s3Prefix, "720"),
-    "1080": publicUrlFor(s3Prefix, "1080"),
-  };
-
-  // 6. Insert media_registry → get the NEW UUID.
-  let newImageId: string;
-  try {
-    newImageId = await insertMediaRegistry({
-      projectId: cluster.p_id,
-      key: registryKey,
-      urls,
-    });
-  } catch (err) {
-    return { ok: false, image_id_old: oldImageId, reason: `media_registry insert failed: ${(err as Error).message}` };
-  }
-
-  // 7. Mutate page_info to point at the new UUID.
-  const mut = mutatePageInfo(cluster.page_info, row.asset_type, oldImageId, newImageId);
-  if (mut.touched) {
-    try {
-      await updateClusterPageInfo(cluster.id, cluster.page_info);
-    } catch (err) {
-      // The S3 + media_registry write already happened — we can't
-      // unwind that cheaply. Surface the partial-success state so
-      // the operator can decide.
-      return {
-        ok: false,
-        image_id_old: oldImageId,
-        reason: `S3 + media_registry succeeded but page_info update failed: ${(err as Error).message}. media_registry id = ${newImageId}; field would have been ${mut.field}.`,
-      };
-    }
+    return { ok: false, image_id_old: oldImageId, reason: `S3 overwrite failed: ${(err as Error).message}` };
   }
 
   const bytes = variants.reduce((n, v) => n + v.size, 0);
   return {
     ok: true,
     image_id_old: oldImageId,
-    image_id_new: newImageId,
-    key_prefix: registryKey,
-    urls,
+    image_id_new: oldImageId, // unchanged — in-place overwrite preserves id
+    key_prefix: mr.key,
+    urls: mr.urls as Record<string, string>,
     bytes,
     elapsed_ms: Date.now() - t0,
   };
 }
 
 /**
- * Convenience: apply every supported image in a list of CSV rows
- * in parallel, return per-row outcomes. Cluster + run handlers
- * both go through here.
+ * Convenience: apply every row in parallel (capped). Cluster + run
+ * handlers both go through here.
  */
 export async function applyMany(rows: CsvRowParsed[]): Promise<Array<ApplyResult | ApplyError>> {
-  // Cap concurrent applies so we don't slam S3 or saturate the
-  // Postgres pool. 5 is the same default we use in the regen
-  // pipeline. Each apply is ~3 PutObject + 2 SQL statements.
   const CONCURRENCY = 5;
   const out: Array<ApplyResult | ApplyError> = new Array(rows.length);
   let cursor = 0;

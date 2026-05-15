@@ -244,6 +244,38 @@ export async function publishedClusterCountsByPageType(
   return out;
 }
 
+/**
+ * Look up a single media_registry row by either its UUID `id` (service /
+ * category image_ids) or by suffix-matching `key` (blog inline hash
+ * image_ids). Returns null if no row matches.
+ *
+ * Used by the in-place apply pipeline: the existing `key` is the
+ * authoritative S3 path to overwrite — we never synthesize a new one.
+ */
+export interface MediaRegistryRow {
+  id: string;
+  key: string;
+  urls: MediaUrls;
+}
+export async function lookupMediaRegistryForId(imageId: string): Promise<MediaRegistryRow | null> {
+  const pool = getPool();
+  if (UUID_RE.test(imageId)) {
+    const r = await pool.query<MediaRegistryRow>(
+      `SELECT id::text AS id, key, urls FROM media_registry WHERE id = $1::uuid LIMIT 1`,
+      [imageId],
+    );
+    return r.rows[0] ?? null;
+  }
+  const r = await pool.query<MediaRegistryRow>(
+    `SELECT id::text AS id, key, urls FROM media_registry
+     WHERE key LIKE $1::text
+     ORDER BY length(key) ASC
+     LIMIT 1`,
+    [`%/${imageId}`],
+  );
+  return r.rows[0] ?? null;
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Apply-to-S3 helpers: insert a fresh media_registry row + read/write a
 // cluster's page_info. Used by the canonical apply pipeline (src/apply.ts).
