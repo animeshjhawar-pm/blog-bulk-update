@@ -2569,10 +2569,11 @@ async function readApplyBody(req: IncomingMessage): Promise<unknown> {
  * → page_info update), returns the new media_registry UUID + URLs.
  */
 async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
-  const body = (await readApplyBody(req)) as { run_id?: string; image_id?: string } | null;
+  const body = (await readApplyBody(req)) as { run_id?: string; image_id?: string; dry_run?: boolean } | null;
   if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
   const runId = body.run_id ?? "";
   const imageId = body.image_id ?? "";
+  const dryRun = body.dry_run === true;
   if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
 
   let state = RUNS.get(runId) ?? null;
@@ -2587,7 +2588,7 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
   // (e.g. sharp's native binary on a build without the right
   // platform support) doesn't kill the whole web process.
   const { applyOne } = await import("./apply.js");
-  const result = await applyOne({ row });
+  const result = await applyOne({ row, dryRun });
   sendJson(res, result.ok ? 200 : 500, result);
 }
 
@@ -4018,9 +4019,17 @@ function paintCard(imageId, opts) {
   }
 }
 
+// Per-card "Apply to S3" runs in DRY-RUN mode until AWS write
+// credentials are provisioned: we open a modal that walks through
+// every step (DB lookup, source bytes, resize sizes, derived S3 keys,
+// would-PUT targets) so the operator can verify the plan before any
+// real write goes out. When write creds land, flip DRY_RUN to false
+// here and the same trace will be shown after the actual PUT.
+const APPLY_DRY_RUN = true;
+
 async function applyOne(imageId) {
   const cur = stateOf.get(imageId) ?? 'pending';
-  if (cur === 'applied' || cur === 'applying') return;
+  if (cur === 'applying') return;
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
   // Cover/thumbnail rows + legacy synthetic IDs aren't supported by
@@ -4037,21 +4046,80 @@ async function applyOne(imageId) {
   }
   stateOf.set(imageId, 'applying'); paintCard(imageId);
   try {
-    // Hit the new canonical endpoint; the legacy /api/apply-one is
-    // an alias for the same handler so either works, but using the
-    // new path keeps server logs aligned with the API contract.
     const r = await fetch('/api/apply/image', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId })
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
-    if (!r.ok || j.ok === false) throw new Error(j.reason || j.error || ('HTTP ' + r.status));
-    stateOf.set(imageId, 'applied'); paintCard(imageId);
+    if (!r.ok && !j.steps) throw new Error(j.reason || j.error || ('HTTP ' + r.status));
+    // Show the trace modal regardless of ok/failure — operator wants
+    // to see WHERE it would have failed too. State only flips to
+    // 'applied' on a successful real (non-dry) run.
+    showApplyTraceModal(imageId, j);
+    if (j.ok && !j.dry_run) {
+      stateOf.set(imageId, 'applied'); paintCard(imageId);
+    } else if (j.ok && j.dry_run) {
+      // Dry run passed — leave card in its prior state ('pending').
+      stateOf.set(imageId, cur === 'applied' ? 'applied' : 'pending');
+      paintCard(imageId);
+    } else {
+      stateOf.set(imageId, 'failed');
+      paintCard(imageId, { error: 'apply failed: ' + (j.reason || 'unknown') });
+    }
   } catch (err) {
     stateOf.set(imageId, 'failed');
     paintCard(imageId, { error: 'apply failed: ' + err.message });
   }
   refreshTotals();
+}
+
+// Modal showing the step-by-step trace returned by /api/apply/image.
+// Lazy-injected on first use so the markup doesn't bloat every page.
+function showApplyTraceModal(imageId, payload) {
+  let overlay = document.getElementById('apply-trace-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'apply-trace-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:none;align-items:center;justify-content:center;z-index:10000;';
+    overlay.innerHTML = '<div id="apply-trace-modal" style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;box-shadow:0 18px 48px rgba(0,0,0,0.32);display:flex;flex-direction:column;overflow:hidden;font:13px/1.45 ui-monospace,Menlo,monospace;"><div id="apply-trace-head" style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;font-family:ui-sans-serif,system-ui,sans-serif;"><div style="font-weight:600;font-size:14px;">Apply to S3 — execution trace</div><button id="apply-trace-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button></div><div id="apply-trace-body" style="padding:14px 18px;overflow:auto;flex:1;"></div><div id="apply-trace-foot" style="padding:10px 18px;border-top:1px solid #e5e7eb;background:#fafafa;font-family:ui-sans-serif,system-ui,sans-serif;font-size:12px;color:#444;display:flex;justify-content:space-between;align-items:center;gap:12px;"></div></div>';
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
+    overlay.querySelector('#apply-trace-close').addEventListener('click', () => { overlay.style.display = 'none'; });
+  }
+  const body = overlay.querySelector('#apply-trace-body');
+  const foot = overlay.querySelector('#apply-trace-foot');
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  const colour = (s) => s === 'ok' ? '#16a34a' : s === 'skipped' ? '#b45309' : '#dc2626';
+  const rows = steps.map((s) =>
+    '<div style="display:grid;grid-template-columns:28px 1fr;gap:10px;padding:8px 0;border-bottom:1px dashed #eee;">'
+    + '<div style="font-weight:600;color:#666;">' + s.n + '.</div>'
+    + '<div><div style="font-weight:600;color:' + colour(s.status) + ';">'
+    + escapeHtml(s.name) + ' <span style="font-weight:400;color:#888;text-transform:uppercase;font-size:11px;">[' + s.status + ']</span></div>'
+    + '<div style="color:#333;margin-top:2px;word-break:break-all;">' + escapeHtml(s.detail) + '</div></div></div>'
+  ).join('');
+  const headBadge = payload.dry_run
+    ? '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">DRY RUN</span>'
+    : payload.ok
+      ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">APPLIED</span>'
+      : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">FAILED</span>';
+  body.innerHTML =
+    '<div style="font-family:ui-sans-serif,system-ui,sans-serif;font-size:12px;color:#555;margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+    + headBadge
+    + '<span>image_id: <code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">' + escapeHtml(imageId) + '</code></span>'
+    + (payload.key_prefix ? '<span>key: <code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">' + escapeHtml(payload.key_prefix) + '</code></span>' : '')
+    + '</div>'
+    + (rows || '<div style="color:#888;">No steps recorded.</div>');
+  const footMsg = payload.dry_run
+    ? 'No S3 writes occurred. AWS write credentials must be provisioned before flipping APPLY_DRY_RUN off in web.ts.'
+    : payload.ok
+      ? 'Bytes overwritten in-place at the existing media_registry key. CDN cache TTL is 60s.'
+      : ('Failed: ' + escapeHtml(payload.reason || 'unknown'));
+  foot.innerHTML = '<div>' + footMsg + '</div><div style="color:#888;">' + (payload.elapsed_ms != null ? payload.elapsed_ms + 'ms' : '') + '</div>';
+  overlay.style.display = 'flex';
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 /**
