@@ -2536,75 +2536,128 @@ refreshTotals();
 // POST /workspace/:slug/brand — save brand guidelines
 // ────────────────────────────────────────────────────────────────────────
 
-async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
+// ────────────────────────────────────────────────────────────────────────
+// Apply endpoints — the production apply pipeline lives in src/apply.ts
+// and matches stormbreaker's behaviour (3 WebP variants → media_registry
+// row → page_info mutation). These handlers are thin: parse + lookup
+// rows + delegate.
+//
+// AUTH — TODO (engineering): no token / Cognito check today. See §4 of
+// docs/apply-api-blueprint.md for the three options. Until we pick
+// one, /api/apply/* is reachable by anyone who can reach the server.
+// On Railway that's everyone on the public domain; tighten before
+// pointing real operators at it for production data outside trusted
+// engineering review.
+// ────────────────────────────────────────────────────────────────────────
+
+async function readApplyBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  let runId = "", imageId = "", imageUrl: string | null = null;
   try {
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
-      run_id?: string;
-      image_id?: string;
-      image_url?: string;
-    };
-    runId = body.run_id ?? "";
-    imageId = body.image_id ?? "";
-    imageUrl = body.image_url ?? null;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
   } catch {
-    return sendJson(res, 400, { error: "invalid JSON body" });
+    return null;
   }
+}
+
+/**
+ * POST /api/apply/image — apply ONE image.
+ * Body: { run_id: string, image_id: string }
+ *
+ * Resolves the CSV row for that image_id, runs the canonical
+ * apply pipeline (resize → 3 S3 PutObjects → media_registry insert
+ * → page_info update), returns the new media_registry UUID + URLs.
+ */
+async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { run_id?: string; image_id?: string } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const runId = body.run_id ?? "";
+  const imageId = body.image_id ?? "";
   if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
 
-  const state = RUNS.get(runId);
-  if (!state) return sendJson(res, 404, { error: `run ${runId} not found` });
-  if (!state.csvPath) return sendJson(res, 400, { error: "run has no CSV yet" });
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
 
-  // Load the CSV row for this image to recover image_url_new + cluster_id
-  // (when the client didn't pass image_url explicitly, e.g. after regen-one
-  // updated the in-page src but not the CSV).
-  let clusterId = "";
-  if (!imageUrl) {
-    const rows = await readRunCsv(state.csvPath);
-    const row = rows.find((r) => r.image_id === imageId);
-    if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
-    if (!row.image_url_new) return sendJson(res, 400, { error: `no new image URL for ${imageId}` });
-    imageUrl = row.image_url_new;
-    clusterId = row.cluster_id;
-  } else {
-    // We still need cluster_id; find via CSV.
-    const rows = await readRunCsv(state.csvPath);
-    const row = rows.find((r) => r.image_id === imageId);
-    if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
-    clusterId = row.cluster_id;
-  }
+  const rows = await readRunCsv(state.csvPath);
+  const row = rows.find((r) => r.image_id === imageId);
+  if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
 
-  // Synthetic cover/thumbnail IDs aren't real S3 paths — refuse for now.
-  if (imageId.includes("/")) {
-    return sendJson(res, 400, {
-      error:
-        `Apply not yet supported for synthetic image_ids (e.g. cover-images/, thumbnail-images/). ` +
-        `These don't map 1:1 to existing S3 keys; cover/thumbnail wiring is the next iteration.`,
-    });
-  }
+  // Pull the apply pipeline in lazily so an import-time failure
+  // (e.g. sharp's native binary on a build without the right
+  // platform support) doesn't kill the whole web process.
+  const { applyOne } = await import("./apply.js");
+  const result = await applyOne({ row });
+  sendJson(res, result.ok ? 200 : 500, result);
+}
 
-  // Look up the project to get staging_subdomain.
-  const entry = findClient(state.client);
-  if (!entry) return sendJson(res, 400, { error: `client ${state.client} not in allow-list` });
-  const project = await lookupProjectById(entry.projectId);
-  if (!project?.staging_subdomain) {
-    return sendJson(res, 500, { error: "project missing staging_subdomain" });
-  }
+/**
+ * POST /api/apply/cluster — apply every supported image in ONE
+ * cluster of a run. Body: { run_id, cluster_id }.
+ * Partial-success tolerant: applies what it can, returns per-image
+ * outcomes. Cover/thumbnail rows in the cluster are skipped with a
+ * clear reason (no support yet — see blueprint §3.5).
+ */
+async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { run_id?: string; cluster_id?: string } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const runId = body.run_id ?? "";
+  const clusterId = body.cluster_id ?? "";
+  if (!runId || !clusterId) return sendJson(res, 400, { error: "run_id and cluster_id required" });
 
-  try {
-    const result = await uploadBlogImage({
-      stagingSubdomain: project.staging_subdomain,
-      clusterId,
-      imageId,
-      imageUrl: imageUrl!,
-    });
-    sendJson(res, 200, { ok: true, ...result, image_id: imageId, cluster_id: clusterId });
-  } catch (err) {
-    sendJson(res, 500, { error: (err as Error).message });
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
+
+  const rows = (await readRunCsv(state.csvPath)).filter((r) => r.cluster_id === clusterId);
+  if (rows.length === 0) {
+    return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
   }
+  const { applyMany } = await import("./apply.js");
+  const results = await applyMany(rows);
+  const applied = results.filter((r) => r.ok);
+  const failed = results.filter((r) => !r.ok);
+  sendJson(res, 200, {
+    ok: failed.length === 0,
+    summary: { total: results.length, applied: applied.length, failed: failed.length },
+    results,
+  });
+}
+
+/**
+ * POST /api/apply/run — apply every supported image across every
+ * cluster in the run. Body: { run_id }.
+ */
+async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as { run_id?: string } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const runId = body.run_id ?? "";
+  if (!runId) return sendJson(res, 400, { error: "run_id required" });
+
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} or its csv not found` });
+
+  const rows = await readRunCsv(state.csvPath);
+  if (rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
+  const { applyMany } = await import("./apply.js");
+  const results = await applyMany(rows);
+  const applied = results.filter((r) => r.ok);
+  const failed = results.filter((r) => !r.ok);
+  sendJson(res, 200, {
+    ok: failed.length === 0,
+    summary: { total: results.length, applied: applied.length, failed: failed.length },
+    results,
+  });
+}
+
+/**
+ * Legacy /api/apply-one — kept for the existing per-card "Apply to
+ * S3" button while we transition the UI. Internally delegates to
+ * the same applyImageHandler so behaviour matches exactly.
+ */
+async function applyOneHandler(req: IncomingMessage, res: ServerResponse) {
+  return applyImageHandler(req, res);
 }
 
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
@@ -3408,32 +3461,9 @@ ${RUNS.size === 0
 </section>`));
 }
 
-interface CsvRowParsed {
-  image_id: string;
-  asset_type: string;
-  cluster_id: string;
-  page_topic: string;
-  image_url_new: string;
-  image_local_path: string;
-  description_used: string;
-  prompt_used: string;
-  aspect_ratio: string;
-  generated_at_utc: string;
-  status: string;
-  error: string;
-  client_slug: string;
-  project_id: string;
-  /** CDN URL of the image this run is replacing. Captured at run-start
-   * from page_info / media_registry. Older CSVs from before this
-   * column existed will have it undefined; we fall back to a
-   * media_registry batch lookup in that case. */
-  previous_image_url?: string;
-  /** Replicate prediction id from this row's generation attempt
-   * (set for both successful and failed rows). Lets a later
-   * regenerate poll-and-recover instead of paying for a fresh call.
-   * Undefined for rows from CSVs written before this column existed. */
-  prediction_id?: string;
-}
+// CsvRowParsed lives in web-types.ts so apply.ts can use it without
+// pulling in the rest of the web server. Re-imported below.
+import type { CsvRowParsed } from "./web-types.js";
 
 async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
   try {
@@ -3619,10 +3649,23 @@ async function runPage(res: ServerResponse, id: string) {
             // CDN URL through to here, so this is true for every card
             // on any run created after that change shipped.
             const canCompare = !!r.image_url_new && !!oldUrl;
+            // Cover & thumbnail go through a separate stormbreaker
+            // flow (FinalizeBlogService) and aren't wired into the
+            // /api/apply/* pipeline yet — disable Apply for them
+            // and include the row in bulk-pick selection but skip
+            // it server-side. See docs/apply-api-blueprint.md §3.5.
+            const applyUnsupported = synthetic
+              || r.asset_type === "cover"
+              || r.asset_type === "thumbnail";
+            const applyDisabledReason = synthetic
+              ? "Apply not yet supported for synthetic cover/thumbnail IDs"
+              : (r.asset_type === "cover" || r.asset_type === "thumbnail")
+                ? "Apply for cover/thumbnail uses a separate stormbreaker flow — not wired yet"
+                : "";
             return `
-<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
-  <label class="rc-pick" title="${synthetic ? "Synthetic ID — Apply not supported" : "Include in bulk actions (Apply / Regenerate)"}">
-    <input type="checkbox" class="rc-pick-cb" ${synthetic || isFailed ? "disabled" : "checked"} onchange="onCardPick(this)">
+<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
+  <label class="rc-pick" title="${applyUnsupported ? esc(applyDisabledReason) : "Include in bulk actions (Apply / Regenerate)"}">
+    <input type="checkbox" class="rc-pick-cb" ${applyUnsupported || isFailed ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
   <div class="rc-img">${previewHtml}
     ${isFailed ? "" : `<button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>`}
@@ -3643,7 +3686,7 @@ async function runPage(res: ServerResponse, id: string) {
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
-      <button class="btn-apply primary" type="button" data-apply ${synthetic ? `disabled title="Apply not yet supported for synthetic cover/thumbnail IDs"` : `title="Push to s3://gw-content-store/website/.../assets/blog-images/<cluster>/<image_id>/{1080,720,360}.webp"`}>Apply to S3</button>
+      <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled title="${esc(applyDisabledReason)}"` : `title="Resize to 1080/720/360 WebP, upload to S3, insert media_registry, update page_info to point at the new media_registry id."`}>Apply to S3</button>
     </div>
   </div>
 </div>`;
@@ -3966,7 +4009,7 @@ function paintCard(imageId, opts) {
     if (s === 'applied') { applyBtn.textContent = 'Applied ✓'; applyBtn.disabled = true; }
     else if (s === 'applying') { applyBtn.textContent = 'Applying…'; applyBtn.disabled = true; }
     else if (s === 'failed') { applyBtn.textContent = 'Retry apply'; applyBtn.disabled = false; }
-    else { applyBtn.textContent = 'Apply to S3'; applyBtn.disabled = card.dataset.synthetic === '1'; }
+    else { applyBtn.textContent = 'Apply to S3'; applyBtn.disabled = card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1'; }
   }
   const errLine = card.querySelector('.rc-status-line');
   if (errLine) {
@@ -3980,21 +4023,29 @@ async function applyOne(imageId) {
   if (cur === 'applied' || cur === 'applying') return;
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
-  if (card.dataset.synthetic === '1') {
-    paintCard(imageId, { error: 'Apply not yet supported for cover/thumbnail synthetic IDs.' });
+  // Cover/thumbnail rows + legacy synthetic IDs aren't supported by
+  // /api/apply/* — the server would 4xx with a clean reason but we
+  // short-circuit client-side so the card flags as failed instantly.
+  if (card.dataset.applyUnsupported === '1' || card.dataset.synthetic === '1') {
+    const msg = card.dataset.synthetic === '1'
+      ? 'Apply not yet supported for synthetic cover/thumbnail IDs.'
+      : 'Apply for cover/thumbnail uses a separate stormbreaker flow — not wired yet.';
     stateOf.set(imageId, 'failed');
-    paintCard(imageId, { error: 'Apply not yet supported for cover/thumbnail synthetic IDs.' });
+    paintCard(imageId, { error: msg });
     refreshTotals();
     return;
   }
   stateOf.set(imageId, 'applying'); paintCard(imageId);
   try {
-    const r = await fetch('/api/apply-one', {
+    // Hit the new canonical endpoint; the legacy /api/apply-one is
+    // an alias for the same handler so either works, but using the
+    // new path keeps server logs aligned with the API contract.
+    const r = await fetch('/api/apply/image', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_id: card.dataset.clusterId })
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId })
     });
     const j = await r.json();
-    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    if (!r.ok || j.ok === false) throw new Error(j.reason || j.error || ('HTTP ' + r.status));
     stateOf.set(imageId, 'applied'); paintCard(imageId);
   } catch (err) {
     stateOf.set(imageId, 'failed');
@@ -4003,32 +4054,89 @@ async function applyOne(imageId) {
   refreshTotals();
 }
 
+/**
+ * Reconcile a batch of per-row results from /api/apply/cluster or
+ * /api/apply/run back into the card state. Each entry is either
+ *   { ok: true, image_id_old, image_id_new, … }
+ * or
+ *   { ok: false, image_id_old, reason }.
+ */
+function applyServerResults(results) {
+  for (const r of results) {
+    const oldId = r.image_id_old || '';
+    if (!oldId) continue;
+    if (r.ok) {
+      stateOf.set(oldId, 'applied');
+      paintCard(oldId);
+    } else {
+      stateOf.set(oldId, 'failed');
+      paintCard(oldId, { error: 'apply failed: ' + (r.reason || 'unknown') });
+    }
+  }
+}
+
 async function applyCluster(clusterId) {
-  const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
-  const ids = [];
+  // Mark every applicable card 'applying' up front so the whole
+  // cluster spins simultaneously — the server fans out internally
+  // and returns all results in one response.
+  const cards = [...document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]')];
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
+    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') continue;
     const s = stateOf.get(id) ?? 'pending';
     if (s === 'applied' || s === 'applying') continue;
-    if (card.dataset.synthetic === '1') continue;
-    ids.push(id);
+    stateOf.set(id, 'applying'); paintCard(id);
   }
-  // Fan out — applies are independent S3 PUTs and the per-card UI
-  // already shows progress, so parallelism is safe and ~5× faster.
-  await Promise.all(ids.map((id) => applyOne(id)));
+  try {
+    const r = await fetch('/api/apply/cluster', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ run_id: RUN_ID, cluster_id: clusterId })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    applyServerResults(j.results || []);
+  } catch (err) {
+    for (const card of cards) {
+      const id = card.dataset.imageId;
+      if (!id) continue;
+      if ((stateOf.get(id) ?? 'pending') !== 'applying') continue;
+      stateOf.set(id, 'failed');
+      paintCard(id, { error: 'apply failed: ' + err.message });
+    }
+  }
+  refreshTotals();
 }
 
 async function applyAll() {
-  const allCards = document.querySelectorAll('.result-card[data-image-id]');
-  for (const card of allCards) {
+  // One POST → server applies every supported row in the run.
+  const cards = [...document.querySelectorAll('.result-card[data-image-id]')];
+  for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
+    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') continue;
     const s = stateOf.get(id) ?? 'pending';
     if (s === 'applied' || s === 'applying') continue;
-    if (card.dataset.synthetic === '1') continue;
-    await applyOne(id);
+    stateOf.set(id, 'applying'); paintCard(id);
   }
+  try {
+    const r = await fetch('/api/apply/run', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ run_id: RUN_ID })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    applyServerResults(j.results || []);
+  } catch (err) {
+    for (const card of cards) {
+      const id = card.dataset.imageId;
+      if (!id) continue;
+      if ((stateOf.get(id) ?? 'pending') !== 'applying') continue;
+      stateOf.set(id, 'failed');
+      paintCard(id, { error: 'apply failed: ' + err.message });
+    }
+  }
+  refreshTotals();
 }
 
 // Per-image / per-cluster / all checkbox tree on the runs page. Synthetic
@@ -4764,7 +4872,10 @@ export function startWebServer(port: number): void {
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
-      if (method === "POST" && p === "/api/apply-one") return await applyOneHandler(req, res);
+      if (method === "POST" && p === "/api/apply-one")     return await applyOneHandler(req, res);
+      if (method === "POST" && p === "/api/apply/image")   return await applyImageHandler(req, res);
+      if (method === "POST" && p === "/api/apply/cluster") return await applyClusterHandler(req, res);
+      if (method === "POST" && p === "/api/apply/run")     return await applyRunHandler(req, res);
       if (method === "GET" && p === "/api/projects/search") {
         try {
           loadEnv();

@@ -77,6 +77,67 @@ export interface ApplyResult {
   bytes: number;
 }
 
+/**
+ * Apply-pipeline upload primitive — writes the 3 WebP variants
+ * (1080/720/360) to S3 at a caller-supplied key prefix. Returns
+ * the absolute CDN URLs ready to drop into media_registry.urls.
+ *
+ * Used by src/apply.ts to mirror stormbreaker's
+ * `convert_and_upload_as_webp` shape from outside the Lambda. The
+ * prefix is asset-type-aware and decided by the caller (we don't
+ * embed routing here):
+ *
+ *   blog inline   → website/<staging>/assets/blog-images/<cluster>/<hash>
+ *   service H1/body, category, generic →
+ *                   website/<staging>/assets/generated-images/<hash>
+ */
+export interface UploadVariantsArgs {
+  /** S3 key prefix WITHOUT a trailing slash and WITHOUT the size suffix.
+   *  Each variant lands at `<keyPrefix>/<size>.webp`. */
+  keyPrefix: string;
+  variants: { width: 360 | 720 | 1080; bytes: Buffer }[];
+}
+export interface UploadVariantsResult {
+  bucket: string;
+  /** Public CDN URL keyed by width-as-string ("360" | "720" | "1080"). */
+  urls: Record<string, string>;
+  /** Final S3 key for each variant — useful for stderr/log lines. */
+  keys: string[];
+}
+
+const CDN_BASE = "https://file-host.link";
+
+export async function uploadVariantsToS3(args: UploadVariantsArgs): Promise<UploadVariantsResult> {
+  const env = loadEnv();
+  const bucket = env.S3_CONTENT_BUCKET;
+  const urls: Record<string, string> = {};
+  const keys: string[] = [];
+  for (const v of args.variants) {
+    const key = `${args.keyPrefix}/${v.width}.webp`;
+    await client().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: v.bytes,
+        ContentType: "image/webp",
+        // Long-lived cache — every apply writes to a NEW hash so the
+        // URL itself is the cache key and we never need to bust it.
+        // Matches stormbreaker's CDN_CACHE_CONTROL.
+        CacheControl: "public, max-age=31536000, immutable",
+      }),
+    );
+    urls[String(v.width)] = `${CDN_BASE}/${key}`;
+    keys.push(key);
+  }
+  return { bucket, urls, keys };
+}
+
+/**
+ * Legacy single-size apply — uploads the SAME source bytes to all 3
+ * S3 size slots without resizing. Retained while the old
+ * /api/apply-one endpoint still has UI callers; the new pipeline in
+ * src/apply.ts uses uploadVariantsToS3 + sharp instead.
+ */
 export async function uploadBlogImage(args: {
   stagingSubdomain: string;
   clusterId: string;

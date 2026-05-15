@@ -243,3 +243,84 @@ export async function publishedClusterCountsByPageType(
   for (const r of res.rows) out[r.page_type] = r.n;
   return out;
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Apply-to-S3 helpers: insert a fresh media_registry row + read/write a
+// cluster's page_info. Used by the canonical apply pipeline (src/apply.ts).
+// All three mirror behaviour in gw-backend-stormbreaker —
+// services/postgres/stormbreaker/media_registry.py and the page_info
+// updaters in handlers/create_pages/update_images.py.
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Insert one media_registry row. Returns the new UUID. Matches
+ * stormbreaker's `bulk_insert_media_entries` shape but for a single
+ * row (we apply one image at a time, with `Promise.all` fan-out for
+ * cluster + run scopes). The `urls` JSONB holds the per-size CDN
+ * URLs; `key` is the canonical S3 key prefix (`blog-images/<cluster>/<hash>`
+ * etc.) the rest of stormbreaker reads from.
+ */
+export async function insertMediaRegistry(args: {
+  projectId: string;
+  key: string;
+  urls: Record<string, string>;
+}): Promise<string> {
+  const sql = `
+    INSERT INTO media_registry (p_id, key, urls)
+    VALUES ($1::uuid, $2, $3::jsonb)
+    RETURNING id::text AS id
+  `;
+  const r = await getPool().query<{ id: string }>(sql, [
+    args.projectId,
+    args.key,
+    JSON.stringify(args.urls),
+  ]);
+  if (!r.rows[0]) throw new Error("media_registry insert returned no row");
+  return r.rows[0].id;
+}
+
+/**
+ * Fetch the page_info of one cluster, plus enough metadata for the
+ * apply pipeline to route correctly (page_type, project_id,
+ * staging_subdomain). Keyed by cluster id so the apply path doesn't
+ * have to re-fetch the parent project separately.
+ */
+export interface ClusterForApply {
+  id: string;
+  p_id: string;
+  page_type: PageType;
+  page_info: ClusterPageInfo;
+  staging_subdomain: string | null;
+}
+export async function getClusterForApply(clusterId: string): Promise<ClusterForApply | null> {
+  const sql = `
+    SELECT c.id::text AS id, c.p_id::text AS p_id, c.page_type, c.page_info,
+           p.staging_subdomain
+    FROM clusters c
+    JOIN projects p ON p.id = c.p_id
+    WHERE c.id = $1::uuid
+    LIMIT 1
+  `;
+  const r = await getPool().query<ClusterForApply>(sql, [clusterId]);
+  return r.rows[0] ?? null;
+}
+
+/**
+ * Overwrite a cluster's page_info with the supplied JSONB. The apply
+ * pipeline reads, mutates the targeted image_id field (or rewrites
+ * the matching <Image imageId="…"/> in blog_text.md), and persists
+ * via this call. We update u_at to NOW() so any downstream consumers
+ * that order by it see the fresh data.
+ */
+export async function updateClusterPageInfo(
+  clusterId: string,
+  pageInfo: unknown,
+): Promise<void> {
+  const sql = `
+    UPDATE clusters
+    SET page_info = $1::jsonb,
+        u_at = NOW()
+    WHERE id = $2::uuid
+  `;
+  await getPool().query(sql, [JSON.stringify(pageInfo), clusterId]);
+}
