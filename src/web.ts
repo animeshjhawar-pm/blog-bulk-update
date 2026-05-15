@@ -1668,6 +1668,10 @@ async function workspacePage(
       by_asset: counts,
       images: recs.map((r) => ({
         id: r.imageId,
+        // Synthetic placeholders contain "/" — let the drawer flag
+        // them visually so the operator knows the image_id won't map
+        // to media_registry until a real ID is wired in.
+        id_is_synthetic: typeof r.imageId === "string" && r.imageId.includes("/"),
         asset: r.asset,
         description: r.description,
         aspect: r.aspectRatio,
@@ -2231,7 +2235,13 @@ function openDrawer(cid) {
         '<div>' +
           '<div class="meta-row">' +
             '<span class="pill ' + img.asset + '">' + img.asset + ' · ' + img.aspect + '</span>' +
-            '<code>' + img.id + '</code>' +
+            // Empty / synthetic ids get a clear visual marker so the
+            // operator can spot a parse miss (e.g. Sentinel <Image>
+            // emitted without imageId, or shape-A fallback to a
+            // placeholder hash) without having to dig into logs.
+            (img.id && !img.id_is_synthetic
+              ? '<code title="canonical image_id from ' + img.source + '">' + img.id + '</code>'
+              : '<code style="background:#fef3c7;color:#92400e;" title="' + (img.id ? 'synthetic placeholder — does not map to media_registry' : 'no image_id parsed from this record') + '">' + (img.id || '⟨no image_id⟩') + '</code>') +
           '</div>' +
           '<div class="desc">' + (img.description || '<em style="color:var(--ink-faint)">(no description)</em>') + '</div>' +
           '<div class="sub" style="margin-top:4px;font-size:11px;color:var(--ink-faint)">source: ' + img.source + '</div>' +

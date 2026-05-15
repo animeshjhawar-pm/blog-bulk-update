@@ -323,9 +323,15 @@ function thumbnailRecord(cluster: ClusterRow): ImageRecord {
 // etc.). We now extract attributes independently from each tag's
 // attribute span: first pluck the whole tag, then pull imageId and
 // alt out by name regardless of where they sit.
-const MDX_IMAGE_TAG_RE = /<Image\b([^>]*)\/>/gi;
-const MDX_ATTR_IMAGE_ID = /\bimageId\s*=\s*"([^"]+)"/i;
-const MDX_ATTR_ALT      = /\balt\s*=\s*"([^"]*)"/i;
+// Both self-closing  <Image .../>  AND non-self-closing  <Image ...>...</Image>
+// forms appear in the wild (Stormbreaker emits self-closing in
+// replace_images.py, but defensively accept both so a renderer change
+// upstream doesn't silently break the drawer's image-id chips).
+// imageId / alt attribute values can be wrapped in either " or '.
+const MDX_IMAGE_TAG_RE =
+  /<Image\b([^>]*?)(?:\/>|>[\s\S]*?<\/Image>)/gi;
+const MDX_ATTR_IMAGE_ID = /\bimageId\s*=\s*["']([^"']+)["']/i;
+const MDX_ATTR_ALT      = /\balt\s*=\s*["']([^"']*)["']/i;
 
 interface MdxImageTag {
   imageId: string;
@@ -334,12 +340,21 @@ interface MdxImageTag {
 
 function scanMdxImageTags(md: string): MdxImageTag[] {
   const out: MdxImageTag[] = [];
+  let skippedNoId = 0;
   for (const m of md.matchAll(MDX_IMAGE_TAG_RE)) {
     const attrs = m[1] ?? "";
     const imageId = (MDX_ATTR_IMAGE_ID.exec(attrs)?.[1] ?? "").trim();
-    if (!imageId) continue;
+    if (!imageId) { skippedNoId++; continue; }
     const alt = (MDX_ATTR_ALT.exec(attrs)?.[1] ?? "").trim();
     out.push({ imageId, alt });
+  }
+  if (skippedNoId > 0) {
+    // Helpful breadcrumb when a Sentinel-style blog's <Image> tags are
+    // emitted without imageId — those rows would otherwise vanish
+    // silently from the workspace drawer.
+    process.stderr.write(
+      `scanMdxImageTags: skipped ${skippedNoId} <Image> tag(s) with no imageId attribute\n`,
+    );
   }
   return out;
 }
