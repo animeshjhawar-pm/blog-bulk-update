@@ -156,6 +156,16 @@ export interface BuildPromptParams {
    */
   blogTopic?: string;
   /**
+   * Per-record aspect ratio (e.g. "16:9", "1:1", "3:2"). Interpolated
+   * as `{{aspect_ratio}}` in the infographic + page (internal/external/
+   * generic + service/category) user templates so Claude composes for
+   * the same canvas Replicate is asked to render. Was previously
+   * hardcoded inside the templates ("16:9" in infographic, "1:1" in
+   * page), so service_body/category infographics generated for the
+   * wrong canvas.
+   */
+  aspectRatio?: string;
+  /**
    * Per-run system+user prompt overrides keyed by prompt group. When
    * the asset's group has an override, those texts replace the
    * defaults baked into prompts/*.ts — but only for THIS call.
@@ -248,6 +258,7 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
     subtitle: params.subtitle ?? "",
     category_label: params.categoryLabel ?? "",
     blog_topic: params.blogTopic ?? "",
+    aspect_ratio: params.aspectRatio ?? "",
     additional_instructions: additionalInstructions ?? "",
   });
 

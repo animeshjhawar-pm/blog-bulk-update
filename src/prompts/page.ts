@@ -409,7 +409,7 @@ export const BUILD_IMAGE_PROMPT_USER_TEMPLATE_PAGE = `
 
 <context>
 {
-  "aspect_ratio": "1:1"
+  "aspect_ratio": "{{aspect_ratio}}"
 }
 </context>
 `.trim();

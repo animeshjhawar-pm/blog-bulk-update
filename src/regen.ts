@@ -289,6 +289,14 @@ async function processOne(args: {
         // {{blog_topic}}; without this the block lands empty and Claude
         // invents a topic from business_context.
         blogTopic: record.cluster.topic ?? "",
+        // Per-record aspect ratio (16:9 for infographic / internal /
+        // external / generic; 1:1 for service_h1 / service_body /
+        // category_industry; per-tag override possible via context).
+        // The infographic + page templates interpolate this into their
+        // <context>{ "aspect_ratio": "{{aspect_ratio}}" }</context>
+        // block so Claude composes for the same canvas Replicate will
+        // render (Replicate gets aspectRatio separately via generate()).
+        aspectRatio: record.aspectRatio,
       });
       // buildImagePrompt already prepended the saved-token directives.
       // When per-run extras are present, we re-apply with the merged

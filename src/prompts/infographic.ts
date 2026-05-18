@@ -559,7 +559,7 @@ export const GENERATE_INFOGRAPHIC_USER_TEMPLATE_NEW = `
 
 <context>
 {
-  "aspect_ratio": "16:9"
+  "aspect_ratio": "{{aspect_ratio}}"
 }
 </context>
 `.trim();
