@@ -997,6 +997,12 @@ interface RecentRunSummary {
   finished_at: string | null;
   ok: number;
   failed: number;
+  /** Total rows the run was scheduled to process; null for very old manifests. */
+  total: number | null;
+  /** Images successfully Applied-to-S3 for this run (sidecar). */
+  applied: number;
+  /** "blog" / "service+category" etc, comma/+-joined when multiple. */
+  page_types: string | null;
   csv: string | null;
   html: string | null;
   run_id: string | null;
@@ -1020,6 +1026,9 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
       const j = JSON.parse(raw);
       const csvPath = typeof j.csv === "string" ? j.csv : null;
       const htmlPath = typeof j.html === "string" ? j.html : null;
+      const runId = typeof j.run_id === "string" ? j.run_id : null;
+      const total = typeof j.total_rows === "number" ? j.total_rows : null;
+      const applied = runId ? await loadAppliedCount(runId) : 0;
       out.push({
         manifest: n,
         client: j.client ?? "",
@@ -1030,9 +1039,12 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
         finished_at: j.finished_at ?? null,
         ok: j.summary?.ok ?? 0,
         failed: j.summary?.failed ?? 0,
+        total,
+        applied,
+        page_types: typeof j.page_type === "string" ? j.page_type : Array.isArray(j.page_type) ? j.page_type.join("+") : null,
         csv: csvPath,
         html: htmlPath,
-        run_id: typeof j.run_id === "string" ? j.run_id : null,
+        run_id: runId,
       });
     } catch {
       /* skip corrupt manifest */
@@ -1083,39 +1095,56 @@ async function homePage(res: ServerResponse) {
     envOk
       ? loadClientPickerEntries()
       : Promise.resolve(CLIENTS.map((c) => ({ slug: c.slug, projectId: c.projectId, name: c.slug }))),
-    envOk ? loadRecentRuns(50) : Promise.resolve([] as RecentRunSummary[]),
+    envOk ? loadRecentRuns(200) : Promise.resolve([] as RecentRunSummary[]),
   ]);
   const featuredJson = JSON.stringify(featured);
   const recentRows = recent
     .map((r) => {
       const istLabel = formatIst(r.started_at);
-      const status = !r.finished_at
+      // status pill — running / failed / partial / ok / pending-apply
+      const statusKey = !r.finished_at
+        ? "running"
+        : r.failed > 0 && r.ok > 0
+          ? "partial"
+          : r.failed > 0
+            ? "failed"
+            : "ok";
+      const statusPill = statusKey === "running"
         ? `<span class="pill infographic">running</span>`
-        : r.failed > 0
-          ? `<span class="pill external">${r.failed} failed</span>`
-          : `<span class="pill internal">${r.ok} ok</span>`;
-      // Recent runs are now navigation-only: every column is wrapped in
-      // the run link, no duplicate "open run / CSV" cell. Rows missing a
-      // run_id (very old manifests) just render unlinked.
+        : statusKey === "partial"
+          ? `<span class="pill external" title="some images failed in this run">${r.failed} failed · ${r.ok} ok</span>`
+          : statusKey === "failed"
+            ? `<span class="pill external">${r.failed} failed</span>`
+            : `<span class="pill internal">${r.ok} ok</span>`;
+      const totalLabel = r.total != null ? r.total : (r.ok + r.failed) || "—";
+      const regeneratedLabel = r.ok;
+      const appliedLabel = r.applied;
+      const appliedPct = r.ok > 0 ? Math.round((r.applied / r.ok) * 100) : 0;
+      const appliedCell = r.applied > 0
+        ? `<span title="${r.applied} of ${r.ok} regenerated images applied (${appliedPct}%)" style="color:#0a7;font-weight:600">${appliedLabel}</span>`
+        : `<span style="color:var(--ink-faint)">0</span>`;
       const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
       const displayName = r.client_name ?? r.client;
       const nameCell = `${fav}<span>${esc(displayName)}</span>`;
-      // data-search holds the lowercased client name so the client-side
-      // search filter can hide non-matching rows in O(1) per row.
-      const searchKey = (displayName ?? "").toLowerCase();
-      if (r.run_id) {
-        return `
-<tr class="recent-row" data-search="${esc(searchKey)}" onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer">
-  <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${nameCell}</a></td>
-  <td><a href="/runs/${esc(r.run_id)}" class="recent-link"><span class="ts-ist">${esc(istLabel)}</span></a></td>
-  <td><a href="/runs/${esc(r.run_id)}" class="recent-link">${status}</a></td>
-</tr>`;
-      }
+      const pageTypesCell = r.page_types
+        ? `<span class="sub" style="font-size:11px;color:var(--ink-faint)">${esc(r.page_types)}</span>`
+        : "";
+      // data-search holds the lowercased client name + page_types so
+      // the filter input matches either; data-status drives the
+      // status-filter dropdown.
+      const searchKey = [displayName, r.page_types].filter(Boolean).join(" ").toLowerCase();
+      const linkOpen = r.run_id ? `<a href="/runs/${esc(r.run_id)}" class="recent-link">` : `<span class="recent-link">`;
+      const linkClose = r.run_id ? `</a>` : `</span>`;
+      const rowAttr = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer"` : "";
       return `
-<tr class="recent-row" data-search="${esc(searchKey)}">
-  <td>${nameCell}</td>
-  <td><span class="ts-ist">${esc(istLabel)}</span></td>
-  <td>${status}</td>
+<tr class="recent-row" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}"${rowAttr}>
+  <td>${linkOpen}${nameCell}${linkClose}</td>
+  <td>${linkOpen}${pageTypesCell}${linkClose}</td>
+  <td>${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
+  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${totalLabel}${linkClose}</td>
+  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${regeneratedLabel}${linkClose}</td>
+  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${appliedCell}${linkClose}</td>
+  <td>${linkOpen}${statusPill}${linkClose}</td>
 </tr>`;
     })
     .join("");
@@ -1155,36 +1184,69 @@ async function homePage(res: ServerResponse) {
 
 ${recent.length > 0 ? `
 <section class="card" style="padding:0;margin-top:18px">
-  <div class="recent-head">
+  <div class="recent-head" style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap">
     <h2 style="margin:0">Recent runs</h2>
-    <span class="sub" style="margin-left:6px;color:var(--ink-faint)" id="recent-count">${recent.length}</span>
-    <input type="search"
-           id="recent-search"
-           placeholder="Filter by client name…"
-           autocomplete="off"
-           style="margin-left:auto;max-width:260px;font-size:13px;padding:6px 10px"
-           oninput="filterRecentRuns(this.value)">
+    <span class="sub" style="color:var(--ink-faint)" id="recent-count">${recent.length}</span>
+    <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="search"
+             id="recent-search"
+             placeholder="Filter by client or page type…"
+             autocomplete="off"
+             style="max-width:240px;font-size:13px;padding:6px 10px"
+             oninput="filterRecentRuns()">
+      <select id="recent-status-filter" onchange="filterRecentRuns()" style="font-size:13px;padding:6px 8px">
+        <option value="">All statuses</option>
+        <option value="running">Running</option>
+        <option value="ok">Completed (no failures)</option>
+        <option value="partial">Partial (some failed)</option>
+        <option value="failed">Failed (all failed)</option>
+      </select>
+      <select id="recent-applied-filter" onchange="filterRecentRuns()" style="font-size:13px;padding:6px 8px">
+        <option value="">All apply state</option>
+        <option value="1">Has applies</option>
+        <option value="0">Not yet applied</option>
+      </select>
+    </div>
   </div>
-  <table class="cluster-list"><tbody id="recent-tbody">${recentRows}</tbody></table>
-  <div id="recent-empty" class="sub" style="display:none;padding:16px 18px;text-align:center">No runs match that search.</div>
+  <div style="overflow-x:auto">
+  <table class="cluster-list" style="width:100%">
+    <thead>
+      <tr style="background:var(--bg-faint)">
+        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Client</th>
+        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Page type</th>
+        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Started</th>
+        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Total images the run was scheduled to process">Total</th>
+        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Images successfully regenerated">Regen</th>
+        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Images successfully Applied-to-S3 from this run">Applied</th>
+        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Status</th>
+      </tr>
+    </thead>
+    <tbody id="recent-tbody">${recentRows}</tbody>
+  </table>
+  </div>
+  <div id="recent-empty" class="sub" style="display:none;padding:16px 18px;text-align:center">No runs match the filters.</div>
   <script>
-    // Client-side filter — works on the data-search attribute we
-    // stamped on each <tr>. Cheap even at 50 rows; instant feedback.
-    function filterRecentRuns(q) {
-      const needle = (q || '').toLowerCase().trim();
+    // Combined client-side filter — name/page_type substring + status
+    // pill match + applied-state flag. All three AND together. Cheap
+    // even at 200 rows; instant feedback.
+    function filterRecentRuns() {
+      const needle = (document.getElementById('recent-search').value || '').toLowerCase().trim();
+      const statusF = document.getElementById('recent-status-filter').value;
+      const appliedF = document.getElementById('recent-applied-filter').value;
       const rows = document.querySelectorAll('#recent-tbody tr.recent-row');
       let visible = 0;
       for (const tr of rows) {
-        const hit = !needle || (tr.dataset.search || '').includes(needle);
+        const okSearch = !needle || (tr.dataset.search || '').includes(needle);
+        const okStatus = !statusF || tr.dataset.status === statusF;
+        const okApplied = !appliedF || tr.dataset.applied === appliedF;
+        const hit = okSearch && okStatus && okApplied;
         tr.style.display = hit ? '' : 'none';
         if (hit) visible++;
       }
       const total = rows.length;
-      document.getElementById('recent-count').textContent = needle
-        ? visible + ' / ' + total
-        : total;
-      document.getElementById('recent-empty').style.display =
-        (needle && visible === 0) ? 'block' : 'none';
+      const filtered = needle || statusF || appliedF;
+      document.getElementById('recent-count').textContent = filtered ? (visible + ' / ' + total) : total;
+      document.getElementById('recent-empty').style.display = (filtered && visible === 0) ? 'block' : 'none';
     }
   </script>
 </section>` : `
@@ -2676,8 +2738,21 @@ async function resolveRunRows(
 ): Promise<{ rows: CsvRowParsed[] } | { error: string; code: number }> {
   let state = RUNS.get(runId) ?? null;
   if (!state) state = await tryReconstructRunFromDisk(runId);
-  if (!state || !state.csvPath) return { error: `run ${runId} or its csv not found`, code: 404 };
-  return { rows: await readRunCsv(state.csvPath) };
+  if (!state || !state.csvPath) {
+    return { error: `Run ${runId} not found — no in-memory state and no manifest on disk. The container may have been redeployed and the run is older than its retention window, or the manifest was pruned.`, code: 404 };
+  }
+  const r = await readRunCsv(state.csvPath);
+  if ("error" in r) {
+    // Surface the real reason so the operator sees "csv missing on
+    // disk" / "csv malformed" instead of the misleading "image_id not
+    // in csv" downstream. Path drift after a Railway redeploy lands
+    // here (manifest's absolute csv path points at the old container
+    // filesystem); tryReconstructRunFromDisk now re-resolves basenames
+    // against runOutDir(), so this branch only fires when the CSV is
+    // genuinely missing from the volume.
+    return { error: r.error, code: r.code === "ENOENT" ? 410 : 500 };
+  }
+  return { rows: r.rows };
 }
 
 async function runRepointPipeline(
@@ -2685,6 +2760,7 @@ async function runRepointPipeline(
   scopeRows: CsvRowParsed[],
   dryRun: boolean,
   scopeLabel: string,
+  runId?: string,
 ) {
   const tk = requireApiToken();
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
@@ -2746,6 +2822,12 @@ async function runRepointPipeline(
     };
   });
   const okN = results.filter((r) => r.ok).length;
+  // Persist a sidecar so the recent-runs view can show how many
+  // images have actually been applied. Skipped for dry-runs.
+  if (runId && !dryRun) {
+    const appliedIds = results.filter((r) => r.ok).map((r) => r.image_id_old).filter(Boolean);
+    void recordAppliedImages(runId, appliedIds);
+  }
   const payload = {
     ok: results.every((r) => r.ok),
     dry_run: dryRun,
@@ -2756,6 +2838,45 @@ async function runRepointPipeline(
     ...(results.length === 1 ? results[0] : {}),
   };
   return sendJson(res, 200, payload);
+}
+
+/**
+ * Sidecar persistence for applied image_ids per run. One file per run
+ * at `<runOutDir>/applied-<runId>.json` shaped:
+ *   { image_ids: ["id1", "id2", …], updated_at: "<iso>" }
+ *
+ * Read by loadRecentRuns to surface the "applied" count alongside
+ * ok/failed/total in the home-page recent-runs table. Survives
+ * redeploys because it lives on the same persistent volume as the
+ * manifest. Best-effort writes — a sidecar failure never blocks an
+ * apply response.
+ */
+async function recordAppliedImages(runId: string, imageIds: string[]): Promise<void> {
+  if (!runId || imageIds.length === 0) return;
+  const p = path.join(runOutDir(), `applied-${runId}.json`);
+  let existing: string[] = [];
+  try {
+    const raw = await fs.readFile(p, "utf8");
+    const j = JSON.parse(raw) as { image_ids?: unknown };
+    if (Array.isArray(j.image_ids)) existing = j.image_ids.filter((x): x is string => typeof x === "string");
+  } catch { /* first write or unreadable — start fresh */ }
+  const set = new Set(existing);
+  for (const id of imageIds) set.add(id);
+  const payload = { image_ids: [...set], updated_at: new Date().toISOString() };
+  try {
+    await fs.writeFile(p, JSON.stringify(payload) + "\n", "utf8");
+  } catch (err) {
+    process.stderr.write(`recordAppliedImages: ${p} write failed: ${(err as Error).message}\n`);
+  }
+}
+
+async function loadAppliedCount(runId: string): Promise<number> {
+  const p = path.join(runOutDir(), `applied-${runId}.json`);
+  try {
+    const raw = await fs.readFile(p, "utf8");
+    const j = JSON.parse(raw) as { image_ids?: unknown };
+    return Array.isArray(j.image_ids) ? j.image_ids.length : 0;
+  } catch { return 0; }
 }
 
 /**
@@ -2776,8 +2897,16 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
   const r = await resolveRunRows(runId);
   if ("error" in r) return sendJson(res, r.code, { error: r.error });
   const scope = r.rows.filter((x) => x.image_id === imageId);
-  if (scope.length === 0) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
-  return runRepointPipeline(res, scope, dryRun, `image ${imageId}`);
+  if (scope.length === 0) {
+    // Distinguish "CSV present but row missing" from "CSV had zero
+    // rows (parsed empty or wrong shape)" so the operator can tell
+    // a data mismatch from a path/parse failure.
+    if (r.rows.length === 0) {
+      return sendJson(res, 410, { error: `Run ${runId} CSV parsed as empty — file may be truncated or schema drifted. Re-run Generate or check the manifest's csv path on the volume.` });
+    }
+    return sendJson(res, 404, { error: `image_id "${imageId}" is not in run ${runId} (${r.rows.length} rows checked). Likely cause: the cluster's thumbnail / page_info was updated by Stormbreaker between Generate and Apply, so the live image_id no longer matches what was recorded at Generate time. Re-import the cluster and Generate again.` });
+  }
+  return runRepointPipeline(res, scope, dryRun, `image ${imageId}`, runId);
 }
 
 /**
@@ -2800,7 +2929,7 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const scope = r.rows.filter((x) => x.cluster_id === clusterId);
   if (scope.length === 0)
     return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
-  return runRepointPipeline(res, scope, dryRun, `cluster ${clusterId}`);
+  return runRepointPipeline(res, scope, dryRun, `cluster ${clusterId}`, runId);
 }
 
 /**
@@ -2819,7 +2948,7 @@ async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
   const r = await resolveRunRows(runId);
   if ("error" in r) return sendJson(res, r.code, { error: r.error });
   if (r.rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
-  return runRepointPipeline(res, r.rows, dryRun, `run ${runId}`);
+  return runRepointPipeline(res, r.rows, dryRun, `run ${runId}`, runId);
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2944,7 +3073,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   let promptOverrideFile: string | undefined;
   let resumePredictionId: string | undefined;
   if (parent.csvPath) {
-    const rows = await readRunCsv(parent.csvPath);
+    const rows = await readRunCsvOrEmpty(parent.csvPath);
     const row = rows.find((r) => r.image_id === imageId);
     if (row) {
       if (!clusterId) clusterId = row.cluster_id;
@@ -3007,7 +3136,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   if (child.exitCode !== 0 || !child.csvPath) {
     return sendJson(res, 500, { error: `regen subprocess failed (exit ${child.exitCode})`, run_id: child.id });
   }
-  const childRows = await readRunCsv(child.csvPath);
+  const childRows = await readRunCsvOrEmpty(child.csvPath);
   const childRow = childRows.find((r) => r.image_id === imageId);
   if (!childRow || !childRow.image_url_new) {
     return sendJson(res, 500, { error: `no new image URL produced for ${imageId}`, run_id: child.id });
@@ -3720,14 +3849,38 @@ ${RUNS.size === 0
 // pulling in the rest of the web server. Re-imported below.
 import type { CsvRowParsed } from "./web-types.js";
 
-async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
+/**
+ * Returns the parsed rows on success, or an error result that callers
+ * can surface to the operator. The original behaviour (swallow + return
+ * []) silently masked CSV-missing / CSV-malformed errors as "image_id
+ * not in CSV", which made post-deploy path drift on Railway look like a
+ * data bug. Callers that prefer the legacy contract (just want rows or
+ * empty) can use `readRunCsvOrEmpty`.
+ */
+async function readRunCsv(csvPath: string): Promise<
+  { rows: CsvRowParsed[] } | { error: string; code: "ENOENT" | "EPARSE" | "EOTHER" }
+> {
+  let raw: string;
   try {
-    const raw = await fs.readFile(csvPath, "utf8");
-    const rows = csvParse(raw, { columns: true, skip_empty_lines: true }) as CsvRowParsed[];
-    return rows;
-  } catch {
-    return [];
+    raw = await fs.readFile(csvPath, "utf8");
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") {
+      return { error: `CSV file missing on disk: ${csvPath}`, code: "ENOENT" };
+    }
+    return { error: `CSV file read failed (${e.code ?? "?"}): ${csvPath} — ${e.message}`, code: "EOTHER" };
   }
+  try {
+    const rows = csvParse(raw, { columns: true, skip_empty_lines: true }) as CsvRowParsed[];
+    return { rows };
+  } catch (err) {
+    return { error: `CSV parse failed at ${csvPath}: ${(err as Error).message}`, code: "EPARSE" };
+  }
+}
+
+async function readRunCsvOrEmpty(csvPath: string): Promise<CsvRowParsed[]> {
+  const r = await readRunCsv(csvPath);
+  return "rows" in r ? r.rows : [];
 }
 
 /**
@@ -3736,6 +3889,34 @@ async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
  * can render from. log + listeners are empty (the live process is gone);
  * csvPath / htmlPath / done / exitCode come from the manifest.
  */
+/**
+ * Resolve a path field stored in a manifest. Old manifests baked
+ * absolute paths into csv/html (e.g. /app/out/foo.csv when cwd was
+ * /app, before RUN_OUT_DIR landed). After a redeploy that flipped the
+ * runs directory to a Railway Volume at /data/runs, those absolute
+ * paths no longer exist — but the files themselves WERE migrated /
+ * still live alongside their manifest. We rescue them by also trying
+ * the basename against the current runOutDir().
+ *
+ * Order: (1) the stored absolute path — works when nothing moved;
+ * (2) basename joined to runOutDir() — works after a volume remount.
+ * Returns the first path that exists on disk, or null if both miss.
+ */
+async function rehydrateManifestPath(stored: unknown): Promise<string | null> {
+  if (typeof stored !== "string" || !stored) return null;
+  try {
+    await fs.access(stored);
+    return stored;
+  } catch { /* fall through */ }
+  const basename = path.basename(stored);
+  const candidate = path.join(runOutDir(), basename);
+  try {
+    await fs.access(candidate);
+    return candidate;
+  } catch { /* fall through */ }
+  return null;
+}
+
 async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
   const dir = runOutDir();
   let names: string[];
@@ -3750,7 +3931,11 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
       const raw = await fs.readFile(path.join(dir, n), "utf8");
       const j = JSON.parse(raw);
       if (j?.run_id !== id) continue;
-      // Match — synthesise.
+      // Match — synthesise. Rehydrate csv/html paths so old manifests
+      // whose absolute paths point at a previous cwd / volume mount
+      // still resolve to the actual file on the current filesystem.
+      const csvPath = await rehydrateManifestPath(j.csv);
+      const htmlPath = await rehydrateManifestPath(j.html);
       const state: RunState = {
         id,
         client: typeof j.client === "string" ? j.client : "",
@@ -3759,8 +3944,8 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
         log: ["(log not available — server was restarted after this run finished)\n"],
         done: true,
         exitCode: 0,
-        csvPath: typeof j.csv === "string" ? j.csv : undefined,
-        htmlPath: typeof j.html === "string" ? j.html : undefined,
+        csvPath: csvPath ?? undefined,
+        htmlPath: htmlPath ?? undefined,
         proc: { kill() { /* no-op */ } } as unknown as ChildProcess,
         listeners: new Set(),
       };
@@ -3817,7 +4002,7 @@ async function runPage(res: ServerResponse, id: string) {
   // in the sticky publish action bar at the bottom of the page.
   let resultsHtml = "";
   if (state.done && state.csvPath) {
-    const rows = await readRunCsv(state.csvPath);
+    const rows = await readRunCsvOrEmpty(state.csvPath);
     if (rows.length > 0) {
       const grouped = new Map<string, { topic: string; rows: CsvRowParsed[] }>();
       for (const r of rows) {
@@ -5159,7 +5344,7 @@ async function runDownloadOne(
     send(res, 404, "text/plain", "run or csv not found");
     return;
   }
-  const rows = await readRunCsv(state.csvPath);
+  const rows = await readRunCsvOrEmpty(state.csvPath);
   const row = rows.find((r) => r.image_id === imageId);
   if (!row) {
     send(res, 404, "text/plain", `image ${imageId} not in run`);
@@ -5234,7 +5419,7 @@ async function runDownloadZip(req: IncomingMessage, res: ServerResponse, runId: 
     send(res, 404, "text/plain", "run or csv not found");
     return;
   }
-  const rows = await readRunCsv(state.csvPath);
+  const rows = await readRunCsvOrEmpty(state.csvPath);
   const usable = rows.filter((r) => r.image_url_new || r.image_local_path);
   if (usable.length === 0) {
     send(res, 404, "text/plain", "no completed images in this run");

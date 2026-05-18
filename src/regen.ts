@@ -512,9 +512,15 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     token_source: tokenSource,
     provider: options.provider ?? loadEnv().IMAGE_PROVIDER,
     concurrency: options.concurrency,
+    page_type: Array.isArray(pageTypeOpt) ? pageTypeOpt : [pageTypeOpt],
     started_at: startedAt,
+    // Absolute path for current readers + basename for future readers
+    // (basename survives runOutDir changes / Railway volume remounts;
+    // rehydrateManifestPath in web.ts falls back to it when csv 404s).
     csv: csvPath,
+    csv_basename: path.basename(csvPath),
     html: htmlPath,
+    html_basename: path.basename(htmlPath),
     total_rows: records.length,
   };
   await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
