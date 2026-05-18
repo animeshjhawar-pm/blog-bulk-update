@@ -337,6 +337,12 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
      denser row; subtle right-alignment for the counters. */
   table.recent-runs { width: 100%; }
   table.recent-runs th, table.recent-runs td { padding: 9px 12px; font-size: 13px; vertical-align: middle; }
+  /* The .cluster-list base sets th { position: sticky; top: 49px } —
+     that's right for the cluster picker on the workspace page (which
+     has a 49px sub-nav above) but on the home page there's no nav,
+     so the sticky offset leaves a 49px phantom gap above the header
+     row. Reset to static for the recent-runs context. */
+  table.recent-runs th { position: static; top: auto; background: #f8fafc; }
   table.recent-runs th.num, table.recent-runs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   table.recent-runs th.num { padding-right: 14px; }
   table.recent-runs td.client { white-space: nowrap; }
@@ -351,27 +357,30 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   table.recent-runs a.recent-link { color: inherit; text-decoration: none; display: block; }
   table.recent-runs tr.row-hidden { display: none; }
 
+  /* Single-line toolbar: title + count + search + filter dropdowns
+     all on one row. Search bar takes the spare horizontal space
+     (flex:1) so it never forces the dropdowns to wrap. */
   .recent-toolbar {
     display: flex; align-items: center; gap: 10px;
     padding: 12px 16px; border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
   }
-  .recent-toolbar h2 { margin: 0; font-size: 16px; }
+  .recent-toolbar h2 { margin: 0; font-size: 16px; flex-shrink: 0; }
   .recent-toolbar .count-chip {
     background: #eef2f7; color: var(--ink-muted);
     padding: 2px 8px; border-radius: 999px; font-size: 12px;
-    font-variant-numeric: tabular-nums;
+    font-variant-numeric: tabular-nums; flex-shrink: 0;
   }
-  .recent-toolbar .filters {
-    margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  .recent-toolbar input[type="search"] {
+    flex: 1 1 220px; min-width: 0;
   }
   .recent-toolbar input[type="search"],
   .recent-toolbar select {
     font-size: 13px; padding: 6px 10px; border: 1px solid var(--border);
     border-radius: 6px; background: #fff; color: var(--ink);
+    height: 34px; box-sizing: border-box;
   }
-  .recent-toolbar input[type="search"] { min-width: 220px; }
-  .recent-toolbar select { cursor: pointer; }
+  .recent-toolbar select { cursor: pointer; flex-shrink: 0; }
 
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
   .pill.cover { background: #dbeafe; color: #1e40af; }
@@ -1230,25 +1239,23 @@ ${recent.length > 0 ? `
   <div class="recent-toolbar">
     <h2>Recent runs</h2>
     <span class="count-chip" id="recent-count">${recent.length}</span>
-    <div class="filters">
-      <input type="search"
-             id="recent-search"
-             placeholder="Filter by client or page type…"
-             autocomplete="off"
-             oninput="filterRecentRuns()">
-      <select id="recent-status-filter" onchange="filterRecentRuns()" title="Status filter">
-        <option value="">All statuses</option>
-        <option value="running">Running</option>
-        <option value="ok">Completed</option>
-        <option value="partial">Partial</option>
-        <option value="failed">Failed</option>
-      </select>
-      <select id="recent-applied-filter" onchange="filterRecentRuns()" title="Apply state">
-        <option value="">All apply state</option>
-        <option value="1">Has applies</option>
-        <option value="0">Not yet applied</option>
-      </select>
-    </div>
+    <input type="search"
+           id="recent-search"
+           placeholder="Filter by client or page type…"
+           autocomplete="off"
+           oninput="filterRecentRuns()">
+    <select id="recent-status-filter" onchange="filterRecentRuns()" title="Status filter">
+      <option value="">All statuses</option>
+      <option value="running">Running</option>
+      <option value="ok">Completed</option>
+      <option value="partial">Partial</option>
+      <option value="failed">Failed</option>
+    </select>
+    <select id="recent-applied-filter" onchange="filterRecentRuns()" title="Apply state">
+      <option value="">All apply state</option>
+      <option value="1">Has applies</option>
+      <option value="0">Not yet applied</option>
+    </select>
   </div>
   <div style="overflow-x:auto">
     <table class="cluster-list recent-runs">
