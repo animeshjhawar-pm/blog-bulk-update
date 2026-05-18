@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { runOutDir } from "./runOutDir.js";
 import { parse as csvParse } from "csv-parse/sync";
 import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
@@ -310,7 +311,7 @@ export async function repointMappingRows(
     arr.push(r);
   }
 
-  const outDir = path.resolve(process.cwd(), "out");
+  const outDir = runOutDir();
   const backupDir = path.join(outDir, "repoint-backups");
   const previewDir = path.join(outDir, "repoint-preview");
   await fs.mkdir(backupDir, { recursive: true });

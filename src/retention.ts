@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { runOutDir } from "./runOutDir.js";
 
 /**
  * Run-artefact retention.
@@ -123,7 +124,7 @@ async function dirSize(p: string): Promise<number> {
  */
 export async function sweepRunRetention(
   cfg: RetentionConfig = loadRetentionConfig(),
-  outDir: string = path.resolve(process.cwd(), "out"),
+  outDir: string = runOutDir(),
 ): Promise<SweepResult> {
   const result: SweepResult = {
     scanned: 0,

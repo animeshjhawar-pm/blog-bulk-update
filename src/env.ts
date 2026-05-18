@@ -27,6 +27,14 @@ const Schema = z.object({
   /** Bucket where rendered blog images live (cover/thumbnail/inline). Apply
    * step writes here at `website/<staging>/assets/blog-images/<cluster>/<image_id>/{size}.webp`. */
   S3_CONTENT_BUCKET: z.preprocess(emptyToUndef, z.string().min(1).default("gw-content-store")),
+  /**
+   * Directory where run artefacts (manifest, csv, html, images) live.
+   * Defaults to `<cwd>/out` for local dev. On Railway, point this at
+   * a mounted Volume path (e.g. `/data/runs`) so runs survive deploys.
+   * Empty / unset → default applies. Accessed via `runOutDir()` in
+   * src/runOutDir.ts so the rest of the codebase has one source of truth.
+   */
+  RUN_OUT_DIR: z.preprocess(emptyToUndef, z.string().min(1).optional()),
 });
 
 export type Env = z.infer<typeof Schema>;

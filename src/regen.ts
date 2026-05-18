@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { loadEnv } from "./env.js";
+import { runOutDir } from "./runOutDir.js";
 import {
   closePool,
   listPublishedClusters,
@@ -283,6 +284,11 @@ async function processOne(args: {
         clientHomepageUrl: project.url ?? "",
         projectId: project.id,
         promptOverrides: options.promptOverrides,
+        // cluster.topic is the blog title for blog clusters. The cover
+        // (+ thumbnail, which re-exports cover) user template references
+        // {{blog_topic}}; without this the block lands empty and Claude
+        // invents a topic from business_context.
+        blogTopic: record.cluster.topic ?? "",
       });
       // buildImagePrompt already prepended the saved-token directives.
       // When per-run extras are present, we re-apply with the merged
@@ -475,7 +481,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   }
 
   const stamp = utcStamp();
-  const outDir = path.resolve(process.cwd(), "out");
+  const outDir = runOutDir();
   await fs.mkdir(outDir, { recursive: true });
 
   const csvPath = path.join(outDir, `${slug}-${stamp}.csv`);

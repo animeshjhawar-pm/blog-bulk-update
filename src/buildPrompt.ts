@@ -148,6 +148,14 @@ export interface BuildPromptParams {
   subtitle?: string;
   categoryLabel?: string;
   /**
+   * The cluster's blog topic. Interpolated as `{{blog_topic}}` in the
+   * cover/thumbnail user template. Was previously omitted, which made
+   * the `<blog_topic>` block in the prompt arrive empty and Claude
+   * fabricated a topic from business_context. Always pass this for
+   * blog page_type — callers from other page types can leave it unset.
+   */
+  blogTopic?: string;
+  /**
    * Per-run system+user prompt overrides keyed by prompt group. When
    * the asset's group has an override, those texts replace the
    * defaults baked into prompts/*.ts — but only for THIS call.
@@ -239,6 +247,7 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
     client_homepage_url: params.clientHomepageUrl ?? "",
     subtitle: params.subtitle ?? "",
     category_label: params.categoryLabel ?? "",
+    blog_topic: params.blogTopic ?? "",
     additional_instructions: additionalInstructions ?? "",
   });
 

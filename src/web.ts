@@ -6,6 +6,7 @@ import {
 import { spawn, type ChildProcess } from "node:child_process";
 import { createReadStream, statSync } from "node:fs";
 import path from "node:path";
+import { runOutDir } from "./runOutDir.js";
 import { randomUUID } from "node:crypto";
 import { CLIENTS, findClient } from "./clients.js";
 import {
@@ -1002,7 +1003,7 @@ interface RecentRunSummary {
 }
 
 async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
-  const dir = path.resolve(process.cwd(), "out");
+  const dir = runOutDir();
   let names: string[];
   try {
     names = await fs.readdir(dir);
@@ -2948,7 +2949,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     if (row) {
       if (!clusterId) clusterId = row.cluster_id;
       if (row.prompt_used && row.prompt_used.trim().length > 0) {
-        const tmpDir = path.resolve(process.cwd(), "out");
+        const tmpDir = runOutDir();
         const fname = `prompt-override-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
         promptOverrideFile = path.join(tmpDir, fname);
         await fs.mkdir(tmpDir, { recursive: true });
@@ -2967,7 +2968,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   // per-record top-priority directive block at generation time.
   let extraInstructionsFile: string | undefined;
   if (customInstructions.length > 0) {
-    const tmpDir = path.resolve(process.cwd(), "out");
+    const tmpDir = runOutDir();
     const fname = `extra-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
     extraInstructionsFile = path.join(tmpDir, fname);
     await fs.mkdir(tmpDir, { recursive: true });
@@ -3494,7 +3495,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
         if (Object.keys(entry).length > 0) cleaned[k] = entry;
       }
       if (Object.keys(cleaned).length > 0) {
-        const tmpDir = path.resolve(process.cwd(), "out");
+        const tmpDir = runOutDir();
         await fs.mkdir(tmpDir, { recursive: true });
         promptOverridesFile = path.join(tmpDir, `prompt-overrides-${Date.now()}.json`);
         await fs.writeFile(promptOverridesFile, JSON.stringify(cleaned), "utf8");
@@ -3736,7 +3737,7 @@ async function readRunCsv(csvPath: string): Promise<CsvRowParsed[]> {
  * csvPath / htmlPath / done / exitCode come from the manifest.
  */
 async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
-  const dir = path.resolve(process.cwd(), "out");
+  const dir = runOutDir();
   let names: string[];
   try {
     names = await fs.readdir(dir);
