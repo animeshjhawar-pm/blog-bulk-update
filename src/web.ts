@@ -4122,8 +4122,14 @@ async function runPage(res: ServerResponse, id: string) {
             // future cards added dynamically). For failed/no-image
             // rows we render an unmistakable failure placeholder
             // instead of a bare status string.
-            const previewHtml = r.image_url_new
-              ? `<img class="rc-preview-img" src="${esc(r.image_url_new)}" alt="" loading="lazy">`
+            // Preview is served through /runs/<id>/preview/<image_id>
+            // — our own endpoint that streams the local file first
+            // and only falls back to the (1-hour-TTL) Replicate URL
+            // when local is missing. Wiring it through our endpoint
+            // means shared run URLs keep rendering long after the
+            // Replicate signed URL expires.
+            const previewHtml = (r.image_url_new || r.image_local_path)
+              ? `<img class="rc-preview-img" src="/runs/${esc(id)}/preview/${encodeURIComponent(r.image_id)}" alt="" loading="lazy">`
               : isFailed
                 ? `<div class="ph ph-failed"><span class="ph-failed-icon">⚠</span><span>Generation failed</span><span class="ph-failed-hint">Hit ↻ Regenerate to retry</span></div>`
                 : `<div class="ph">${esc(r.status)}</div>`;
@@ -5114,7 +5120,15 @@ async function regenOne(imageId, customInstructions) {
     if (!r.ok) throw new Error(await r.text());
     const j = await r.json();
     const img = card.querySelector('.rc-img img');
-    if (img && j.image_url_new) img.src = j.image_url_new;
+    if (img && (j.image_url_new || j.image_local_path)) {
+      // Route through our /preview/ endpoint so the swapped image
+      // stays loadable past the Replicate signed-URL TTL — the
+      // regen handler updated the parent CSV in place, so /preview
+      // serves the new local file. Cache-buster on the query side
+      // forces the browser to re-fetch instead of showing the
+      // stale image bytes still in cache for this src.
+      img.src = '/runs/' + encodeURIComponent(RUN_ID) + '/preview/' + encodeURIComponent(imageId) + '?t=' + Date.now();
+    }
     // A regenerated image returns to pending so the operator decides
     // whether to Apply this one.
     stateOf.set(imageId, 'pending');
@@ -5328,14 +5342,44 @@ async function openImageStream(
   if (local) {
     try {
       const abs = path.resolve(local);
-      const root = path.resolve(process.cwd());
-      if (abs.startsWith(root)) {
+      // Allow files under either the current cwd OR the configured
+      // RUN_OUT_DIR. Older CSV rows were written when cwd === out's
+      // parent, so abs.startsWith(cwd) was equivalent to "under
+      // runOutDir". After the Railway volume rollout, runOutDir
+      // resolves to /data/runs, but cwd is /app — the cwd check
+      // alone would reject every legitimate file on the volume.
+      const cwdRoot = path.resolve(process.cwd());
+      const outRoot = runOutDir();
+      if (abs.startsWith(cwdRoot) || abs.startsWith(outRoot)) {
         const st = statSync(abs);
         if (st.isFile()) {
           return {
             stream: createReadStream(abs),
             size: st.size,
             ext: extOf(abs),
+            localMtimeMs: st.mtimeMs,
+          };
+        }
+      }
+    } catch { /* fall through to remote */ }
+  }
+  // Fallback: try the basename of the recorded local path against
+  // runOutDir(). Older CSV rows persisted absolute paths that no
+  // longer exist verbatim after a redeploy (e.g. /app/out/runs/<id>/
+  // images/foo.webp written when runOutDir was <cwd>/out), but the
+  // file itself was migrated alongside the manifest to /data/runs/
+  // runs/<id>/images/foo.webp. Re-resolve the basename + run subdir
+  // against the current runOutDir so shared run URLs keep working.
+  if (local) {
+    try {
+      const candidate = rehydrateLocalImagePath(local);
+      if (candidate) {
+        const st = statSync(candidate);
+        if (st.isFile()) {
+          return {
+            stream: createReadStream(candidate),
+            size: st.size,
+            ext: extOf(candidate),
             localMtimeMs: st.mtimeMs,
           };
         }
@@ -5386,6 +5430,95 @@ function fetchAsStream(url: string, maxRedirects = 3): Promise<Readable | null> 
     req.on("error", () => resolve(null));
     req.end();
   });
+}
+
+/**
+ * Re-resolve a CSV-stored image_local_path against the current
+ * runOutDir(). Image paths land in CSV as absolute (e.g.
+ * /app/out/runs/<id>/images/<basename>); after a Railway redeploy
+ * the volume is mounted at /data/runs, so the verbatim path 404s
+ * but the bytes are present at /data/runs/runs/<id>/images/<basename>.
+ *
+ * Walks back from the file to find the run-scoped subtree
+ * ("runs/<id>/images/<basename>" or "images/<basename>") and joins it
+ * onto runOutDir(). Returns null if no candidate exists.
+ */
+function rehydrateLocalImagePath(stored: string): string | null {
+  // Try to extract the trailing `runs/<runId>/images/<basename>` /
+  // `images/<basename>` substring out of the stored absolute path.
+  const m = stored.match(/(?:^|\/)(runs\/[a-f0-9]+\/images\/[^/]+|images\/[^/]+\/[^/]+)$/i);
+  if (!m || !m[1]) return null;
+  return path.join(runOutDir(), m[1]);
+}
+
+/** Inline-serving counterpart of runDownloadOne — same source-of-
+ * truth (openImageStream: local-first, remote-fallback), but no
+ * Content-Disposition: attachment header, so the response can be the
+ * src= target of an <img> tag. Used by the runs page card previews
+ * so shared run URLs keep rendering after the Replicate signed URL
+ * window expires (~1 hour). */
+async function runPreviewOne(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) {
+    send(res, 404, "text/plain", "run or csv not found");
+    return;
+  }
+  const rows = await readRunCsvOrEmpty(state.csvPath);
+  const row = rows.find((r) => r.image_id === imageId);
+  if (!row) {
+    send(res, 404, "text/plain", `image ${imageId} not in run`);
+    return;
+  }
+  const opened = await openImageStream(row);
+  if (!opened) {
+    // 410 Gone — the file's been pruned by retention and the
+    // Replicate URL has expired. The card-rendering JS treats any
+    // image error by leaving the placeholder visible.
+    send(res, 410, "text/plain", "image bytes no longer available");
+    return;
+  }
+  const headers: Record<string, string> = {
+    "content-type": IMAGE_CT[opened.ext] ?? "application/octet-stream",
+    // Long cache — image content for a finished run is immutable,
+    // and the URL is keyed by image_id. Re-regen creates a NEW
+    // child run with a new id, so this caches cleanly.
+    "cache-control": "private, max-age=86400",
+    "accept-ranges": "none",
+  };
+  if (opened.size != null) headers["content-length"] = String(opened.size);
+  if (opened.localMtimeMs != null && opened.size != null) {
+    const lastMod = new Date(opened.localMtimeMs).toUTCString();
+    const etag = `W/"${opened.size.toString(16)}-${Math.floor(opened.localMtimeMs).toString(16)}"`;
+    headers["last-modified"] = lastMod;
+    headers["etag"] = etag;
+    const ifNoneMatch = req.headers["if-none-match"];
+    const ifModSince = req.headers["if-modified-since"];
+    const matches = (typeof ifNoneMatch === "string" && ifNoneMatch === etag)
+      || (typeof ifModSince === "string"
+        && !Number.isNaN(Date.parse(ifModSince))
+        && opened.localMtimeMs <= Date.parse(ifModSince) + 999);
+    if (matches) {
+      try { opened.stream.destroy(); } catch { /* */ }
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+  }
+  if (req.method === "HEAD") {
+    try { opened.stream.destroy(); } catch { /* */ }
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, headers);
+  opened.stream.pipe(res);
+  opened.stream.on("error", () => { try { res.destroy(); } catch { /* */ } });
 }
 
 async function runDownloadOne(
@@ -5737,6 +5870,10 @@ export function startWebServer(port: number): void {
       const runOneMatch = /^\/runs\/([a-f0-9]+)\/download\/(.+)$/.exec(p);
       if ((method === "GET" || method === "HEAD") && runOneMatch && runOneMatch[1] && runOneMatch[2]) {
         return await runDownloadOne(req, res, runOneMatch[1], decodeURIComponent(runOneMatch[2]));
+      }
+      const runPreviewMatch = /^\/runs\/([a-f0-9]+)\/preview\/(.+)$/.exec(p);
+      if ((method === "GET" || method === "HEAD") && runPreviewMatch && runPreviewMatch[1] && runPreviewMatch[2]) {
+        return await runPreviewOne(req, res, runPreviewMatch[1], decodeURIComponent(runPreviewMatch[2]));
       }
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {
