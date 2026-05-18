@@ -332,6 +332,47 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   table.cluster-list td.preview .ar-1x1  { width: 48px; height: 48px; }
   table.cluster-list td.types .pills-wrap { display: flex; flex-wrap: wrap; gap: 3px; }
 
+  /* Recent-runs table — dedicated tweaks on top of the .cluster-list
+     base styles. Tabular nums for the numeric columns; a slightly
+     denser row; subtle right-alignment for the counters. */
+  table.recent-runs { width: 100%; }
+  table.recent-runs th, table.recent-runs td { padding: 9px 12px; font-size: 13px; vertical-align: middle; }
+  table.recent-runs th.num, table.recent-runs td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.recent-runs th.num { padding-right: 14px; }
+  table.recent-runs td.client { white-space: nowrap; }
+  table.recent-runs td.client .fav { width: 16px; height: 16px; vertical-align: middle; margin-right: 6px; border-radius: 3px; }
+  table.recent-runs td.pt { font-size: 11px; color: var(--ink-muted); white-space: nowrap; }
+  table.recent-runs td.started { font-size: 12px; color: var(--ink-muted); white-space: nowrap; }
+  table.recent-runs td.applied-cell { font-variant-numeric: tabular-nums; text-align: right; }
+  table.recent-runs td.applied-cell .has { color: #047857; font-weight: 600; }
+  table.recent-runs td.applied-cell .none { color: var(--ink-faint); }
+  table.recent-runs tr.recent-row { cursor: pointer; }
+  table.recent-runs tr.recent-row:hover td { background: #f8fafc; }
+  table.recent-runs a.recent-link { color: inherit; text-decoration: none; display: block; }
+  table.recent-runs tr.row-hidden { display: none; }
+
+  .recent-toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .recent-toolbar h2 { margin: 0; font-size: 16px; }
+  .recent-toolbar .count-chip {
+    background: #eef2f7; color: var(--ink-muted);
+    padding: 2px 8px; border-radius: 999px; font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .recent-toolbar .filters {
+    margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+  .recent-toolbar input[type="search"],
+  .recent-toolbar select {
+    font-size: 13px; padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 6px; background: #fff; color: var(--ink);
+  }
+  .recent-toolbar input[type="search"] { min-width: 220px; }
+  .recent-toolbar select { cursor: pointer; }
+
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
   .pill.cover { background: #dbeafe; color: #1e40af; }
   .pill.thumbnail { background: #ede9fe; color: #5b21b6; }
@@ -1027,7 +1068,15 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
       const csvPath = typeof j.csv === "string" ? j.csv : null;
       const htmlPath = typeof j.html === "string" ? j.html : null;
       const runId = typeof j.run_id === "string" ? j.run_id : null;
-      const total = typeof j.total_rows === "number" ? j.total_rows : null;
+      // total_rows landed in the manifest schema fairly recently; for
+      // older manifests, fall back to ok+failed (the final summary
+      // counts every row that was processed end-to-end). If even that
+      // is absent, we'll render "—" so it's honest about being legacy.
+      const total = typeof j.total_rows === "number"
+        ? j.total_rows
+        : (typeof j.summary?.ok === "number" || typeof j.summary?.failed === "number")
+          ? (j.summary?.ok ?? 0) + (j.summary?.failed ?? 0)
+          : null;
       const applied = runId ? await loadAppliedCount(runId) : 0;
       out.push({
         manifest: n,
@@ -1116,34 +1165,28 @@ async function homePage(res: ServerResponse) {
           : statusKey === "failed"
             ? `<span class="pill external">${r.failed} failed</span>`
             : `<span class="pill internal">${r.ok} ok</span>`;
-      const totalLabel = r.total != null ? r.total : (r.ok + r.failed) || "—";
-      const regeneratedLabel = r.ok;
-      const appliedLabel = r.applied;
+      const totalLabel = r.total != null ? String(r.total) : "—";
+      const regeneratedLabel = (r.ok || r.failed) ? String(r.ok) : "—";
       const appliedPct = r.ok > 0 ? Math.round((r.applied / r.ok) * 100) : 0;
-      const appliedCell = r.applied > 0
-        ? `<span title="${r.applied} of ${r.ok} regenerated images applied (${appliedPct}%)" style="color:#0a7;font-weight:600">${appliedLabel}</span>`
-        : `<span style="color:var(--ink-faint)">0</span>`;
+      const appliedInner = r.applied > 0
+        ? `<span class="has" title="${r.applied} of ${r.ok} regenerated images uploaded to S3 (${appliedPct}%)">${r.applied}</span>`
+        : `<span class="none">0</span>`;
       const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
       const displayName = r.client_name ?? r.client;
-      const nameCell = `${fav}<span>${esc(displayName)}</span>`;
-      const pageTypesCell = r.page_types
-        ? `<span class="sub" style="font-size:11px;color:var(--ink-faint)">${esc(r.page_types)}</span>`
-        : "";
-      // data-search holds the lowercased client name + page_types so
-      // the filter input matches either; data-status drives the
-      // status-filter dropdown.
+      const nameInner = `${fav}<span>${esc(displayName)}</span>`;
+      const pageTypeInner = r.page_types ? esc(r.page_types) : "—";
       const searchKey = [displayName, r.page_types].filter(Boolean).join(" ").toLowerCase();
       const linkOpen = r.run_id ? `<a href="/runs/${esc(r.run_id)}" class="recent-link">` : `<span class="recent-link">`;
       const linkClose = r.run_id ? `</a>` : `</span>`;
-      const rowAttr = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'" style="cursor:pointer"` : "";
+      const rowOnClick = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'"` : "";
       return `
-<tr class="recent-row" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}"${rowAttr}>
-  <td>${linkOpen}${nameCell}${linkClose}</td>
-  <td>${linkOpen}${pageTypesCell}${linkClose}</td>
-  <td>${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
-  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${totalLabel}${linkClose}</td>
-  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${regeneratedLabel}${linkClose}</td>
-  <td style="text-align:right;font-variant-numeric:tabular-nums">${linkOpen}${appliedCell}${linkClose}</td>
+<tr class="recent-row" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}"${rowOnClick}>
+  <td class="client">${linkOpen}${nameInner}${linkClose}</td>
+  <td class="pt">${linkOpen}${pageTypeInner}${linkClose}</td>
+  <td class="started">${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
+  <td class="num">${linkOpen}${totalLabel}${linkClose}</td>
+  <td class="num">${linkOpen}${regeneratedLabel}${linkClose}</td>
+  <td class="applied-cell">${linkOpen}${appliedInner}${linkClose}</td>
   <td>${linkOpen}${statusPill}${linkClose}</td>
 </tr>`;
     })
@@ -1184,24 +1227,23 @@ async function homePage(res: ServerResponse) {
 
 ${recent.length > 0 ? `
 <section class="card" style="padding:0;margin-top:18px">
-  <div class="recent-head" style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap">
-    <h2 style="margin:0">Recent runs</h2>
-    <span class="sub" style="color:var(--ink-faint)" id="recent-count">${recent.length}</span>
-    <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <div class="recent-toolbar">
+    <h2>Recent runs</h2>
+    <span class="count-chip" id="recent-count">${recent.length}</span>
+    <div class="filters">
       <input type="search"
              id="recent-search"
              placeholder="Filter by client or page type…"
              autocomplete="off"
-             style="max-width:240px;font-size:13px;padding:6px 10px"
              oninput="filterRecentRuns()">
-      <select id="recent-status-filter" onchange="filterRecentRuns()" style="font-size:13px;padding:6px 8px">
+      <select id="recent-status-filter" onchange="filterRecentRuns()" title="Status filter">
         <option value="">All statuses</option>
         <option value="running">Running</option>
-        <option value="ok">Completed (no failures)</option>
-        <option value="partial">Partial (some failed)</option>
-        <option value="failed">Failed (all failed)</option>
+        <option value="ok">Completed</option>
+        <option value="partial">Partial</option>
+        <option value="failed">Failed</option>
       </select>
-      <select id="recent-applied-filter" onchange="filterRecentRuns()" style="font-size:13px;padding:6px 8px">
+      <select id="recent-applied-filter" onchange="filterRecentRuns()" title="Apply state">
         <option value="">All apply state</option>
         <option value="1">Has applies</option>
         <option value="0">Not yet applied</option>
@@ -1209,20 +1251,20 @@ ${recent.length > 0 ? `
     </div>
   </div>
   <div style="overflow-x:auto">
-  <table class="cluster-list" style="width:100%">
-    <thead>
-      <tr style="background:var(--bg-faint)">
-        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Client</th>
-        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Page type</th>
-        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Started</th>
-        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Total images the run was scheduled to process">Total</th>
-        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Images successfully regenerated">Regen</th>
-        <th style="text-align:right;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em" title="Images successfully Applied-to-S3 from this run">Applied</th>
-        <th style="text-align:left;padding:8px 12px;font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.04em">Status</th>
-      </tr>
-    </thead>
-    <tbody id="recent-tbody">${recentRows}</tbody>
-  </table>
+    <table class="cluster-list recent-runs">
+      <thead>
+        <tr>
+          <th>Client</th>
+          <th>Page type</th>
+          <th>Started</th>
+          <th class="num" title="Total images the run was scheduled to process">Total</th>
+          <th class="num" title="Images successfully regenerated">Regen</th>
+          <th class="num" title="Images uploaded to S3 from this run (Apply count)">Applied</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="recent-tbody">${recentRows}</tbody>
+    </table>
   </div>
   <div id="recent-empty" class="sub" style="display:none;padding:16px 18px;text-align:center">No runs match the filters.</div>
   <script>
@@ -2823,10 +2865,17 @@ async function runRepointPipeline(
   });
   const okN = results.filter((r) => r.ok).length;
   // Persist a sidecar so the recent-runs view can show how many
-  // images have actually been applied. Skipped for dry-runs.
-  if (runId && !dryRun) {
-    const appliedIds = results.filter((r) => r.ok).map((r) => r.image_id_old).filter(Boolean);
-    void recordAppliedImages(runId, appliedIds);
+  // images have actually been pushed to S3 via this run. We count
+  // every successful UPLOAD (the persistent side-effect — bytes on
+  // S3) regardless of dry_run, because dry-run still uploads; only
+  // the page_info repoint PUT is gated on dry_run. Each id is set-
+  // unioned in the sidecar so re-applies don't double-count.
+  if (runId) {
+    const uploadedIds = up.mapping
+      .filter((m) => m.upload_status === "uploaded")
+      .map((m) => m.old_image_id)
+      .filter(Boolean);
+    if (uploadedIds.length > 0) void recordAppliedImages(runId, uploadedIds);
   }
   const payload = {
     ok: results.every((r) => r.ok),
