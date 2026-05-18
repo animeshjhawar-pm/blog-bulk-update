@@ -5,6 +5,7 @@ import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
 import { closePool, lookupMediaRegistryForId, type MediaRegistryRow } from "./db.js";
 import { makeLimiter } from "./concurrency.js";
+import { runOutDir } from "./runOutDir.js";
 import type { CsvRowParsed } from "./web-types.js";
 
 /**
@@ -89,11 +90,36 @@ async function readSourceBytes(
 ): Promise<{ bytes: Buffer; source: "local" | "remote" }> {
   const local = (row.image_local_path ?? "").trim();
   if (local) {
+    // Allow files under either cwd OR runOutDir(). Before
+    // RUN_OUT_DIR existed, cwd was the natural parent of "out" so
+    // abs.startsWith(cwd) covered everything. On Railway with the
+    // /data/runs volume, cwd is /app and abs is /data/runs/runs/<id>/
+    // images/... — the cwd-only check rejected every legit file and
+    // silently fell through to fetching the Replicate URL, which
+    // expires after ~1h. For mass-applies of 50+ images, the early
+    // rows' URLs had already expired by the time Apply hit them →
+    // remote fetch returned 4xx → upload step failed. The repoint
+    // cluster gate then rolled this up into "skip-whole-cluster"
+    // and the operator just saw "apply failed: unknown" because
+    // the per-row error was masked.
     const abs = path.resolve(local);
-    const root = path.resolve(process.cwd());
-    if (abs.startsWith(root)) {
+    const cwdRoot = path.resolve(process.cwd());
+    const outRoot = runOutDir();
+    if (abs.startsWith(cwdRoot) || abs.startsWith(outRoot)) {
       try {
         return { bytes: await fs.readFile(abs), source: "local" };
+      } catch {
+        /* fall through to rehydration */
+      }
+    }
+    // Verbatim path missing (stored absolute path predates the
+    // current runOutDir / Railway volume remount). Try to recover
+    // the run-scoped basename against the current runOutDir.
+    const m = local.match(/(?:^|\/)(runs\/[a-f0-9]+\/images\/[^/]+|images\/[^/]+\/[^/]+)$/i);
+    if (m && m[1]) {
+      const candidate = path.join(runOutDir(), m[1]);
+      try {
+        return { bytes: await fs.readFile(candidate), source: "local" };
       } catch {
         /* fall through to remote */
       }
@@ -104,7 +130,15 @@ async function readSourceBytes(
     throw new Error("no usable source: image_local_path and image_url_new both empty/unreadable");
   }
   const resp = await fetch(remote);
-  if (!resp.ok) throw new Error(`download ${remote} failed: HTTP ${resp.status}`);
+  if (!resp.ok) {
+    // Replicate signed-URL TTL is ~1h. After that this branch fires
+    // on every retry until the file is regenerated. Make the error
+    // explicit so the operator knows what to do.
+    const hint = resp.status === 403 || resp.status === 404 || resp.status === 410
+      ? " — Replicate URL likely expired (TTL ~1h after generation). Re-run Regenerate for this row to mint a fresh local file."
+      : "";
+    throw new Error(`download ${remote} failed: HTTP ${resp.status}${hint}`);
+  }
   return { bytes: Buffer.from(await resp.arrayBuffer()), source: "remote" };
 }
 

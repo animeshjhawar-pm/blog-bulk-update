@@ -2858,13 +2858,26 @@ async function runRepointPipeline(
             : "error",
       detail: oc ? oc.reason : "no cluster outcome (upload failed?)",
     };
+    // Reason priority: row-level upload error wins over cluster
+    // rollup. The cluster gate says things like "1/6 image(s) not
+    // 'uploaded' — skip-whole-cluster", which is useless for
+    // diagnosing the actual row failure. Surface the specific
+    // upload_error (HTTP code, expired URL, etc.) so the operator
+    // sees the actionable message. Falls back to the cluster
+    // outcome's reason for rows where upload succeeded but the
+    // cluster as a whole was skipped or failed.
+    const rowReason = !uploaded && m.upload_error
+      ? m.upload_error
+      : oc
+        ? oc.reason
+        : uploadStep.detail;
     return {
       ok,
       dry_run: dryRun,
       image_id_old: m.old_image_id,
       image_id_new: m.new_image_id,
       key_prefix: m.new_refined_key,
-      reason: ok ? "" : oc ? oc.reason : uploadStep.detail,
+      reason: ok ? "" : (rowReason || `apply failed for ${m.old_image_id} (no upstream error message — check server logs)`),
       asset_type: m.asset_type,
       cluster_id: m.cluster_id,
       steps: [uploadStep, repStep],
