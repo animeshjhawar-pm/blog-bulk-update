@@ -42,8 +42,15 @@ export function loadRetentionConfig(): RetentionConfig {
   const max = Number.parseInt(process.env.MAX_RUNS_KEPT ?? "", 10);
   const repl = Number.parseFloat(process.env.REPLICATE_URL_TTL_HOURS ?? "");
   return {
-    retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 168, // 7 days
-    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 50,
+    // Default bumped from 7d -> 30d so the recent-runs UI (which
+    // surfaces up to 200 runs across 4 tabs) doesn't silently lose
+    // historical runs. Files live on the Railway volume mounted at
+    // RUN_OUT_DIR, so disk pressure is the only reason to evict.
+    retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 720, // 30 days
+    // Bumped from 50 -> 250 so the UI's 200-row window never gets
+    // pruned out from under the operator. The cap protects the
+    // volume from runaway growth on long-running deployments.
+    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 250,
     replicateUrlTtlHours: Number.isFinite(repl) && repl > 0 ? repl : 1,
   };
 }

@@ -351,11 +351,44 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   table.recent-runs td.started { font-size: 12px; color: var(--ink-muted); white-space: nowrap; }
   table.recent-runs td.applied-cell { font-variant-numeric: tabular-nums; text-align: right; }
   table.recent-runs td.applied-cell .has { color: #047857; font-weight: 600; }
+  table.recent-runs td.applied-cell .has .check { margin-left: 4px; color: #16a34a; font-weight: 700; }
   table.recent-runs td.applied-cell .none { color: var(--ink-faint); }
   table.recent-runs tr.recent-row { cursor: pointer; }
   table.recent-runs tr.recent-row:hover td { background: #f8fafc; }
   table.recent-runs a.recent-link { color: inherit; text-decoration: none; display: block; }
   table.recent-runs tr.row-hidden { display: none; }
+  /* Green left-edge stripe + soft tint for fully-applied runs so a
+     glance at the table shows which clients are fully published.
+     Partial-apply runs get a milder amber stripe; runs with zero
+     applies stay neutral. */
+  table.recent-runs tr.apply-full td:first-child {
+    box-shadow: inset 3px 0 0 #16a34a;
+  }
+  table.recent-runs tr.apply-full td { background: #f0fdf4; }
+  table.recent-runs tr.apply-full:hover td { background: #dcfce7; }
+  table.recent-runs tr.apply-partial td:first-child {
+    box-shadow: inset 3px 0 0 #f59e0b;
+  }
+
+  /* Tab bar above the recent-runs table — newest 50 / next 50 / etc.
+     Active tab gets a brand-coloured underline; inactive tabs are
+     muted text on a transparent background, hover lifts them. The
+     bar lives between the toolbar and the table. */
+  .recent-tabs {
+    display: flex; gap: 4px; padding: 0 16px;
+    border-bottom: 1px solid var(--border); background: #fbfbfd;
+  }
+  .recent-tabs button {
+    background: transparent; border: 0; padding: 10px 14px;
+    font-size: 13px; color: var(--ink-muted); cursor: pointer;
+    border-bottom: 2px solid transparent;
+    font-variant-numeric: tabular-nums;
+  }
+  .recent-tabs button:hover { color: var(--ink); }
+  .recent-tabs button.active {
+    color: var(--ink); font-weight: 600;
+    border-bottom-color: var(--brand, #2563eb);
+  }
 
   /* Single-line toolbar: title + count + search + filter dropdowns
      all on one row. Search bar takes the spare horizontal space
@@ -1156,8 +1189,13 @@ async function homePage(res: ServerResponse) {
     envOk ? loadRecentRuns(200) : Promise.resolve([] as RecentRunSummary[]),
   ]);
   const featuredJson = JSON.stringify(featured);
+  const RUNS_PER_TAB = 50;
+  // page-index per row so we can split them client-side into 4 tabs
+  // without re-rendering. Search-across-all is the default behaviour
+  // (filter spans every row regardless of active tab).
   const recentRows = recent
-    .map((r) => {
+    .map((r, i) => {
+      const pageIdx = Math.floor(i / RUNS_PER_TAB); // 0..3
       const istLabel = formatIst(r.started_at);
       // status pill — running / failed / partial / ok / pending-apply
       const statusKey = !r.finished_at
@@ -1177,9 +1215,22 @@ async function homePage(res: ServerResponse) {
       const totalLabel = r.total != null ? String(r.total) : "—";
       const regeneratedLabel = (r.ok || r.failed) ? String(r.ok) : "—";
       const appliedPct = r.ok > 0 ? Math.round((r.applied / r.ok) * 100) : 0;
-      const appliedInner = r.applied > 0
-        ? `<span class="has" title="${r.applied} of ${r.ok} regenerated images uploaded to S3 (${appliedPct}%)">${r.applied}</span>`
-        : `<span class="none">0</span>`;
+      // Apply-state classification:
+      //   full    — every regenerated image was also applied to S3
+      //   partial — some applied, some still pending
+      //   none    — nothing applied yet
+      // The full case gets a left-edge green stripe + chip in the row
+      // so a glance at the table shows "this run is fully published".
+      const applyState = r.ok > 0 && r.applied >= r.ok
+        ? "full"
+        : r.applied > 0
+          ? "partial"
+          : "none";
+      const appliedInner = applyState === "full"
+        ? `<span class="has all" title="all ${r.applied} regenerated images uploaded to S3">${r.applied}<span class="check">✓</span></span>`
+        : applyState === "partial"
+          ? `<span class="has" title="${r.applied} of ${r.ok} regenerated images uploaded to S3 (${appliedPct}%)">${r.applied}</span>`
+          : `<span class="none">0</span>`;
       const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
       const displayName = r.client_name ?? r.client;
       const nameInner = `${fav}<span>${esc(displayName)}</span>`;
@@ -1189,7 +1240,7 @@ async function homePage(res: ServerResponse) {
       const linkClose = r.run_id ? `</a>` : `</span>`;
       const rowOnClick = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'"` : "";
       return `
-<tr class="recent-row" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}"${rowOnClick}>
+<tr class="recent-row apply-${applyState}" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}" data-apply-state="${applyState}" data-page="${pageIdx}"${rowOnClick}>
   <td class="client">${linkOpen}${nameInner}${linkClose}</td>
   <td class="pt">${linkOpen}${pageTypeInner}${linkClose}</td>
   <td class="started">${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
@@ -1200,6 +1251,22 @@ async function homePage(res: ServerResponse) {
 </tr>`;
     })
     .join("");
+  // Tab metadata for the client-side switcher. Each tab covers a
+  // contiguous slice of 50 rows in newest-first order. Search
+  // queries span ALL rows regardless of which tab is active; the
+  // tab only governs which rows are visible when no filter is set.
+  const totalRuns = recent.length;
+  const tabCount = Math.min(4, Math.ceil(totalRuns / RUNS_PER_TAB) || 1);
+  const tabsBar = totalRuns > RUNS_PER_TAB
+    ? `<div class="recent-tabs" id="recent-tabs">
+        ${Array.from({ length: tabCount }, (_, i) => {
+          const start = i * RUNS_PER_TAB + 1;
+          const end = Math.min((i + 1) * RUNS_PER_TAB, totalRuns);
+          const active = i === 0 ? ' aria-selected="true" class="active"' : '';
+          return `<button type="button" role="tab" data-tab="${i}"${active} onclick="switchRecentTab(${i})">${start}–${end}</button>`;
+        }).join("")}
+      </div>`
+    : "";
 
   sendHtml(res, 200, shell("Home", `
 <section class="hero">
@@ -1257,6 +1324,7 @@ ${recent.length > 0 ? `
       <option value="0">Not yet applied</option>
     </select>
   </div>
+  ${tabsBar}
   <div style="overflow-x:auto">
     <table class="cluster-list recent-runs">
       <thead>
@@ -1276,27 +1344,49 @@ ${recent.length > 0 ? `
   <div id="recent-empty" class="sub" style="display:none;padding:16px 18px;text-align:center">No runs match the filters.</div>
   <script>
     // Combined client-side filter — name/page_type substring + status
-    // pill match + applied-state flag. All three AND together. Cheap
-    // even at 200 rows; instant feedback.
+    // pill match + applied-state flag. All three AND together.
+    // Tab behaviour:
+    //   - When NO filter is active, only the rows belonging to the
+    //     currently-active tab (data-page === activeTab) are shown.
+    //     This pages 200 runs into 4 tabs of 50.
+    //   - When ANY filter is set (search / status / apply-state),
+    //     the tab restriction is dropped — matches span every row
+    //     across every tab so search-across-all works naturally.
+    let __recentActiveTab = 0;
+    function switchRecentTab(idx) {
+      __recentActiveTab = idx;
+      const buttons = document.querySelectorAll('#recent-tabs button');
+      buttons.forEach((b) => {
+        const isActive = Number(b.dataset.tab) === idx;
+        b.classList.toggle('active', isActive);
+        if (isActive) b.setAttribute('aria-selected', 'true');
+        else b.removeAttribute('aria-selected');
+      });
+      filterRecentRuns();
+    }
     function filterRecentRuns() {
       const needle = (document.getElementById('recent-search').value || '').toLowerCase().trim();
       const statusF = document.getElementById('recent-status-filter').value;
       const appliedF = document.getElementById('recent-applied-filter').value;
       const rows = document.querySelectorAll('#recent-tbody tr.recent-row');
+      const filtered = !!(needle || statusF || appliedF);
       let visible = 0;
       for (const tr of rows) {
         const okSearch = !needle || (tr.dataset.search || '').includes(needle);
         const okStatus = !statusF || tr.dataset.status === statusF;
         const okApplied = !appliedF || tr.dataset.applied === appliedF;
-        const hit = okSearch && okStatus && okApplied;
+        // Tab only restricts when no other filter is active.
+        const okTab = filtered || Number(tr.dataset.page || 0) === __recentActiveTab;
+        const hit = okSearch && okStatus && okApplied && okTab;
         tr.style.display = hit ? '' : 'none';
         if (hit) visible++;
       }
       const total = rows.length;
-      const filtered = needle || statusF || appliedF;
       document.getElementById('recent-count').textContent = filtered ? (visible + ' / ' + total) : total;
       document.getElementById('recent-empty').style.display = (filtered && visible === 0) ? 'block' : 'none';
     }
+    // Initial paint: show only the first tab's rows.
+    if (document.getElementById('recent-tbody')) filterRecentRuns();
   </script>
 </section>` : `
 <section class="card" style="margin-top:18px;text-align:center;padding:32px">
