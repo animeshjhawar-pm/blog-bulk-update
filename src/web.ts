@@ -5753,18 +5753,22 @@ document.addEventListener('click', (ev) => {
   const img = t.closest('.rc-img .rc-preview-img');
   if (img && t.tagName !== 'BUTTON') {
     const card = img.closest('.result-card');
-    if (card && card.dataset.imageId) zoomCard(card.dataset.imageId, ev);
+    if (card && card.dataset.imageId) { console.log('[click] zoom via image', card.dataset.imageId); zoomCard(card.dataset.imageId, ev); }
     return;
   }
   // Card-action triggers. We include <a> alongside <button> because
   // "↻ Custom…" is styled as a hyperlink, and we don't want it to
-  // navigate (no href), so its onclick goes through here too.
-  const btn = t.closest('[data-zoom],[data-compare],[data-regen],[data-regen-custom],[data-apply]');
+  // navigate (no href), so its onclick goes through here too. The
+  // selector list MUST stay in sync with the action attributes we
+  // render in the card template — adding a new data-* attr without
+  // adding it here means the button looks live but does nothing.
+  const btn = t.closest('[data-zoom],[data-compare],[data-regen],[data-regen-custom],[data-apply],[data-replace],[data-clear]');
   if (!btn) return;
   const card = btn.closest('.result-card');
   if (!card) return;
   const id = card.dataset.imageId;
-  if (!id) return;
+  if (!id) { console.warn('[click] action button found but card has no data-image-id'); return; }
+  console.log('[click] action=', btn.dataset && Object.keys(btn.dataset).find((k) => k.startsWith('regen') || k.startsWith('compare') || k.startsWith('apply') || k.startsWith('zoom') || k.startsWith('replace') || k.startsWith('clear')), 'imageId=', id);
   if (btn.matches('[data-zoom]'))          { zoomCard(id, ev);  return; }
   if (btn.matches('[data-compare]'))       { openCompare(id);   return; }
   if (btn.matches('[data-regen]'))         { regenOne(id);      return; }
