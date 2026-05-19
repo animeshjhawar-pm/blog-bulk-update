@@ -273,6 +273,22 @@ export function imagesDirFor(runId: string): string {
   return path.join(runOutDir(), "runs", runId, "images");
 }
 
+/**
+ * Map an image_id to a safe filesystem basename. Image ids come in
+ * two shapes:
+ *   - media_registry UUIDs:  hex + hyphens, already safe
+ *   - synthetic placeholders for missing cover/thumbnail ids:
+ *       "cover-images/<cluster_id>" or "thumbnail-images/<cluster_id>"
+ *       — these contain a forward slash, which would create a
+ *       phantom subdir under runs/<id>/images/ and break the write.
+ * Replace anything outside [a-zA-Z0-9._-] with "_". Resulting names
+ * are deterministic per image_id; we never parse them back — lookup
+ * always goes through the CSV row's image_id column.
+ */
+function safeFilenameForId(imageId: string): string {
+  return imageId.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
 export async function writeUploadedImage(
   runId: string,
   imageId: string,
@@ -281,15 +297,16 @@ export async function writeUploadedImage(
 ): Promise<string> {
   const dir = imagesDirFor(runId);
   await fs.mkdir(dir, { recursive: true });
+  const safeName = safeFilenameForId(imageId);
   // Always wipe any prior file for this image_id regardless of ext —
   // a re-drop with a different format leaves at most one file.
   for (const e of ["jpg", "png", "webp"]) {
-    const stale = path.join(dir, `${imageId}.${e}`);
+    const stale = path.join(dir, `${safeName}.${e}`);
     if (e !== ext) {
       try { await fs.rm(stale, { force: true }); } catch { /* */ }
     }
   }
-  const finalPath = path.join(dir, `${imageId}.${ext}`);
+  const finalPath = path.join(dir, `${safeName}.${ext}`);
   const tmp = `${finalPath}.tmp-${randomBytes(6).toString("hex")}`;
   await fs.writeFile(tmp, bytes);
   await fs.rename(tmp, finalPath);
@@ -298,8 +315,9 @@ export async function writeUploadedImage(
 
 export async function removeUploadedImage(runId: string, imageId: string): Promise<void> {
   const dir = imagesDirFor(runId);
+  const safeName = safeFilenameForId(imageId);
   for (const ext of ["jpg", "png", "webp"]) {
-    try { await fs.rm(path.join(dir, `${imageId}.${ext}`), { force: true }); } catch { /* */ }
+    try { await fs.rm(path.join(dir, `${safeName}.${ext}`), { force: true }); } catch { /* */ }
   }
 }
 

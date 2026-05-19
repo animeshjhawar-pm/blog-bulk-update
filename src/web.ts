@@ -5228,6 +5228,11 @@ async function applyAllPicked() {
   try {
     const ids = pickedCards
       .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
+      // Upload-mode cards without a dropped file would hit the
+      // applyOne client-side alert("Drop a replacement file first")
+      // for every row — skip them here so bulk apply only runs
+      // against rows the server can actually process.
+      .filter((c) => !(c.dataset.upload === '1' && c.dataset.needsFile === '1'))
       .map((c) => c.dataset.imageId)
       .filter((id) => {
         const s = stateOf.get(id) ?? 'pending';
