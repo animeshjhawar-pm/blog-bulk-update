@@ -4716,8 +4716,8 @@ ${stage === "prepare" ? `
     <a class="btn" id="download-all-btn" href="/runs/${esc(id)}/download.zip" title="Stream a ZIP of every generated image, organised by cluster topic. Images are not re-encoded." download>⬇ Download all (ZIP)</a>
     <span id="tok-chip" title="Bearer token used for upload + repoint. Pasted here, held in server memory until it expires (~1h) or the process restarts." style="font:12px/1 ui-sans-serif,system-ui;padding:6px 10px;border:1px solid var(--border);border-radius:6px;color:#a33;">🔑 no token</span>
     <button id="tok-set-btn" onclick="setToken()" title="Paste a fresh bearer token from https://platform.gushwork.ai/api/auth/token">🔑 Set token</button>
-    <label style="font:12px/1 ui-sans-serif,system-ui;display:flex;align-items:center;gap:5px" title="Dry-run still UPLOADS images (new ids are needed to preview) — it only skips the page_info PUT.">
-      <input type="checkbox" id="dry-toggle" checked onchange="APPLY_DRY_RUN=this.checked"> dry-run
+    <label id="dry-toggle-label" style="font:12px/1 ui-sans-serif,system-ui;display:flex;align-items:center;gap:5px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:#fff" title="Dry-run still UPLOADS images (new ids are needed to preview) — it only skips the page_info PUT. Leave unchecked to actually publish to production.">
+      <input type="checkbox" id="dry-toggle" onchange="APPLY_DRY_RUN=this.checked; document.getElementById('dry-toggle-label').style.background = this.checked ? '#fef3c7' : '#fff'; document.getElementById('dry-toggle-label').style.color = this.checked ? '#92400e' : 'inherit';"> dry-run
     </label>
     ${state.mode === "upload" ? "" : `<button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>`}
     <button id="revert-all-btn" onclick="revertRun()" title="Restore EVERY cluster in this run from its latest repoint backup. Dry-run previews; each current state is snapshotted first.">↩ Revert run</button>
@@ -4965,7 +4965,16 @@ function paintCard(imageId, opts) {
 // would-PUT targets) so the operator can verify the plan before any
 // real write goes out. When write creds land, flip DRY_RUN to false
 // here and the same trace will be shown after the actual PUT.
-let APPLY_DRY_RUN = true;
+// DEFAULT FALSE — Apply actually publishes to production.
+// Was true during initial rollout when AWS creds were uncertain;
+// the silent default trapped operators who didn't notice the
+// dry-run checkbox was pre-checked. They'd click Apply, see the
+// trace modal say success, but page_info was never written and
+// the live page kept rendering the old images. Defaulting to FALSE
+// matches what every operator actually wants on each apply, and the
+// dry-run checkbox in the action bar is still there for the rare
+// case someone wants the upload-but-don't-PUT preview behaviour.
+let APPLY_DRY_RUN = false;
 
 // Run-level mutex. Only ONE apply op (single/cluster/run/picked) can
 // be in flight at a time — protects against double-clicks and against
