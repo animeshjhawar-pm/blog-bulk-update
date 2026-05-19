@@ -190,8 +190,29 @@ export async function validateAndCanonicalise(
   if (expectedAspect) {
     const target = aspectToNumber(expectedAspect);
     const actual = finalW / finalH;
-    if (Number.isFinite(target) && Math.abs(actual - target) / target > 0.05) {
-      aspectWarning = `aspect mismatch — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}). Continuing anyway.`;
+    if (Number.isFinite(target)) {
+      const delta = Math.abs(actual - target) / target;
+      // Tiered handling:
+      //   0%-5%   silent accept (e.g. 1920x1080 → 16:9)
+      //   5%-15%  warn (yellow banner in card) but accept; minor
+      //           differences are tolerable (some downstream
+      //           renderers will fit/cover them).
+      //   >15%   REJECT. A 1:1 image into a 16:9 slot is a 44%
+      //          delta — that's a wrong image, not a marginal
+      //          mismatch, and it will publish to production
+      //          looking wrong. Block at intake so the operator
+      //          re-exports at the correct dimensions instead
+      //          of finding out from the live page.
+      if (delta > 0.15) {
+        return {
+          ok: false,
+          status: 422,
+          error: `aspect mismatch too large — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Crop or re-export to match the target aspect ratio before re-dropping. Letting this through would push a wrongly-shaped image to the live page.`,
+        };
+      }
+      if (delta > 0.05) {
+        aspectWarning = `aspect mismatch — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Within tolerance, but the live page may show fit/cover artefacts.`;
+      }
     }
   }
   const sha256 = createHash("sha256").update(canonical).digest("hex");
