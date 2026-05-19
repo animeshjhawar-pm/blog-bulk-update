@@ -4783,6 +4783,10 @@ const RUN_ID = window.location.pathname.split('/').pop();
 // Claude UX: a primary verb that mutates ("Thinking…", "Generating
 // image 3 of 7…") with a rotating secondary tip about the platform.
 const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
+// Declared at the very top of the script so functions called later
+// in the body (updateUploadProgress, etc.) can read it without TDZ.
+// "prepare" only for upload-mode runs; everything else is "apply".
+const RUN_STAGE = ${JSON.stringify(stage)};
 let onLogStream = null;
 (function () {
   const heroEl = document.getElementById('running-hero');
@@ -5781,9 +5785,13 @@ document.addEventListener('click', (ev) => {
 // ── Upload-mode stage handling (prepare vs apply) ────────────────────
 // The runPage URL query param decides which view we're in. The
 // prepare view focuses purely on drops; the apply view shows the
-// full Apply / Regen / Token toolbox. Server-rendered both ways;
-// these client helpers just keep the bottom bar in sync.
-const RUN_STAGE = ${JSON.stringify(stage)};
+// full Apply / Regen / Token toolbox. RUN_STAGE is declared at the
+// very top of the script so updateUploadProgress (called BEFORE
+// this block during init) can read it without hitting TDZ — the
+// previous setup threw at the call site and silently killed the
+// rest of the script, leaving every let after that point
+// uninitialised and inline onclick="dzClick(event)" with TDZ for
+// __dzActiveImageId.
 
 function updateUploadProgress() {
   if (RUN_STAGE !== 'prepare') return;
