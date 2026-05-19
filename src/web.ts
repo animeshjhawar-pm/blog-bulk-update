@@ -2308,7 +2308,7 @@ async function saveToken(e) {
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
   </div>
   <div class="right">
-    <button id="bar-upload-btn" onclick="openUploadRun()" disabled title="Skip the generation step — operator drops client-supplied replacement images for each picked slot, then runs the same Apply pipeline.">↑ Upload replacements →</button>
+    <button id="bar-upload-btn" onclick="openUploadRun()" disabled title="Skip the generation step — operator drops client-supplied replacement images for each picked slot, then runs the same Apply pipeline.">↑ Upload replacements</button>
     <button class="primary" id="bar-generate-btn" onclick="openGenerateConfirm()" disabled title="Review prompts before running the generation pipeline.">Generate →</button>
   </div>
 </div>
@@ -2842,10 +2842,14 @@ async function openUploadRun() {
     });
     const j = await r.json();
     if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
-    window.location.href = j.url || ('/runs/' + j.run_id);
+    // Land on the prepare stage — focused dropzone view with a
+    // Continue button. Operator can switch to the Apply view at any
+    // time via the "Skip — go to Apply" link in the bottom bar, or
+    // by dropping the ?stage= param from the URL.
+    window.location.href = (j.url || ('/runs/' + j.run_id)) + '?stage=prepare';
   } catch (err) {
     alert('failed to create upload run: ' + (err && err.message ? err.message : err));
-    if (btn) { btn.disabled = false; btn.textContent = '↑ Upload replacements →'; }
+    if (btn) { btn.disabled = false; btn.textContent = '↑ Upload replacements'; }
   }
 }
 
@@ -4202,7 +4206,7 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
   return null;
 }
 
-async function runPage(res: ServerResponse, id: string) {
+async function runPage(res: ServerResponse, id: string, stage: "prepare" | "apply" = "apply") {
   let state = RUNS.get(id);
   if (!state) {
     // Manifest fallback: a previous server process spawned this run; the
@@ -4392,9 +4396,9 @@ async function runPage(res: ServerResponse, id: string) {
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
-      <span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : (isUpload && !hasUploadedFile) ? ' data-tip="Drop a replacement file first."' : ""}>
+      ${stage === "prepare" ? "" : `<span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : (isUpload && !hasUploadedFile) ? ' data-tip="Drop a replacement file first."' : ""}>
         <button class="btn-apply primary" type="button" data-apply ${(applyUnsupported || (isUpload && !hasUploadedFile)) ? `disabled aria-disabled="true"` : `title="Upload this image via the Gushwork media API, then repoint page_info to the new id. Dry-run still uploads (preview only, no page_info PUT)."`}>Upload + Repoint</button>
-      </span>
+      </span>`}
     </div>
   </div>
 </div>`;
@@ -4428,11 +4432,13 @@ async function runPage(res: ServerResponse, id: string) {
       <input type="checkbox" id="all-pick-cb" checked onchange="onAllPick(this)">
       <span>All</span>
     </label>
-    <h2 style="margin:0">Publish — verify and push to S3</h2>
-    <span class="sub">${rows.length} new images across ${grouped.size} clusters · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}</span>
+    <h2 style="margin:0">${stage === "prepare" ? "Step 1 · Drop replacement images" : "Publish — verify and push to S3"}</h2>
+    <span class="sub">${rows.length} ${stage === "prepare" ? "slots awaiting files" : "new images"} across ${grouped.size} clusters${stage === "prepare" ? "" : ` · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}`}</span>
     <span class="sub" id="picked-count" style="margin-left:auto"></span>
   </div>
-  <div class="sub" style="margin-top:6px">Click <strong>⤢</strong> on any card to zoom, or <strong>⇄ Compare</strong> for an old-vs-new side-by-side. Use the checkboxes to scope <strong>Apply selected</strong> / <strong>Regenerate selected</strong> — pick by image, by cluster, or all at once.</div>
+  <div class="sub" style="margin-top:6px">${stage === "prepare"
+    ? `Drag-and-drop a replacement file (<strong>PNG · JPEG · WebP · ≤10MB</strong>) into each slot you want to push live. You can skip slots — they stay untouched in the live page. When you're done, click <strong>Continue to Apply</strong> to upload the new images and repoint <code>page_info</code>.`
+    : `Click <strong>⤢</strong> on any card to zoom, or <strong>⇄ Compare</strong> for an old-vs-new side-by-side. Use the checkboxes to scope <strong>Apply selected</strong> / <strong>Regenerate selected</strong> — pick by image, by cluster, or all at once.`}</div>
 </section>
 
 ${clusterSections}
@@ -4487,7 +4493,19 @@ ${clusterSections}
   </div>
 </div>
 
-<!-- Sticky bottom action bar -->
+<!-- Sticky bottom action bar — variant per stage:
+       prepare (upload-mode onboarding): progress chip + "Continue to Apply"
+       apply   (default): full Apply / Regen / Token / Revert toolbox -->
+${stage === "prepare" ? `
+<div class="action-bar">
+  <div class="stats">
+    Step 1 of 2 — <strong id="dz-uploaded-count">0</strong> of <strong>${rows.length}</strong> files uploaded
+  </div>
+  <div class="right">
+    <a class="btn" href="/runs/${esc(id)}" title="Switch to the Apply view (you can come back here any time by appending ?stage=prepare)">Skip — go to Apply</a>
+    <button class="primary" id="prepare-continue-btn" disabled onclick="goToApplyStage()" title="Continue to the Apply step. You can apply now or come back here to upload more files first.">Continue to Apply</button>
+  </div>
+</div>` : `
 <div class="action-bar">
   <div class="stats">
     <strong id="applied-count">0</strong> applied · <strong id="failed-count">0</strong> failed · <strong id="pending-count">0</strong> pending · <strong id="picked-count-bar">0</strong> selected
@@ -4499,11 +4517,11 @@ ${clusterSections}
     <label style="font:12px/1 ui-sans-serif,system-ui;display:flex;align-items:center;gap:5px" title="Dry-run still UPLOADS images (new ids are needed to preview) — it only skips the page_info PUT.">
       <input type="checkbox" id="dry-toggle" checked onchange="APPLY_DRY_RUN=this.checked"> dry-run
     </label>
-    <button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
+    ${state.mode === "upload" ? "" : `<button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>`}
     <button id="revert-all-btn" onclick="revertRun()" title="Restore EVERY cluster in this run from its latest repoint backup. Dry-run previews; each current state is snapshotted first.">↩ Revert run</button>
     <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Upload + Repoint selected →</button>
   </div>
-</div>
+</div>`}
 `;
     }
   }
@@ -5445,6 +5463,9 @@ document.addEventListener('keydown', (e) => {
 });
 
 if (document.getElementById('apply-all-btn')) refreshTotals();
+// Prepare-stage progress chip initial paint. Safe no-op when the
+// run isn't in prepare mode (function early-returns on RUN_STAGE check).
+updateUploadProgress();
 
 // ── Delegated click handler for result-cards ──
 // Inline onclick attributes were unreliable across some content/escape
@@ -5477,6 +5498,38 @@ document.addEventListener('click', (ev) => {
   if (btn.matches('[data-replace]'))       { triggerUploadFilePicker(id); return; }
   if (btn.matches('[data-clear]'))         { clearUploadedFile(id); return; }
 });
+
+// ── Upload-mode stage handling (prepare vs apply) ────────────────────
+// The runPage URL query param decides which view we're in. The
+// prepare view focuses purely on drops; the apply view shows the
+// full Apply / Regen / Token toolbox. Server-rendered both ways;
+// these client helpers just keep the bottom bar in sync.
+const RUN_STAGE = ${JSON.stringify(stage)};
+
+function updateUploadProgress() {
+  if (RUN_STAGE !== 'prepare') return;
+  const total = document.querySelectorAll('.result-card.upload-mode').length;
+  const done = document.querySelectorAll('.result-card.upload-mode:not([data-needs-file="1"])').length;
+  const lbl = document.getElementById('dz-uploaded-count');
+  if (lbl) lbl.textContent = String(done);
+  const btn = document.getElementById('prepare-continue-btn');
+  if (btn) {
+    btn.disabled = done === 0;
+    btn.textContent = done === 0
+      ? 'Continue to Apply'
+      : done === total
+        ? 'Continue to Apply (' + done + '/' + total + ' ready) →'
+        : 'Continue to Apply (' + done + '/' + total + ' ready, ' + (total - done) + ' will be skipped) →';
+  }
+}
+
+function goToApplyStage() {
+  // Drop the ?stage=prepare and reload — server returns the full
+  // Apply view with the same on-disk file state.
+  const url = new URL(window.location.href);
+  url.searchParams.delete('stage');
+  window.location.href = url.pathname + (url.search ? url.search : '') + url.hash;
+}
 
 // ── Upload-mode drag-and-drop ───────────────────────────────────────
 // Wired up only for cards that have data-upload="1". We delegate
@@ -5618,6 +5671,7 @@ function paintDropError(card, msg) {
 function paintDropApplied(card, info) {
   card.dataset.needsFile = '';
   card.removeAttribute('data-needs-file');
+  updateUploadProgress();
   // Swap the dropzone for the preview image.
   const rcImg = card.querySelector('.rc-img');
   if (rcImg) {
@@ -5659,6 +5713,7 @@ async function clearUploadedFile(imageId) {
     if (!r.ok || j.ok !== true) throw new Error(j.error || ('HTTP ' + r.status));
     // Reset the card back to the dropzone state.
     card.setAttribute('data-needs-file', '1');
+    updateUploadProgress();
     const rcImg = card.querySelector('.rc-img');
     if (rcImg) {
       rcImg.innerHTML =
@@ -6536,7 +6591,12 @@ export function startWebServer(port: number): void {
         const [, id, suffix] = runMatch;
         if (!id) return send(res, 404, "text/plain", "not found");
         if (suffix === "/events") return runEvents(res, id);
-        return runPage(res, id);
+        // "?stage=prepare" renders the upload-onboarding view for an
+        // upload-mode run: dropzones only, no Apply buttons, with a
+        // "Continue to Apply" CTA in the bottom bar. Default stage is
+        // the existing Apply view.
+        const stage = url.searchParams.get("stage") === "prepare" ? "prepare" : "apply";
+        return runPage(res, id, stage);
       }
       if (method === "GET" && p === "/files") {
         const fp = url.searchParams.get("p") ?? "";
