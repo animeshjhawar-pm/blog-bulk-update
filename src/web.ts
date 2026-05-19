@@ -5836,15 +5836,46 @@ window.addEventListener('dragenter', dzWindowSuppress);
 window.addEventListener('dragover', dzWindowSuppress);
 window.addEventListener('drop', dzWindowSuppress);
 
+// Persistent hidden file input — created ONCE at page load and
+// reused for every click-to-browse. Dynamically-created-and-immediately-
+// clicked inputs are unreliable across browsers (some refuse to open
+// the picker until the next event loop tick; some require the
+// element to have been part of the DOM for at least one frame).
+// One-off + reuse fixes both.
+let __dzFileInput = null;
+let __dzActiveImageId = null;
+function ensureDzFileInput() {
+  if (__dzFileInput && __dzFileInput.parentNode) return __dzFileInput;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = ACCEPTED_MIMES.join(',');
+  input.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;width:1px;height:1px;pointer-events:none;';
+  input.addEventListener('change', () => {
+    const f = input.files && input.files[0];
+    const id = __dzActiveImageId;
+    __dzActiveImageId = null;
+    input.value = ''; // allow re-picking the same file
+    if (f && id) handleUploadFile(id, f);
+  });
+  document.body.appendChild(input);
+  __dzFileInput = input;
+  console.log('[upload] persistent file input ready');
+  return input;
+}
+
 // Per-dropzone inline handlers. Exposed on window so the inline
 // onclick / ondragover attributes can resolve them.
 function dzClick(ev) {
   const dz = ev.currentTarget;
+  console.log('[upload] dzClick fired, dz=', dz);
   if (!dz) return;
-  if (dz.classList.contains('uploading')) return;
-  const imageId = dz.dataset.imageId || (dz.closest('.result-card') || {}).dataset?.imageId;
-  if (!imageId) return;
-  triggerUploadFilePicker(imageId);
+  if (dz.classList.contains('uploading')) { console.log('[upload] skipped — uploading in progress'); return; }
+  const imageId = dz.getAttribute('data-image-id');
+  if (!imageId) { console.warn('[upload] dropzone has no data-image-id'); return; }
+  __dzActiveImageId = imageId;
+  const input = ensureDzFileInput();
+  console.log('[upload] triggering file picker for', imageId);
+  input.click();
 }
 function dzDragEnter(ev) {
   ev.preventDefault();
@@ -5884,25 +5915,17 @@ window.dzDragOver = dzDragOver;
 window.dzDragLeave = dzDragLeave;
 window.dzDrop = dzDrop;
 
-// Click-to-browse: append the input to the DOM BEFORE clicking
-// (some browsers reject .click() on detached elements). Inline
-// positioning instead of display:none for the same reason — a
-// handful of browsers refuse file-picker activation on hidden
-// inputs. The input is removed immediately on change/cancel.
+// Pre-create the persistent hidden file input on page load so the
+// first dropzone click doesn't pay the create-and-attach cost.
+// Only meaningful for upload-mode runs but harmless elsewhere.
+if (document.querySelector('.rc-dropzone, .result-card[data-upload="1"]')) ensureDzFileInput();
+
+// Legacy entry-point for the per-card Replace button (and any
+// other inline trigger). Reuses the persistent file input.
 function triggerUploadFilePicker(imageId) {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = ACCEPTED_MIMES.join(',');
-  input.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;width:1px;height:1px;';
-  input.onchange = () => {
-    const f = input.files && input.files[0];
-    if (input.parentNode) input.parentNode.removeChild(input);
-    if (f) handleUploadFile(imageId, f);
-  };
-  // If the user cancels the dialog, onchange never fires; clean up
-  // the orphan input after a tick so the DOM doesn't accumulate.
-  setTimeout(() => { if (input.parentNode && !input.files?.length) input.parentNode.removeChild(input); }, 60000);
-  document.body.appendChild(input);
+  __dzActiveImageId = imageId;
+  const input = ensureDzFileInput();
+  console.log('[upload] triggering file picker for', imageId);
   input.click();
 }
 
