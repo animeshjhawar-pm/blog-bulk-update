@@ -105,6 +105,13 @@ interface RunState {
   htmlPath?: string;
   proc: ChildProcess;
   listeners: Set<ServerResponse>;
+  /**
+   * "regen" — generated via Replicate/fal subprocess (default).
+   * "upload" — operator dropped client-provided replacement images.
+   * The Apply pipeline is identical for both; only the source of
+   * image_local_path differs (regen subprocess vs HTTP upload).
+   */
+  mode?: "regen" | "upload";
 }
 
 const RUNS = new Map<string, RunState>();
@@ -671,6 +678,50 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .rc-desc { font-size: 12px; color: var(--ink-muted); margin-top: 6px; line-height: 1.45; }
   .result-card .err-line { background: var(--err-bg); color: var(--err); border-radius: 4px; padding: 4px 8px; margin-top: 6px; font-size: 11px; word-break: break-word; }
   .result-card .rc-actions { margin-top: 10px; display: flex; gap: 6px; }
+
+  /* Drop-zone (upload-mode runs). Sits in the same slot as the
+     regen image, same aspect ratio. Visual states:
+       idle      — dashed border, faint background, instructions
+       hover     — solid border + brand tint (operator is dragging
+                   a file over this card)
+       uploading — spinner + progress
+       error     — red border + message
+     When a file has been uploaded the dropzone is replaced by the
+     /preview/ image; the card sprouts Replace + Clear buttons. */
+  .result-card .rc-dropzone {
+    width: 100%; height: 100%; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    border: 2px dashed var(--border-strong);
+    border-radius: 6px; background: #fafbfc; color: var(--ink-muted);
+    text-align: center; padding: 12px; cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease;
+  }
+  .result-card .rc-dropzone:hover { background: #f1f5f9; border-color: var(--brand); color: var(--ink); }
+  .result-card .rc-dropzone.dragover { background: #eef2ff; border-color: var(--brand); border-style: solid; color: var(--brand); }
+  .result-card .rc-dropzone .dz-icon { font-size: 24px; line-height: 1; margin-bottom: 4px; }
+  .result-card .rc-dropzone .dz-text { font-size: 13px; font-weight: 600; }
+  .result-card .rc-dropzone .dz-sub  { font-size: 10.5px; color: var(--ink-faint); margin-top: 2px; }
+  .result-card .rc-dropzone.uploading,
+  .result-card .rc-dropzone.error { cursor: default; }
+  .result-card .rc-dropzone.uploading { background: #eff6ff; border-color: var(--brand); border-style: solid; color: var(--brand); }
+  .result-card .rc-dropzone.error    { background: #fef2f2; border-color: #fca5a5; color: #991b1b; border-style: solid; }
+  .result-card .rc-dropzone .dz-progress { font-variant-numeric: tabular-nums; font-size: 12px; margin-top: 6px; }
+  .result-card .rc-dropzone .dz-err-msg  { font-size: 11.5px; margin-top: 4px; max-width: 220px; word-break: break-word; }
+
+  /* Upload-mode card: hide the rc-img zoom button overlay when in
+     the drop-zone state (no image to zoom into). */
+  .result-card.upload-mode[data-needs-file="1"] .rc-img { cursor: default; }
+  .result-card.upload-mode[data-needs-file="1"] .rc-img::after { display: none !important; }
+  .result-card .btn-replace, .result-card .btn-clear {
+    font-size: 12px; padding: 5px 10px;
+  }
+  .result-card .btn-clear:hover { color: #b91c1c; border-color: #fca5a5; }
+  /* Aspect-mismatch banner inside an upload card, shown when the
+     server flagged the dropped file's aspect against the slot. */
+  .result-card .upload-warn {
+    margin-top: 6px; padding: 6px 8px; border-radius: 4px;
+    background: #fef3c7; color: #92400e; font-size: 11.5px;
+  }
   /* Run page result cards — only states we paint:
        pending  (default, no extra class)
        applying (in flight, blue tint)
@@ -2257,6 +2308,7 @@ async function saveToken(e) {
     <strong id="bar-img-count">0</strong> images selected across <strong id="bar-cluster-count">0</strong> clusters
   </div>
   <div class="right">
+    <button id="bar-upload-btn" onclick="openUploadRun()" disabled title="Skip the generation step — operator drops client-supplied replacement images for each picked slot, then runs the same Apply pipeline.">↑ Upload replacements →</button>
     <button class="primary" id="bar-generate-btn" onclick="openGenerateConfirm()" disabled title="Review prompts before running the generation pipeline.">Generate →</button>
   </div>
 </div>
@@ -2369,6 +2421,8 @@ function refreshTotals() {
   document.getElementById('bar-img-count').textContent = imgs;
   document.getElementById('bar-cluster-count').textContent = cls;
   document.getElementById('bar-generate-btn').disabled = imgs === 0;
+  const upBtn = document.getElementById('bar-upload-btn');
+  if (upBtn) upBtn.disabled = imgs === 0;
   for (const tr of allRows()) {
     const cid = tr.dataset.clusterId;
     if (!cid) continue;
@@ -2764,6 +2818,36 @@ async function genConfirmSubmit() {
 // Legacy entry point — anything still wired to runRegen() now goes
 // through the confirm modal first.
 function runRegen() { openGenerateConfirm(); }
+
+// Upload-replacement entry point — POSTs the current selection to
+// /upload-run/start (which creates a manifest + skeleton CSV) and
+// redirects to the new run page where each card exposes a drop
+// zone instead of a regenerated preview. Strictly parallel to
+// runRegen — never invokes the generation pipeline.
+async function openUploadRun() {
+  const items = [];
+  for (const [cid, set] of selection.entries()) {
+    if (!set || set.size === 0) continue;
+    items.push({ cluster_id: cid, image_ids: [...set] });
+  }
+  if (items.length === 0) return;
+  const total = items.reduce((n, it) => n + it.image_ids.length, 0);
+  if (!confirm('Start an UPLOAD run for ' + total + ' images? You\\'ll drag-and-drop a replacement file per slot on the next page, then click Apply to push them through the same upload→repoint pipeline as a regenerated run.')) return;
+  const btn = document.getElementById('bar-upload-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '… creating run'; }
+  try {
+    const r = await fetch('/upload-run/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client: SLUG, page_type: SELECTED_PAGE_TYPES, items })
+    });
+    const j = await r.json();
+    if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
+    window.location.href = j.url || ('/runs/' + j.run_id);
+  } catch (err) {
+    alert('failed to create upload run: ' + (err && err.message ? err.message : err));
+    if (btn) { btn.disabled = false; btn.textContent = '↑ Upload replacements →'; }
+  }
+}
 
 refreshTotals();
 </script>`;
@@ -4107,6 +4191,7 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
         htmlPath: htmlPath ?? undefined,
         proc: { kill() { /* no-op */ } } as unknown as ChildProcess,
         listeners: new Set(),
+        mode: j.mode === "upload" ? "upload" : "regen",
       };
       RUNS.set(id, state);
       return state;
@@ -4231,11 +4316,27 @@ async function runPage(res: ServerResponse, id: string) {
             // when local is missing. Wiring it through our endpoint
             // means shared run URLs keep rendering long after the
             // Replicate signed URL expires.
-            const previewHtml = (r.image_url_new || r.image_local_path)
-              ? `<img class="rc-preview-img" src="/runs/${esc(id)}/preview/${encodeURIComponent(r.image_id)}" alt="" loading="lazy">`
-              : isFailed
-                ? `<div class="ph ph-failed"><span class="ph-failed-icon">⚠</span><span>Generation failed</span><span class="ph-failed-hint">Hit ↻ Regenerate to retry</span></div>`
-                : `<div class="ph">${esc(r.status)}</div>`;
+            //
+            // Upload-mode runs swap the preview for a drop zone when
+            // no file has been uploaded yet. Once an upload lands
+            // (image_local_path populated), we render the same
+            // /preview/ image, plus a Replace overlay so the
+            // operator can swap the dropped file before applying.
+            const isUpload = state.mode === "upload";
+            const hasUploadedFile = isUpload && !!r.image_local_path;
+            const previewHtml = isUpload
+              ? (hasUploadedFile
+                ? `<img class="rc-preview-img" src="/runs/${esc(id)}/preview/${encodeURIComponent(r.image_id)}?t=${encodeURIComponent(Date.now().toString())}" alt="" loading="lazy">`
+                : `<div class="rc-dropzone" data-dropzone data-image-id="${esc(r.image_id)}">
+                    <div class="dz-icon">↑</div>
+                    <div class="dz-text">Drop file here</div>
+                    <div class="dz-sub">or click to browse — png · jpeg · webp · ≤10MB</div>
+                   </div>`)
+              : (r.image_url_new || r.image_local_path)
+                ? `<img class="rc-preview-img" src="/runs/${esc(id)}/preview/${encodeURIComponent(r.image_id)}" alt="" loading="lazy">`
+                : isFailed
+                  ? `<div class="ph ph-failed"><span class="ph-failed-icon">⚠</span><span>Generation failed</span><span class="ph-failed-hint">Hit ↻ Regenerate to retry</span></div>`
+                  : `<div class="ph">${esc(r.status)}</div>`;
             // Always show SOMETHING in red when a row is failed, even
             // if the upstream error string is empty — operators were
             // seeing blank cards with no explanation when the CSV
@@ -4265,7 +4366,7 @@ async function runPage(res: ServerResponse, id: string) {
               ? "No resolvable page_info reference for this synthetic id — regenerate from a real cluster image"
               : "";
             return `
-<div class="result-card" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
+<div class="result-card${isUpload ? ' upload-mode' : ''}" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${isUpload ? ' data-upload="1"' : ''}${isUpload && !hasUploadedFile ? ' data-needs-file="1"' : ''}${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${applyUnsupported ? esc(applyDisabledReason) : "Include in bulk actions (Apply / Regenerate)"}">
     <input type="checkbox" class="rc-pick-cb" ${applyUnsupported || isFailed ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
@@ -4282,14 +4383,17 @@ async function runPage(res: ServerResponse, id: string) {
     ${errCell}
     <div class="rc-status-line"></div>
     <div class="rc-actions">
-      <button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
-      <a class="btn-regen-custom" type="button" data-regen-custom title="Re-roll with one-off instructions for this image only" role="button" tabindex="0">↻ Custom…</a>
+      ${isUpload
+        ? `<button class="btn-replace" type="button" data-replace ${hasUploadedFile ? '' : 'style="display:none"'} title="Re-drop a different file for this slot">↻ Replace</button>
+           <button class="btn-clear" type="button" data-clear ${hasUploadedFile ? '' : 'style="display:none"'} title="Remove the uploaded file for this slot">✕ Clear</button>`
+        : `<button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
+           <a class="btn-regen-custom" type="button" data-regen-custom title="Re-roll with one-off instructions for this image only" role="button" tabindex="0">↻ Custom…</a>`}
       ${canCompare ? `<button class="btn-compare" type="button" data-compare title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
-      <span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : ""}>
-        <button class="btn-apply primary" type="button" data-apply ${applyUnsupported ? `disabled aria-disabled="true"` : `title="Upload this image via the Gushwork media API, then repoint page_info to the new id. Dry-run still uploads (preview only, no page_info PUT)."`}>Upload + Repoint</button>
+      <span class="apply-tip"${applyUnsupported ? ` data-tip="${esc(applyDisabledReason)}"` : (isUpload && !hasUploadedFile) ? ' data-tip="Drop a replacement file first."' : ""}>
+        <button class="btn-apply primary" type="button" data-apply ${(applyUnsupported || (isUpload && !hasUploadedFile)) ? `disabled aria-disabled="true"` : `title="Upload this image via the Gushwork media API, then repoint page_info to the new id. Dry-run still uploads (preview only, no page_info PUT)."`}>Upload + Repoint</button>
       </span>
     </div>
   </div>
@@ -4706,11 +4810,17 @@ if (document.getElementById('tok-chip')) tokenRefresh();
 // rows are excluded server-side; already-applied / currently-applying
 // rows are skipped here so the count matches what will actually run.
 function countApplicable(cards) {
-  let eligible = 0, skippedUnsupported = 0, skippedAlreadyApplied = 0;
+  let eligible = 0, skippedUnsupported = 0, skippedAlreadyApplied = 0, skippedNoFile = 0;
   for (const card of cards) {
     if (!card.dataset.imageId) continue;
     if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') {
       skippedUnsupported++;
+      continue;
+    }
+    // Upload-mode cards without a dropped file yet are not eligible.
+    // The server would reject them as "no image_local_path" anyway.
+    if (card.dataset.upload === '1' && card.dataset.needsFile === '1') {
+      skippedNoFile++;
       continue;
     }
     const s = stateOf.get(card.dataset.imageId) ?? 'pending';
@@ -4720,7 +4830,7 @@ function countApplicable(cards) {
     }
     eligible++;
   }
-  return { eligible, skippedUnsupported, skippedAlreadyApplied, total: cards.length };
+  return { eligible, skippedUnsupported, skippedAlreadyApplied, skippedNoFile, total: cards.length };
 }
 
 // Asks the operator to confirm a bulk apply. Resolves to true on
@@ -4733,6 +4843,7 @@ function confirmBulkApply(scopeLabel, counts) {
     const skipLines = [];
     if (counts.skippedUnsupported > 0) skipLines.push(counts.skippedUnsupported + ' skipped (cover / thumbnail / synthetic — separate stormbreaker flow)');
     if (counts.skippedAlreadyApplied > 0) skipLines.push(counts.skippedAlreadyApplied + ' skipped (already applied or currently applying)');
+    if (counts.skippedNoFile > 0) skipLines.push(counts.skippedNoFile + ' skipped (no file uploaded yet — drop a replacement first)');
     const skipHtml = skipLines.length
       ? '<ul style="margin:8px 0 0 18px;padding:0;color:#666;font-size:12px;">' + skipLines.map((l) => '<li>' + escapeHtml(l) + '</li>').join('') + '</ul>'
       : '';
@@ -4809,6 +4920,12 @@ async function applyOne(imageId, opts) {
     stateOf.set(imageId, 'failed');
     paintCard(imageId, { error: 'No resolvable page_info reference for this synthetic id.' });
     refreshTotals();
+    return;
+  }
+  // Upload-mode card with no file dropped yet → reject client-side so
+  // the operator sees a clear message instead of a server 404.
+  if (card.dataset.upload === '1' && card.dataset.needsFile === '1') {
+    alert('Drop a replacement file for this slot before applying.');
     return;
   }
   // Single-card clicks honour the run-level mutex; bulk callers
@@ -5352,7 +5469,215 @@ document.addEventListener('click', (ev) => {
   if (btn.matches('[data-regen]'))         { regenOne(id);      return; }
   if (btn.matches('[data-regen-custom]'))  { ev.preventDefault(); rcOpen(id); return; }
   if (btn.matches('[data-apply]'))         { applyOne(id);      return; }
+  if (btn.matches('[data-replace]'))       { triggerUploadFilePicker(id); return; }
+  if (btn.matches('[data-clear]'))         { clearUploadedFile(id); return; }
 });
+
+// ── Upload-mode drag-and-drop ───────────────────────────────────────
+// Wired up only for cards that have data-upload="1". We delegate
+// click + drag events at the document level so cards rendered
+// dynamically (post-clear, post-replace) inherit the behaviour
+// without re-binding.
+const ACCEPTED_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+function findDropZone(el) {
+  return el && el.closest ? el.closest('.rc-dropzone') : null;
+}
+function findUploadCard(el) {
+  const c = el && el.closest ? el.closest('.result-card.upload-mode') : null;
+  return c && c.dataset.imageId ? c : null;
+}
+
+// Hover state — purely visual; tracks whether the dragged file is
+// over a drop zone right now.
+document.addEventListener('dragover', (ev) => {
+  const dz = findDropZone(ev.target);
+  if (!dz) return;
+  ev.preventDefault();
+  ev.dataTransfer && (ev.dataTransfer.dropEffect = 'copy');
+  dz.classList.add('dragover');
+});
+document.addEventListener('dragleave', (ev) => {
+  const dz = findDropZone(ev.target);
+  if (dz) dz.classList.remove('dragover');
+});
+document.addEventListener('drop', (ev) => {
+  const dz = findDropZone(ev.target);
+  if (!dz) return;
+  ev.preventDefault();
+  dz.classList.remove('dragover');
+  const card = findUploadCard(dz);
+  if (!card) return;
+  const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (file) handleUploadFile(card.dataset.imageId, file);
+});
+// Click-to-browse: triggers a hidden file input scoped to this card.
+document.addEventListener('click', (ev) => {
+  const dz = findDropZone(ev.target);
+  if (!dz) return;
+  if (dz.classList.contains('uploading')) return;
+  const card = findUploadCard(dz);
+  if (!card) return;
+  triggerUploadFilePicker(card.dataset.imageId);
+});
+
+function triggerUploadFilePicker(imageId) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = ACCEPTED_MIMES.join(',');
+  input.style.display = 'none';
+  input.onchange = () => {
+    const f = input.files && input.files[0];
+    if (f) handleUploadFile(imageId, f);
+    document.body.removeChild(input);
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+
+async function handleUploadFile(imageId, file) {
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  // Client-side gate so the operator gets fast feedback for the
+  // obvious wrong-file cases. Server still re-validates everything.
+  if (!ACCEPTED_MIMES.includes(file.type)) {
+    paintDropError(card, 'unsupported file type — only PNG, JPEG, and WebP are accepted (got ' + (file.type || 'unknown') + ')');
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    paintDropError(card, 'file too large (' + (file.size / 1024 / 1024).toFixed(1) + ' MB; max 10 MB)');
+    return;
+  }
+  paintDropUploading(card, 0, file.name);
+  try {
+    const url = '/runs/' + encodeURIComponent(RUN_ID) + '/upload/' + encodeURIComponent(imageId);
+    // XHR (not fetch) so we can read upload progress events.
+    const j = await xhrUpload(url, file, (pct) => paintDropUploading(card, pct, file.name));
+    if (!j || j.ok !== true) throw new Error((j && j.error) || 'upload failed');
+    paintDropApplied(card, j);
+  } catch (err) {
+    paintDropError(card, err && err.message ? err.message : String(err));
+  }
+}
+
+function xhrUpload(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.setRequestHeader('content-type', file.type);
+    xhr.setRequestHeader('x-original-filename', file.name);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      try {
+        const j = JSON.parse(xhr.responseText || '{}');
+        if (xhr.status >= 200 && xhr.status < 300) resolve(j);
+        else reject(new Error(j.error || ('HTTP ' + xhr.status)));
+      } catch (e) {
+        reject(new Error('invalid JSON in response (HTTP ' + xhr.status + ')'));
+      }
+    };
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.ontimeout = () => reject(new Error('upload timed out'));
+    xhr.send(file);
+  });
+}
+
+function paintDropUploading(card, pct, name) {
+  const dz = card.querySelector('.rc-dropzone');
+  if (!dz) return;
+  dz.classList.remove('dragover', 'error');
+  dz.classList.add('uploading');
+  dz.innerHTML =
+    '<div class="dz-icon">↑</div>' +
+    '<div class="dz-text">Uploading…</div>' +
+    '<div class="dz-sub">' + escapeHtml(name) + '</div>' +
+    '<div class="dz-progress">' + pct + '%</div>';
+}
+function paintDropError(card, msg) {
+  const dz = card.querySelector('.rc-dropzone');
+  if (!dz) return;
+  dz.classList.remove('dragover', 'uploading');
+  dz.classList.add('error');
+  dz.innerHTML =
+    '<div class="dz-icon">⚠</div>' +
+    '<div class="dz-text">Upload failed</div>' +
+    '<div class="dz-err-msg">' + escapeHtml(msg) + '</div>' +
+    '<div class="dz-sub" style="margin-top:4px">Click here to try again</div>';
+  // Re-arm the dropzone after a moment so a subsequent click /
+  // drop kicks off a fresh upload attempt.
+  setTimeout(() => { dz.classList.remove('error'); }, 4000);
+}
+function paintDropApplied(card, info) {
+  card.dataset.needsFile = '';
+  card.removeAttribute('data-needs-file');
+  // Swap the dropzone for the preview image.
+  const rcImg = card.querySelector('.rc-img');
+  if (rcImg) {
+    rcImg.innerHTML =
+      '<img class="rc-preview-img" src="' + info.preview_url + '" alt="" loading="lazy">' +
+      '<button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>';
+  }
+  // Reveal Replace + Clear, enable Apply.
+  const replaceBtn = card.querySelector('[data-replace]');
+  const clearBtn = card.querySelector('[data-clear]');
+  if (replaceBtn) replaceBtn.style.display = '';
+  if (clearBtn) clearBtn.style.display = '';
+  const applyBtn = card.querySelector('[data-apply]');
+  if (applyBtn) {
+    applyBtn.disabled = false;
+    applyBtn.removeAttribute('aria-disabled');
+    applyBtn.title = 'Upload this image via the Gushwork media API, then repoint page_info to the new id.';
+  }
+  // Surface an aspect-mismatch warning if present (yellow banner
+  // inside the card body, just below the description).
+  const existing = card.querySelector('.upload-warn');
+  if (existing) existing.remove();
+  if (info.aspect_warning) {
+    const warn = document.createElement('div');
+    warn.className = 'upload-warn';
+    warn.textContent = '⚠ ' + info.aspect_warning;
+    const body = card.querySelector('.rc-body');
+    if (body) body.insertBefore(warn, body.querySelector('.rc-actions'));
+  }
+}
+
+async function clearUploadedFile(imageId) {
+  if (!confirm('Remove the uploaded file for this slot?')) return;
+  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  if (!card) return;
+  try {
+    const r = await fetch('/runs/' + encodeURIComponent(RUN_ID) + '/upload/' + encodeURIComponent(imageId), { method: 'DELETE' });
+    const j = await r.json();
+    if (!r.ok || j.ok !== true) throw new Error(j.error || ('HTTP ' + r.status));
+    // Reset the card back to the dropzone state.
+    card.setAttribute('data-needs-file', '1');
+    const rcImg = card.querySelector('.rc-img');
+    if (rcImg) {
+      rcImg.innerHTML =
+        '<div class="rc-dropzone" data-dropzone data-image-id="' + escapeHtml(imageId) + '">' +
+        '<div class="dz-icon">↑</div>' +
+        '<div class="dz-text">Drop file here</div>' +
+        '<div class="dz-sub">or click to browse — png · jpeg · webp · ≤10MB</div>' +
+        '</div>';
+    }
+    const replaceBtn = card.querySelector('[data-replace]');
+    const clearBtn = card.querySelector('[data-clear]');
+    if (replaceBtn) replaceBtn.style.display = 'none';
+    if (clearBtn) clearBtn.style.display = 'none';
+    const applyBtn = card.querySelector('[data-apply]');
+    if (applyBtn) {
+      applyBtn.disabled = true;
+      applyBtn.setAttribute('aria-disabled', 'true');
+    }
+    const warn = card.querySelector('.upload-warn');
+    if (warn) warn.remove();
+  } catch (err) {
+    alert('failed to clear: ' + (err && err.message ? err.message : err));
+  }
+}
 
 ${state.done ? "" : `
 const es = new EventSource('/runs/${esc(id)}/events');
@@ -5828,6 +6153,222 @@ function serveFile(res: ServerResponse, fsPath: string) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Upload-run pipeline — parallel to /regen. Operator picks images in
+// the workspace exactly like for regen, clicks "Upload replacements →"
+// instead of "Generate", and lands on a /runs/<id> page whose cards
+// expose a drop-zone per image instead of a Replicate-generated
+// preview. Apply pipeline is unchanged.
+//
+// Endpoints:
+//   POST   /upload-run/start       — body: {client, page_type, items}.
+//                                    Builds manifest + skeleton CSV.
+//                                    Returns {run_id, url}.
+//   POST   /runs/<id>/upload/<imgid>  — raw image bytes in body.
+//                                       Validates, canonicalises via
+//                                       sharp (auto-rotate, drop
+//                                       EXIF, single-frame), writes
+//                                       to volume, updates CSV +
+//                                       sidecar.
+//   DELETE /runs/<id>/upload/<imgid>  — clears the row.
+// ────────────────────────────────────────────────────────────────────────
+async function uploadRunStartHandler(req: IncomingMessage, res: ServerResponse) {
+  type Body = {
+    client?: string;
+    page_type?: string;
+    items?: Array<{ cluster_id?: string; image_ids?: string[] }>;
+  };
+  const body = (await readApplyBody(req)) as Body | null;
+  if (!body || !body.client) return sendJson(res, 400, { error: "client required" });
+  const items = Array.isArray(body.items) ? body.items : [];
+  const clusterIds = new Set(items.map((i) => i.cluster_id ?? "").filter(Boolean));
+  const imageIds = new Set(items.flatMap((i) => i.image_ids ?? []).filter(Boolean));
+  if (clusterIds.size === 0 || imageIds.size === 0) {
+    return sendJson(res, 400, { error: "items must include at least one cluster_id + image_id" });
+  }
+  const ptRaw = (body.page_type ?? "blog").split(",").map((s) => s.trim()).filter(Boolean);
+  const allowed = new Set<string>(["blog", "service", "category"]);
+  const pageTypes = ptRaw.filter((p) => allowed.has(p)) as ("blog" | "service" | "category")[];
+  if (pageTypes.length === 0) pageTypes.push("blog");
+  try {
+    const { startUploadRun } = await import("./uploadRun.js");
+    const result = await startUploadRun({
+      client: body.client,
+      pageType: pageTypes.length === 1 ? pageTypes[0]! : pageTypes,
+      clusterIds,
+      imageIds,
+    });
+    // Synthesise a RunState so /runs/<id> renders without waiting
+    // for the manifest reconstruction round-trip.
+    const state: RunState = {
+      id: result.runId,
+      client: body.client,
+      args: ["(upload run)"],
+      startedAt: new Date().toISOString(),
+      log: ["(upload run — no subprocess)\n"],
+      done: true,
+      exitCode: 0,
+      csvPath: result.csvPath,
+      htmlPath: undefined,
+      proc: { kill() { /* no-op */ } } as unknown as ChildProcess,
+      listeners: new Set(),
+      mode: "upload",
+    };
+    RUNS.set(result.runId, state);
+    // Patch the manifest with the run_id we just generated (the
+    // module returns a runId but writes the manifest before it
+    // knows that path is needed — easier to overwrite here than
+    // refactor the module's signature). Actually startUploadRun
+    // already wrote the run_id into the manifest; nothing to do.
+    sendJson(res, 200, { run_id: result.runId, url: `/runs/${result.runId}`, row_count: result.rowCount });
+  } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
+}
+
+async function uploadRunImagePost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} not found` });
+  if (state.mode !== "upload") {
+    return sendJson(res, 400, { error: `run ${runId} is a regen run, not an upload run — cannot accept dropped files` });
+  }
+
+  // Fast Content-Length pre-check — the client has set it on the
+  // fetch, so reject oversize uploads before reading any bytes.
+  const claimedLen = Number.parseInt(String(req.headers["content-length"] ?? "0"), 10);
+  if (Number.isFinite(claimedLen) && claimedLen > 10 * 1024 * 1024) {
+    return sendJson(res, 413, { error: `file too large (${(claimedLen / 1024 / 1024).toFixed(1)} MB; max 10 MB)` });
+  }
+
+  // Collect the body. We accept raw image bytes (no multipart) — the
+  // client sends `fetch(url, { method: 'POST', body: file })` with
+  // file being a File / Blob. Content-Type carries the claimed MIME
+  // but we don't trust it; magic-byte sniff is the source of truth.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let aborted = false;
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      total += buf.length;
+      if (total > 10 * 1024 * 1024) {
+        aborted = true;
+        break;
+      }
+      chunks.push(buf);
+    }
+  } catch (err) {
+    return sendJson(res, 500, { error: `upload stream failed: ${(err as Error).message}` });
+  }
+  if (aborted) {
+    return sendJson(res, 413, { error: "file too large (>10 MB) — upload aborted mid-stream" });
+  }
+  if (total === 0) return sendJson(res, 400, { error: "empty upload (0 bytes)" });
+  const raw = Buffer.concat(chunks, total);
+
+  // The slot's expected aspect comes from the CSV row.
+  const rows = await readRunCsvOrEmpty(state.csvPath);
+  const row = rows.find((r) => r.image_id === imageId);
+  if (!row) return sendJson(res, 404, { error: `image_id ${imageId} not in run CSV` });
+  const expectedAspect = row.aspect_ratio || null;
+
+  const {
+    validateAndCanonicalise,
+    writeUploadedImage,
+    loadUploadState,
+    saveUploadState,
+    updateCsvRowAfterUpload,
+  } = await import("./uploadRun.js");
+  const v = await validateAndCanonicalise(raw, expectedAspect);
+  if (!v.ok) return sendJson(res, v.status, { error: v.error });
+
+  let finalAbs: string;
+  try {
+    finalAbs = await writeUploadedImage(runId, imageId, v.bytes, v.ext);
+  } catch (err) {
+    return sendJson(res, 500, { error: `failed to write file to volume: ${(err as Error).message}` });
+  }
+
+  // CSV + sidecar updates. CSV first because Apply reads it; sidecar
+  // is best-effort metadata. If CSV write fails, roll back the file.
+  try {
+    await updateCsvRowAfterUpload(state.csvPath, imageId, {
+      image_local_path: finalAbs,
+      status: "ready",
+      error: "",
+    });
+  } catch (err) {
+    try { await (await import("./uploadRun.js")).removeUploadedImage(runId, imageId); } catch { /* */ }
+    return sendJson(res, 500, { error: `failed to update CSV: ${(err as Error).message}` });
+  }
+  try {
+    const state2 = await loadUploadState(runId);
+    const origName = String(req.headers["x-original-filename"] ?? "").slice(0, 200);
+    state2.image_ids[imageId] = {
+      path: path.relative(runOutDir(), finalAbs),
+      size_bytes: v.bytes.length,
+      mime: v.mime,
+      width: v.width,
+      height: v.height,
+      aspect: v.aspect,
+      sha256: v.sha256,
+      original_name: origName,
+      uploaded_at: new Date().toISOString(),
+      aspect_warning: v.aspect_warning,
+    };
+    await saveUploadState(runId, state2);
+  } catch (err) {
+    process.stderr.write(`uploadRunImagePost: sidecar write failed for ${imageId}: ${(err as Error).message}\n`);
+  }
+  sendJson(res, 200, {
+    ok: true,
+    image_id: imageId,
+    preview_url: `/runs/${runId}/preview/${encodeURIComponent(imageId)}?t=${Date.now()}`,
+    width: v.width,
+    height: v.height,
+    aspect: v.aspect,
+    mime: v.mime,
+    size_bytes: v.bytes.length,
+    sha256: v.sha256,
+    aspect_warning: v.aspect_warning,
+  });
+}
+
+async function uploadRunImageDelete(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  let state = RUNS.get(runId) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(runId);
+  if (!state || !state.csvPath) return sendJson(res, 404, { error: `run ${runId} not found` });
+  if (state.mode !== "upload") return sendJson(res, 400, { error: "not an upload run" });
+  const { removeUploadedImage, loadUploadState, saveUploadState, updateCsvRowAfterUpload } = await import("./uploadRun.js");
+  try {
+    await removeUploadedImage(runId, imageId);
+    await updateCsvRowAfterUpload(state.csvPath, imageId, {
+      image_local_path: "",
+      status: "pending",
+      error: "",
+    });
+    const s = await loadUploadState(runId);
+    if (s.image_ids[imageId]) {
+      delete s.image_ids[imageId];
+      await saveUploadState(runId, s);
+    }
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Server bootstrap
 // ────────────────────────────────────────────────────────────────────────
 
@@ -5914,6 +6455,13 @@ export function startWebServer(port: number): void {
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
+      // Upload-run pipeline. Strictly additive — never touches /regen.
+      if (method === "POST" && p === "/upload-run/start") return await uploadRunStartHandler(req, res);
+      const uploadMatch = /^\/runs\/([a-f0-9]+)\/upload\/(.+)$/.exec(p);
+      if (uploadMatch && uploadMatch[1] && uploadMatch[2]) {
+        if (method === "POST")   return await uploadRunImagePost(req, res, uploadMatch[1], decodeURIComponent(uploadMatch[2]));
+        if (method === "DELETE") return await uploadRunImageDelete(req, res, uploadMatch[1], decodeURIComponent(uploadMatch[2]));
+      }
       // Pipeline endpoints. /api/apply/* kept as back-compat aliases
       // for the existing client JS; /api/repoint/* are the canonical
       // names. All run the upload→repoint pipeline now.
