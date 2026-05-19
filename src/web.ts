@@ -2852,6 +2852,7 @@ async function genConfirmSubmit() {
   }
 
   const btn = document.getElementById('gen-submit-btn');
+  const resetBtn = () => { if (btn) { btn.disabled = false; btn.innerHTML = 'Generate →'; } };
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…'; }
   // Best-effort: forward the operator's per-tab bearer token so the
   // server can stamp the run-meta sidecar with "started_by_email".
@@ -2862,11 +2863,28 @@ async function genConfirmSubmit() {
   const fetchOpts = wsTok
     ? { method: 'POST', body: fd, headers: { 'Authorization': 'Bearer ' + wsTok } }
     : { method: 'POST', body: fd };
-  const r = await fetch('/regen', fetchOpts);
-  if (r.redirected) { window.location.href = r.url; return; }
-  const t = await r.text();
-  alert(t || 'regen submitted');
-  if (btn) { btn.disabled = false; btn.innerHTML = 'Generate →'; }
+  // Hard guards on the network call so a transient failure (Railway
+  // redeploy mid-click, 502 from the edge proxy, browser offline)
+  // never leaves the submit button stuck in 'Submitting…' state.
+  // Previously the await threw and the function silently exited
+  // before reaching the reset line.
+  try {
+    const r = await fetch('/regen', fetchOpts);
+    if (r.redirected) { window.location.href = r.url; return; }
+    if (!r.ok) {
+      const errText = (await r.text().catch(() => '')).slice(0, 500);
+      alert('Generate failed (HTTP ' + r.status + ').' + (errText ? '\\n\\n' + errText : '\\n\\nThe server returned an error. If a deploy was in progress, refresh and try again.'));
+      resetBtn();
+      return;
+    }
+    const t = await r.text().catch(() => '');
+    alert(t || 'regen submitted');
+    resetBtn();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    alert('Generate failed: ' + msg + '\\n\\nIf the server is mid-redeploy, wait ~30 seconds and try again.');
+    resetBtn();
+  }
 }
 
 // Legacy entry point — anything still wired to runRegen() now goes
