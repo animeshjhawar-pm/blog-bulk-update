@@ -2893,9 +2893,22 @@ async function readApplyBody(req: IncomingMessage): Promise<unknown> {
 // process restarts — never written to disk, never echoed back in full).
 // Decision: server-side in-memory, no auth gate (operator's call).
 // ────────────────────────────────────────────────────────────────────────
-interface ApiTokenState { value: string; exp: number | null; email: string | null; setAt: number }
-let API_TOKEN: ApiTokenState | null = null;
-
+// Token storage model — per-OPERATOR, not per-process.
+//
+// History: tokens used to live in a process-global API_TOKEN, which
+// leaked between concurrent operators. The cure is to keep the token
+// on the operator's own machine (sessionStorage in their browser tab)
+// and send it as an `Authorization: Bearer <jwt>` header on every
+// request that needs it. The server reads from the header per-request
+// and never holds state for any operator.
+//
+// /api/token POST still exists, but only to validate the token (decode
+// expiry, return the status the client uses to label the chip). It
+// does NOT store anything server-side. Likewise /api/token/clear is
+// now purely a no-op confirmation — clearing happens in the browser.
+//
+// /api/token/status no longer "remembers" anything; it answers
+// "is the token you sent valid?" based on the Authorization header.
 function decodeJwt(tok: string): { exp: number | null; email: string | null } {
   try {
     const p = JSON.parse(Buffer.from(tok.split(".")[1] ?? "", "base64").toString("utf8")) as {
@@ -2911,30 +2924,47 @@ function decodeJwt(tok: string): { exp: number | null; email: string | null } {
   }
 }
 
-function apiTokenStatus() {
-  if (!API_TOKEN) return { present: false as const };
-  const expired = API_TOKEN.exp != null && API_TOKEN.exp * 1000 < Date.now();
+/** Read the bearer token from the per-request Authorization header.
+ *  Strips the "Bearer " prefix; returns "" when absent. */
+function readBearerToken(req: IncomingMessage): string {
+  const raw = req.headers.authorization || req.headers.Authorization;
+  if (!raw) return "";
+  const s = String(Array.isArray(raw) ? raw[0] : raw).trim();
+  if (s.toLowerCase().startsWith("bearer ")) return s.slice(7).trim();
+  return s;
+}
+
+function tokenStatusFromHeader(req: IncomingMessage) {
+  const tok = readBearerToken(req);
+  if (!tok) return { present: false as const };
+  const { exp, email } = decodeJwt(tok);
+  const expired = exp != null && exp * 1000 < Date.now();
   return {
     present: true as const,
     expired,
-    email: API_TOKEN.email,
-    expires_at: API_TOKEN.exp ? new Date(API_TOKEN.exp * 1000).toISOString() : null,
-    set_at: new Date(API_TOKEN.setAt).toISOString(),
+    email,
+    expires_at: exp ? new Date(exp * 1000).toISOString() : null,
   };
 }
 
-function requireApiToken(): { ok: true; token: string } | { ok: false; error: string } {
-  if (!API_TOKEN)
-    return { ok: false, error: "no bearer token set — paste a fresh token in the token panel first" };
-  if (API_TOKEN.exp != null && API_TOKEN.exp * 1000 < Date.now())
+function requireApiToken(req: IncomingMessage): { ok: true; token: string } | { ok: false; error: string } {
+  const tok = readBearerToken(req);
+  if (!tok) {
+    return { ok: false, error: "no bearer token set — paste a fresh token in the token panel first (your token lives only in this browser tab, never on the server)" };
+  }
+  const { exp } = decodeJwt(tok);
+  if (exp != null && exp * 1000 < Date.now()) {
     return {
       ok: false,
-      error: `stored token expired at ${new Date(API_TOKEN.exp * 1000).toISOString()} — paste a fresh one`,
+      error: `your token expired at ${new Date(exp * 1000).toISOString()} — paste a fresh one`,
     };
-  return { ok: true, token: API_TOKEN.value };
+  }
+  return { ok: true, token: tok };
 }
 
 async function tokenSetHandler(req: IncomingMessage, res: ServerResponse) {
+  // Kept for backward-compat with clients that POST the token; we
+  // simply validate-and-echo. Nothing is stored.
   const body = (await readApplyBody(req)) as { token?: string } | null;
   if (!body || typeof body.token !== "string" || !body.token.trim())
     return sendJson(res, 400, { error: "body.token required" });
@@ -2944,13 +2974,15 @@ async function tokenSetHandler(req: IncomingMessage, res: ServerResponse) {
     return sendJson(res, 400, {
       error: `that token is already expired (exp ${new Date(exp * 1000).toISOString()}) — fetch a fresh one from https://platform.gushwork.ai/api/auth/token`,
     });
-  API_TOKEN = { value: tok, exp, email, setAt: Date.now() };
-  return sendJson(res, 200, { ok: true, status: apiTokenStatus() });
+  return sendJson(res, 200, {
+    ok: true,
+    status: { present: true, expired: false, email, expires_at: exp ? new Date(exp * 1000).toISOString() : null },
+  });
 }
 
 async function tokenClearHandler(_req: IncomingMessage, res: ServerResponse) {
-  API_TOKEN = null;
-  return sendJson(res, 200, { ok: true, status: apiTokenStatus() });
+  // Server doesn't hold tokens; the operator clears via their browser.
+  return sendJson(res, 200, { ok: true, status: { present: false } });
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2983,13 +3015,14 @@ async function resolveRunRows(
 }
 
 async function runRepointPipeline(
+  req: IncomingMessage,
   res: ServerResponse,
   scopeRows: CsvRowParsed[],
   dryRun: boolean,
   scopeLabel: string,
   runId?: string,
 ) {
-  const tk = requireApiToken();
+  const tk = requireApiToken(req);
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
   if (scopeRows.length === 0) return sendJson(res, 404, { error: "no rows in scope" });
 
@@ -3138,7 +3171,7 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
   const imageId = body.image_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
-  const tk = requireApiToken();
+  const tk = requireApiToken(req);
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
   const r = await resolveRunRows(runId);
@@ -3153,7 +3186,7 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
     }
     return sendJson(res, 404, { error: `image_id "${imageId}" is not in run ${runId} (${r.rows.length} rows checked). Likely cause: the cluster's thumbnail / page_info was updated by Stormbreaker between Generate and Apply, so the live image_id no longer matches what was recorded at Generate time. Re-import the cluster and Generate again.` });
   }
-  return runRepointPipeline(res, scope, dryRun, `image ${imageId}`, runId);
+  return runRepointPipeline(req, res, scope, dryRun, `image ${imageId}`, runId);
 }
 
 /**
@@ -3168,7 +3201,7 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const clusterId = body.cluster_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId || !clusterId) return sendJson(res, 400, { error: "run_id and cluster_id required" });
-  const tk = requireApiToken();
+  const tk = requireApiToken(req);
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
   const r = await resolveRunRows(runId);
@@ -3176,7 +3209,7 @@ async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const scope = r.rows.filter((x) => x.cluster_id === clusterId);
   if (scope.length === 0)
     return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
-  return runRepointPipeline(res, scope, dryRun, `cluster ${clusterId}`, runId);
+  return runRepointPipeline(req, res, scope, dryRun, `cluster ${clusterId}`, runId);
 }
 
 /**
@@ -3189,13 +3222,13 @@ async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
   const runId = body.run_id ?? "";
   const dryRun = body.dry_run === true;
   if (!runId) return sendJson(res, 400, { error: "run_id required" });
-  const tk = requireApiToken();
+  const tk = requireApiToken(req);
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
   const r = await resolveRunRows(runId);
   if ("error" in r) return sendJson(res, r.code, { error: r.error });
   if (r.rows.length === 0) return sendJson(res, 404, { error: `no rows in run ${runId} csv` });
-  return runRepointPipeline(res, r.rows, dryRun, `run ${runId}`, runId);
+  return runRepointPipeline(req, res, r.rows, dryRun, `run ${runId}`, runId);
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -3205,6 +3238,7 @@ async function applyRunHandler(req: IncomingMessage, res: ServerResponse) {
 // client modal contract (results[] with steps[]).
 // ────────────────────────────────────────────────────────────────────────
 async function runRevertAndRespond(
+  req: IncomingMessage,
   res: ServerResponse,
   backupFiles: string[],
   dryRun: boolean,
@@ -3212,7 +3246,7 @@ async function runRevertAndRespond(
 ) {
   let token = "";
   if (!dryRun) {
-    const tk = requireApiToken();
+    const tk = requireApiToken(req);
     if (!tk.ok) return sendJson(res, 400, { error: tk.error });
     token = tk.token;
   }
@@ -3268,7 +3302,7 @@ async function revertClusterHandler(req: IncomingMessage, res: ServerResponse) {
   const dir = path.resolve(process.cwd(), DEFAULT_BACKUPS_DIR);
   const f = await latestBackupForCluster(dir, clusterId);
   if (!f) return sendJson(res, 404, { error: `no repoint backup for cluster ${clusterId}` });
-  return runRevertAndRespond(res, [f], dryRun, `cluster ${clusterId}`);
+  return runRevertAndRespond(req, res, [f], dryRun, `cluster ${clusterId}`);
 }
 
 /** POST /api/revert/run — restore the latest backup of every cluster
@@ -3288,7 +3322,7 @@ async function revertRunHandler(req: IncomingMessage, res: ServerResponse) {
     const f = await latestBackupForCluster(dir, cid);
     if (f) files.push(f);
   }
-  return runRevertAndRespond(res, files, dryRun, `run ${runId}`);
+  return runRevertAndRespond(req, res, files, dryRun, `run ${runId}`);
 }
 
 async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
@@ -4206,7 +4240,7 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
   return null;
 }
 
-async function runPage(res: ServerResponse, id: string, stage: "prepare" | "apply" = "apply") {
+async function runPage(res: ServerResponse, id: string, requestedStage: "prepare" | "apply" = "apply") {
   let state = RUNS.get(id);
   if (!state) {
     // Manifest fallback: a previous server process spawned this run; the
@@ -4240,6 +4274,12 @@ async function runPage(res: ServerResponse, id: string, stage: "prepare" | "appl
     }
     state = reconstructed;
   }
+  // Prepare stage only makes sense for upload-mode runs. If a regen
+  // run is hit with ?stage=prepare we silently fall back to apply so
+  // the page renders as normal — otherwise the action bar would
+  // mismatch the card content (cards show generated images but the
+  // bottom bar would say "Step 1 — files uploaded").
+  const stage: "prepare" | "apply" = requestedStage === "prepare" && state.mode === "upload" ? "prepare" : "apply";
   const initial = esc(state.log.join(""));
   const cmd = esc(`npx ${state.args.join(" ")}`);
 
@@ -4307,7 +4347,17 @@ async function runPage(res: ServerResponse, id: string, stage: "prepare" | "appl
         const cards = g.rows
           .map((r) => {
             const oldUrl = oldUrlOf(r.image_id);
-            const isFailed = r.status === "failed" || (!r.image_url_new && r.status !== "completed");
+            // Upload-mode rows start with status="pending" and stay that
+            // way until the operator drops a file (then "ready"). The
+            // generic "no image_url_new yet → failed" heuristic would
+            // mis-flag every still-awaiting-upload slot as a Replicate
+            // failure, even though no Replicate call ever happened.
+            // Treat upload-mode pending/ready rows as "not failed";
+            // explicit r.status === "failed" still fires.
+            const isUploadModeRow = state.mode === "upload";
+            const isFailed = isUploadModeRow
+              ? r.status === "failed"
+              : r.status === "failed" || (!r.image_url_new && r.status !== "completed");
             // Image preview is rendered without an inline onclick; a
             // delegated click handler on the page binds zoom to every
             // image on load (more reliable across browsers + matches
@@ -4358,7 +4408,11 @@ async function runPage(res: ServerResponse, id: string, stage: "prepare" | "appl
             // at run-start, every workspace-visible image carries its
             // CDN URL through to here, so this is true for every card
             // on any run created after that change shipped.
-            const canCompare = !!r.image_url_new && !!oldUrl;
+            // Upload-mode rows don't carry image_url_new, so the
+            // "fresh image exists" half of the gate is image_local_path
+            // (set on first drop). Compare still needs an oldUrl from
+            // the live page_info to show what we're replacing.
+            const canCompare = !!oldUrl && (!!r.image_url_new || (isUpload && !!r.image_local_path));
             // The upload→repoint pipeline DOES handle cover &
             // thumbnail (cover = 1st <Image> UUID; thumbnail = the
             // live page_info.thumbnail URL string). Only truly
@@ -4502,8 +4556,7 @@ ${stage === "prepare" ? `
     Step 1 of 2 — <strong id="dz-uploaded-count">0</strong> of <strong>${rows.length}</strong> files uploaded
   </div>
   <div class="right">
-    <a class="btn" href="/runs/${esc(id)}" title="Switch to the Apply view (you can come back here any time by appending ?stage=prepare)">Skip — go to Apply</a>
-    <button class="primary" id="prepare-continue-btn" disabled onclick="goToApplyStage()" title="Continue to the Apply step. You can apply now or come back here to upload more files first.">Continue to Apply</button>
+    <button class="primary" id="prepare-continue-btn" disabled onclick="goToApplyStage()" title="Continue to the Apply step. Enabled once at least one slot has a dropped file.">Continue to Apply</button>
   </div>
 </div>` : `
 <div class="action-bar">
@@ -4776,40 +4829,80 @@ function applyBusyGuard() {
   return false;
 }
 
-// Bearer-token panel. The token is pasted here, POSTed to /api/token,
-// and held in server memory until it expires (~1h) or the process
-// restarts. Both dry-run and apply need it (dry-run still uploads).
+// Bearer-token panel. PER-TAB, NOT SERVER-GLOBAL.
+//
+// History: tokens used to live in a process-global API_TOKEN, which
+// leaked between concurrent operators — whoever set a token last
+// became "the operator" for every other tab pointing at the same
+// Railway instance. The cure is to keep the token in the operator's
+// own browser (sessionStorage, scoped to this tab only) and send it
+// as Authorization: Bearer <jwt> on every request that needs it.
+// The server reads from the header per-request and never stores.
+const TOKEN_KEY = 'gw_repoint_bearer_v1';
+function getStoredToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+function setStoredToken(tok) {
+  try { sessionStorage.setItem(TOKEN_KEY, tok); } catch { /* */ }
+}
+function clearStoredToken() {
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* */ }
+}
+function decodeTokenPayload(tok) {
+  try {
+    const part = (tok || '').split('.')[1] || '';
+    return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch { return null; }
+}
 function paintTokenChip(status) {
   const chip = document.getElementById('tok-chip');
   if (!chip) return;
   if (!status || !status.present) {
     chip.textContent = '🔑 no token';
     chip.style.color = '#a33';
-    chip.title = 'No bearer token set — paste one before upload/repoint.';
+    chip.title = 'No bearer token in this tab — paste one before upload/repoint. Token lives only in this browser tab.';
   } else if (status.expired) {
     chip.textContent = '🔑 token EXPIRED';
     chip.style.color = '#a33';
-    chip.title = 'Stored token expired at ' + status.expires_at + ' — paste a fresh one.';
+    chip.title = 'Token in this tab expired at ' + status.expires_at + ' — paste a fresh one.';
   } else {
     chip.textContent = '🔑 ' + (status.email || 'token set');
     chip.style.color = '#0a7';
-    chip.title = 'Valid until ' + (status.expires_at || 'unknown') + ' (set ' + status.set_at + ').';
+    chip.title = 'Valid until ' + (status.expires_at || 'unknown') + '. Token lives in this browser tab only — concurrent operators have their own.';
   }
 }
 
+// Build the Authorization header from the locally-stored token.
+// Returns an empty object when no token, so handlers reject cleanly.
+function authHeader() {
+  const t = getStoredToken();
+  return t ? { 'Authorization': 'Bearer ' + t } : {};
+}
+
+function statusFromLocalToken() {
+  const tok = getStoredToken();
+  if (!tok) return { present: false };
+  const p = decodeTokenPayload(tok);
+  const exp = p && typeof p.exp === 'number' ? p.exp : null;
+  return {
+    present: true,
+    expired: exp != null && exp * 1000 < Date.now(),
+    email: p && typeof p.email === 'string' ? p.email : null,
+    expires_at: exp ? new Date(exp * 1000).toISOString() : null,
+  };
+}
+
 async function tokenRefresh() {
-  try {
-    const r = await fetch('/api/token/status');
-    const j = await r.json();
-    paintTokenChip(j.status);
-  } catch { /* leave chip as-is */ }
+  paintTokenChip(statusFromLocalToken());
 }
 
 async function setToken() {
-  const tok = prompt('Paste a FRESH bearer token (1h TTL) from\\nhttps://platform.gushwork.ai/api/auth/token');
+  const tok = prompt('Paste a FRESH bearer token (1h TTL) from\\nhttps://platform.gushwork.ai/api/auth/token\\n\\nYour token lives ONLY in this browser tab. Different tabs (and other operators) have their own tokens.');
   if (tok == null) return;
   const t = tok.trim();
   if (!t) return;
+  // Server validates expiry; if accepted, we store locally and start
+  // sending it as Authorization on every subsequent Apply / repoint.
   try {
     const r = await fetch('/api/token', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -4817,7 +4910,8 @@ async function setToken() {
     });
     const j = await r.json();
     if (!r.ok) { alert('Token rejected: ' + (j.error || ('HTTP ' + r.status))); return; }
-    paintTokenChip(j.status);
+    setStoredToken(t);
+    paintTokenChip(j.status || statusFromLocalToken());
   } catch (err) {
     alert('Token set failed: ' + (err && err.message ? err.message : String(err)));
   }
@@ -4954,7 +5048,8 @@ async function applyOne(imageId, opts) {
   stateOf.set(imageId, 'applying'); paintCard(imageId);
   try {
     const r = await fetch('/api/apply/image', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
       body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
@@ -5078,7 +5173,8 @@ async function applyCluster(clusterId) {
   }
   try {
     const r = await fetch('/api/apply/cluster', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
       body: JSON.stringify({ run_id: RUN_ID, cluster_id: clusterId, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
@@ -5113,7 +5209,8 @@ async function revertScope(url, payloadKey, scopeId, scopeLabel) {
     const body = { dry_run: APPLY_DRY_RUN };
     body[payloadKey] = scopeId;
     const r = await fetch(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
       body: JSON.stringify(body)
     });
     const j = await r.json();
@@ -5148,7 +5245,8 @@ async function applyAll() {
   }
   try {
     const r = await fetch('/api/apply/run', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
       body: JSON.stringify({ run_id: RUN_ID, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
@@ -6535,7 +6633,7 @@ export function startWebServer(port: number): void {
       if (method === "POST" && p === "/api/revert/run")     return await revertRunHandler(req, res);
       if (method === "POST" && p === "/api/token")        return await tokenSetHandler(req, res);
       if (method === "POST" && p === "/api/token/clear")  return await tokenClearHandler(req, res);
-      if (method === "GET"  && p === "/api/token/status") return sendJson(res, 200, { status: apiTokenStatus() });
+      if (method === "GET"  && p === "/api/token/status") return sendJson(res, 200, { status: tokenStatusFromHeader(req) });
       if (method === "GET" && p === "/api/projects/search") {
         try {
           loadEnv();
