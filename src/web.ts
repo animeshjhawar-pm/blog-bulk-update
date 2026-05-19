@@ -5973,7 +5973,11 @@ function xhrUpload(url, file, onProgress) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
     xhr.setRequestHeader('content-type', file.type);
-    xhr.setRequestHeader('x-original-filename', file.name);
+    // HTTP headers must be ISO-8859-1. URL-encode the filename so
+    // non-Latin1 chars (emoji, accents, CJK, smart quotes, etc.)
+    // don't throw a synchronous setRequestHeader error before the
+    // body is even streamed. Server decodes via decodeURIComponent.
+    try { xhr.setRequestHeader('x-original-filename', encodeURIComponent(file.name || '')); } catch (_e) { /* skip */ }
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
     };
@@ -6726,7 +6730,13 @@ async function uploadRunImagePost(
   }
   try {
     const state2 = await loadUploadState(runId);
-    const origName = String(req.headers["x-original-filename"] ?? "").slice(0, 200);
+    // Client URL-encodes the filename so non-Latin1 chars don't
+    // trip setRequestHeader's ISO-8859-1 check. Try/catch on
+    // decodeURIComponent in case the value isn't actually encoded.
+    const rawOrigName = String(req.headers["x-original-filename"] ?? "").slice(0, 400);
+    let origName = rawOrigName;
+    try { origName = decodeURIComponent(rawOrigName); } catch { /* keep raw */ }
+    origName = origName.slice(0, 200);
     state2.image_ids[imageId] = {
       path: path.relative(runOutDir(), finalAbs),
       size_bytes: v.bytes.length,
