@@ -368,6 +368,12 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .run-type-chip.run-type-regen  { background: #e0e7ff; color: #3730a3; }
   .run-type-chip.run-type-upload { background: #fef3c7; color: #92400e; }
   table.recent-runs td.run-type-cell { white-space: nowrap; }
+  /* "Run by" — shows email local-part, full email on hover. Falls
+     back to a muted dash for legacy runs (created before this
+     instrumentation, or before the operator had pasted a token). */
+  table.recent-runs td.run-by-cell { white-space: nowrap; font-size: 12px; }
+  table.recent-runs .run-by         { color: var(--ink); }
+  table.recent-runs .run-by-empty   { color: var(--ink-faint); }
   table.recent-runs td.applied-cell .none { color: var(--ink-faint); }
   table.recent-runs tr.recent-row { cursor: pointer; }
   table.recent-runs tr.recent-row:hover td { background: #f8fafc; }
@@ -1148,6 +1154,11 @@ interface RecentRunSummary {
   page_types: string | null;
   /** "regen" (subprocess Generate run) or "upload" (operator drop). */
   mode: "regen" | "upload";
+  /** Email decoded from the bearer JWT the operator used to start
+   * the run. Null when the run was created without a token in the
+   * Authorization header (legacy runs, or operator hadn't pasted
+   * their token before clicking Generate). */
+  started_by_email: string | null;
   csv: string | null;
   html: string | null;
   run_id: string | null;
@@ -1196,6 +1207,7 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
         applied,
         page_types: typeof j.page_type === "string" ? j.page_type : Array.isArray(j.page_type) ? j.page_type.join("+") : null,
         mode: j.mode === "upload" ? "upload" : "regen",
+        started_by_email: runId ? (await loadRunMeta(runId)).started_by_email : null,
         csv: csvPath,
         html: htmlPath,
         run_id: runId,
@@ -1301,7 +1313,14 @@ async function homePage(res: ServerResponse) {
       const typeLabel = r.mode === "upload" ? "Upload" : "Generate";
       const typeIcon = r.mode === "upload" ? "↑" : "↻";
       const typeChip = `<span class="run-type-chip run-type-${r.mode}" title="${r.mode === "upload" ? "Operator-uploaded replacement images" : "Replicate-generated images"}">${typeIcon} ${typeLabel}</span>`;
-      const searchKey = [displayName, r.page_types, typeLabel].filter(Boolean).join(" ").toLowerCase();
+      // Render just the local-part of the email (before "@") in the
+      // cell — full email lives in the title attribute on hover. Keeps
+      // the column compact and readable. Falls back to "—" when no
+      // token was attached when the run started.
+      const runByDisplay = r.started_by_email
+        ? `<span class="run-by" title="${esc(r.started_by_email)}">${esc(r.started_by_email.split("@")[0] ?? r.started_by_email)}</span>`
+        : `<span class="run-by run-by-empty" title="No bearer token was attached when this run was started">—</span>`;
+      const searchKey = [displayName, r.page_types, typeLabel, r.started_by_email].filter(Boolean).join(" ").toLowerCase();
       const linkOpen = r.run_id ? `<a href="/runs/${esc(r.run_id)}" class="recent-link">` : `<span class="recent-link">`;
       const linkClose = r.run_id ? `</a>` : `</span>`;
       const rowOnClick = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'"` : "";
@@ -1309,6 +1328,7 @@ async function homePage(res: ServerResponse) {
 <tr class="recent-row apply-${applyState}" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}" data-apply-state="${applyState}" data-mode="${r.mode}" data-page="${pageIdx}"${rowOnClick}>
   <td class="client">${linkOpen}${nameInner}${linkClose}</td>
   <td class="run-type-cell">${linkOpen}${typeChip}${linkClose}</td>
+  <td class="run-by-cell">${linkOpen}${runByDisplay}${linkClose}</td>
   <td class="pt">${linkOpen}${pageTypeInner}${linkClose}</td>
   <td class="started">${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
   <td class="num">${linkOpen}${totalLabel}${linkClose}</td>
@@ -1403,6 +1423,7 @@ ${recent.length > 0 ? `
         <tr>
           <th>Client</th>
           <th>Type</th>
+          <th title="Operator email decoded from the bearer JWT they used to start the run">Run by</th>
           <th>Page type</th>
           <th>Started</th>
           <th class="num" title="Total images the run was scheduled to process">Total</th>
@@ -2832,7 +2853,16 @@ async function genConfirmSubmit() {
 
   const btn = document.getElementById('gen-submit-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…'; }
-  const r = await fetch('/regen', { method: 'POST', body: fd });
+  // Best-effort: forward the operator's per-tab bearer token so the
+  // server can stamp the run-meta sidecar with "started_by_email".
+  // No token = no header = sidecar shows "—" in the recent-runs
+  // table. Doesn't gate /regen itself (generation only needs
+  // Replicate/Portkey env creds; the bearer is for Apply only).
+  const wsTok = (function () { try { return sessionStorage.getItem('gw_repoint_bearer_v1') || ''; } catch (_e) { return ''; } })();
+  const fetchOpts = wsTok
+    ? { method: 'POST', body: fd, headers: { 'Authorization': 'Bearer ' + wsTok } }
+    : { method: 'POST', body: fd };
+  const r = await fetch('/regen', fetchOpts);
   if (r.redirected) { window.location.href = r.url; return; }
   const t = await r.text();
   alert(t || 'regen submitted');
@@ -2860,8 +2890,16 @@ async function openUploadRun() {
   const btn = document.getElementById('bar-upload-btn');
   if (btn) { btn.disabled = true; btn.textContent = '… creating run'; }
   try {
+    // Forward the operator's per-tab bearer (when present) so the
+    // server can stamp "started_by_email" into the run-meta sidecar
+    // for the recent-runs "Run by" column. Not required to start
+    // the run; absence just leaves the column blank.
+    const upTok = (function () { try { return sessionStorage.getItem('gw_repoint_bearer_v1') || ''; } catch (_e) { return ''; } })();
+    const upHeaders = upTok
+      ? { 'content-type': 'application/json', 'Authorization': 'Bearer ' + upTok }
+      : { 'content-type': 'application/json' };
     const r = await fetch('/upload-run/start', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: upHeaders,
       body: JSON.stringify({ client: SLUG, page_type: SELECTED_PAGE_TYPES, items })
     });
     const j = await r.json();
@@ -3007,6 +3045,57 @@ async function tokenSetHandler(req: IncomingMessage, res: ServerResponse) {
 async function tokenClearHandler(_req: IncomingMessage, res: ServerResponse) {
   // Server doesn't hold tokens; the operator clears via their browser.
   return sendJson(res, 200, { ok: true, status: { present: false } });
+}
+
+/**
+ * Best-effort: pull the operator's email out of the Authorization
+ * JWT for stamping into the run manifest / sidecar. Returns null
+ * when no token is present, the JWT can't be decoded, or the JWT
+ * has no email claim. Never throws — generation/upload starts must
+ * not be blocked by absent or malformed tokens.
+ */
+function readOperatorEmail(req: IncomingMessage): string | null {
+  const tok = readBearerToken(req);
+  if (!tok) return null;
+  const { email } = decodeJwt(tok);
+  return email || null;
+}
+
+/**
+ * Per-run metadata sidecar at <runOutDir>/run-meta-<runId>.json.
+ * Captures who started the run (decoded from the bearer JWT they
+ * sent with /regen or /upload-run/start). Read by loadRecentRuns
+ * so the recent-runs table can show a "Run by" column.
+ *
+ * Why a sidecar and not the manifest: the regen manifest is written
+ * by the subprocess (cli.ts), which doesn't see the HTTP request.
+ * Passing the operator email as a CLI arg would work, but a tiny
+ * server-side sidecar keeps the change strictly additive and
+ * doesn't muddy the CLI contract.
+ */
+async function writeRunMeta(
+  runId: string,
+  meta: { started_by_email: string | null; started_by_set_at: string },
+): Promise<void> {
+  if (!runId) return;
+  try {
+    const p = path.join(runOutDir(), `run-meta-${runId}.json`);
+    await fs.writeFile(p, JSON.stringify(meta) + "\n", "utf8");
+  } catch (err) {
+    process.stderr.write(`writeRunMeta: ${runId} failed: ${(err as Error).message}\n`);
+  }
+}
+
+async function loadRunMeta(runId: string): Promise<{ started_by_email: string | null }> {
+  if (!runId) return { started_by_email: null };
+  try {
+    const p = path.join(runOutDir(), `run-meta-${runId}.json`);
+    const raw = await fs.readFile(p, "utf8");
+    const j = JSON.parse(raw) as { started_by_email?: unknown };
+    return { started_by_email: typeof j.started_by_email === "string" ? j.started_by_email : null };
+  } catch {
+    return { started_by_email: null };
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -3953,6 +4042,13 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     pageType: pageTypeArg,
     provider: body.get("provider") || undefined,
     promptOverridesFile,
+  });
+  // Stamp the operator's email (from their bearer JWT) so the
+  // recent-runs table can show "Run by" without holding any server
+  // session state. Best-effort — runs without a token still proceed.
+  void writeRunMeta(state.id, {
+    started_by_email: readOperatorEmail(req),
+    started_by_set_at: new Date().toISOString(),
   });
   res.writeHead(303, { location: `/runs/${state.id}` });
   res.end();
@@ -6452,11 +6548,14 @@ async function uploadRunStartHandler(req: IncomingMessage, res: ServerResponse) 
       mode: "upload",
     };
     RUNS.set(result.runId, state);
-    // Patch the manifest with the run_id we just generated (the
-    // module returns a runId but writes the manifest before it
-    // knows that path is needed — easier to overwrite here than
-    // refactor the module's signature). Actually startUploadRun
-    // already wrote the run_id into the manifest; nothing to do.
+    // Stamp the operator's email (from their bearer JWT) so the
+    // recent-runs table can show "Run by" without holding any
+    // server session state. Best-effort — upload runs without a
+    // token still proceed and the column shows "—".
+    void writeRunMeta(result.runId, {
+      started_by_email: readOperatorEmail(req),
+      started_by_set_at: new Date().toISOString(),
+    });
     sendJson(res, 200, { run_id: result.runId, url: `/runs/${result.runId}`, row_count: result.rowCount });
   } catch (err) {
     sendJson(res, 500, { error: (err as Error).message });
