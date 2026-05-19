@@ -4502,7 +4502,12 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
             const previewHtml = isUpload
               ? (hasUploadedFile
                 ? `<img class="rc-preview-img" src="/runs/${esc(id)}/preview/${encodeURIComponent(r.image_id)}?t=${encodeURIComponent(Date.now().toString())}" alt="" loading="lazy">`
-                : `<div class="rc-dropzone" data-dropzone data-image-id="${esc(r.image_id)}">
+                : `<div class="rc-dropzone" data-dropzone data-image-id="${esc(r.image_id)}"
+                       onclick="dzClick(event)"
+                       ondragenter="dzDragEnter(event)"
+                       ondragover="dzDragOver(event)"
+                       ondragleave="dzDragLeave(event)"
+                       ondrop="dzDrop(event)">
                     <div class="dz-icon">↑</div>
                     <div class="dz-text">Drop file here</div>
                     <div class="dz-sub">or click to browse — png · jpeg · webp · ≤10MB</div>
@@ -5802,64 +5807,101 @@ function goToApplyStage() {
 }
 
 // ── Upload-mode drag-and-drop ───────────────────────────────────────
-// Wired up only for cards that have data-upload="1". We delegate
-// click + drag events at the document level so cards rendered
-// dynamically (post-clear, post-replace) inherit the behaviour
-// without re-binding.
+// Strategy:
+//  1. Window-level dragenter/dragover/drop suppress the BROWSER
+//     default ("open the file in a new tab") for ANY file-drop on
+//     this page. Without these, drops that miss the dropzone (e.g.
+//     on the page header or padding around the card) navigate to
+//     the dragged file's URL — the operator's image opens in a
+//     new tab instead of uploading.
+//  2. Per-dropzone behaviour is wired via INLINE attributes
+//     (onclick / ondragover / ondrop) on the <div class="rc-dropzone">
+//     element itself. Inline handlers are 100%-reliable across
+//     event-delegation edge-cases and dynamic re-renders, and they
+//     preserve the user-gesture context required for the file
+//     picker to open on click.
 const ACCEPTED_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
-function findDropZone(el) {
-  return el && el.closest ? el.closest('.rc-dropzone') : null;
+// Window-level default-suppression. We preventDefault on any drag
+// event whose dataTransfer carries files, so the browser doesn't
+// initiate the navigation-to-file flow for drops outside dropzones.
+// Non-file drags (text, in-page drag-reorder, etc.) pass through.
+function dzWindowSuppress(ev) {
+  if (ev.dataTransfer && ev.dataTransfer.types && Array.prototype.includes.call(ev.dataTransfer.types, 'Files')) {
+    ev.preventDefault();
+  }
 }
-function findUploadCard(el) {
-  const c = el && el.closest ? el.closest('.result-card.upload-mode') : null;
-  return c && c.dataset.imageId ? c : null;
-}
+window.addEventListener('dragenter', dzWindowSuppress);
+window.addEventListener('dragover', dzWindowSuppress);
+window.addEventListener('drop', dzWindowSuppress);
 
-// Hover state — purely visual; tracks whether the dragged file is
-// over a drop zone right now.
-document.addEventListener('dragover', (ev) => {
-  const dz = findDropZone(ev.target);
-  if (!dz) return;
-  ev.preventDefault();
-  ev.dataTransfer && (ev.dataTransfer.dropEffect = 'copy');
-  dz.classList.add('dragover');
-});
-document.addEventListener('dragleave', (ev) => {
-  const dz = findDropZone(ev.target);
-  if (dz) dz.classList.remove('dragover');
-});
-document.addEventListener('drop', (ev) => {
-  const dz = findDropZone(ev.target);
-  if (!dz) return;
-  ev.preventDefault();
-  dz.classList.remove('dragover');
-  const card = findUploadCard(dz);
-  if (!card) return;
-  const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
-  if (file) handleUploadFile(card.dataset.imageId, file);
-});
-// Click-to-browse: triggers a hidden file input scoped to this card.
-document.addEventListener('click', (ev) => {
-  const dz = findDropZone(ev.target);
+// Per-dropzone inline handlers. Exposed on window so the inline
+// onclick / ondragover attributes can resolve them.
+function dzClick(ev) {
+  const dz = ev.currentTarget;
   if (!dz) return;
   if (dz.classList.contains('uploading')) return;
-  const card = findUploadCard(dz);
-  if (!card) return;
-  triggerUploadFilePicker(card.dataset.imageId);
-});
+  const imageId = dz.dataset.imageId || (dz.closest('.result-card') || {}).dataset?.imageId;
+  if (!imageId) return;
+  triggerUploadFilePicker(imageId);
+}
+function dzDragEnter(ev) {
+  ev.preventDefault();
+  ev.currentTarget && ev.currentTarget.classList.add('dragover');
+}
+function dzDragOver(ev) {
+  ev.preventDefault();
+  if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+  ev.currentTarget && ev.currentTarget.classList.add('dragover');
+}
+function dzDragLeave(ev) {
+  // dragleave fires when the mouse leaves the dropzone OR moves to
+  // a child element. We only clear the highlight when the mouse
+  // truly leaves the dropzone bounds (related target is null or
+  // outside this dropzone).
+  const dz = ev.currentTarget;
+  if (!dz) return;
+  const related = ev.relatedTarget;
+  if (related && dz.contains(related)) return;
+  dz.classList.remove('dragover');
+}
+function dzDrop(ev) {
+  ev.preventDefault();
+  const dz = ev.currentTarget;
+  if (!dz) return;
+  dz.classList.remove('dragover');
+  const imageId = dz.dataset.imageId;
+  if (!imageId) return;
+  const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (file) handleUploadFile(imageId, file);
+}
+// Expose to global scope so inline onclick="dzClick(event)" etc.
+// resolve regardless of script-block scoping.
+window.dzClick = dzClick;
+window.dzDragEnter = dzDragEnter;
+window.dzDragOver = dzDragOver;
+window.dzDragLeave = dzDragLeave;
+window.dzDrop = dzDrop;
 
+// Click-to-browse: append the input to the DOM BEFORE clicking
+// (some browsers reject .click() on detached elements). Inline
+// positioning instead of display:none for the same reason — a
+// handful of browsers refuse file-picker activation on hidden
+// inputs. The input is removed immediately on change/cancel.
 function triggerUploadFilePicker(imageId) {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = ACCEPTED_MIMES.join(',');
-  input.style.display = 'none';
+  input.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;width:1px;height:1px;';
   input.onchange = () => {
     const f = input.files && input.files[0];
+    if (input.parentNode) input.parentNode.removeChild(input);
     if (f) handleUploadFile(imageId, f);
-    document.body.removeChild(input);
   };
+  // If the user cancels the dialog, onchange never fires; clean up
+  // the orphan input after a tick so the DOM doesn't accumulate.
+  setTimeout(() => { if (input.parentNode && !input.files?.length) input.parentNode.removeChild(input); }, 60000);
   document.body.appendChild(input);
   input.click();
 }
@@ -5989,7 +6031,9 @@ async function clearUploadedFile(imageId) {
     const rcImg = card.querySelector('.rc-img');
     if (rcImg) {
       rcImg.innerHTML =
-        '<div class="rc-dropzone" data-dropzone data-image-id="' + escapeHtml(imageId) + '">' +
+        '<div class="rc-dropzone" data-dropzone data-image-id="' + escapeHtml(imageId) + '"' +
+        ' onclick="dzClick(event)" ondragenter="dzDragEnter(event)" ondragover="dzDragOver(event)"' +
+        ' ondragleave="dzDragLeave(event)" ondrop="dzDrop(event)">' +
         '<div class="dz-icon">↑</div>' +
         '<div class="dz-text">Drop file here</div>' +
         '<div class="dz-sub">or click to browse — png · jpeg · webp · ≤10MB</div>' +
