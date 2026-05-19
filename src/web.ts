@@ -3830,6 +3830,7 @@ function startRegen(opts: {
   const state: RunState = {
     id, client: opts.client, args, startedAt: new Date().toISOString(),
     log: [], done: false, exitCode: null, proc, listeners: new Set(),
+    mode: "regen",
   };
   RUNS.set(id, state);
 
@@ -4446,7 +4447,9 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
            <button class="btn-clear" type="button" data-clear ${hasUploadedFile ? '' : 'style="display:none"'} title="Remove the uploaded file for this slot">✕ Clear</button>`
         : `<button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
            <a class="btn-regen-custom" type="button" data-regen-custom title="Re-roll with one-off instructions for this image only" role="button" tabindex="0">↻ Custom…</a>`}
-      ${canCompare ? `<button class="btn-compare" type="button" data-compare title="Old vs new, side-by-side">⇄ Compare</button>` : ""}
+      ${oldUrl
+        ? `<button class="btn-compare" type="button" data-compare ${canCompare ? "" : 'style="display:none"'} title="Old (live) vs new (this run), side-by-side">⇄ Compare</button>`
+        : ""}
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
         : ""}
@@ -5392,13 +5395,17 @@ async function regenAllPicked() {
 // Per-card zoom button: opens the existing lightbox with the new image.
 function zoomCard(imageId, ev) {
   if (ev) ev.stopPropagation();
-  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
-  if (!card) return;
-  const img = card.querySelector('.rc-img img');
-  const src = img ? img.src : '';
-  if (!src) return;
-  const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
-  lbOpen(null, src, (asset || '') + ' · ' + imageId);
+  try {
+    const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+    if (!card) { console.warn('[zoomCard] no card for', imageId); return; }
+    const img = card.querySelector('.rc-img img');
+    const src = img ? img.src : '';
+    if (!src) { console.warn('[zoomCard] no img src for', imageId); return; }
+    const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
+    lbOpen(null, src, (asset || '') + ' · ' + imageId);
+  } catch (e) {
+    console.error('[zoomCard] failed for', imageId, e);
+  }
 }
 
 // Compare modal: old (live CDN URL from media_registry) vs new (from CSV).
@@ -5406,28 +5413,40 @@ function zoomCard(imageId, ev) {
 // pane falls back to a "no live image found" placeholder so the
 // button still gives the operator something to look at.
 function openCompare(imageId) {
-  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
-  if (!card) return;
-  const img = card.querySelector('.rc-img img');
-  const newSrc = img ? img.src : '';
-  if (!newSrc) return;
-  const oldSrc = card.dataset.oldUrl || '';
-  const oldEl = document.getElementById('cmp-old');
-  const oldPh = document.getElementById('cmp-old-ph');
-  if (oldSrc) {
-    oldEl.src = oldSrc;
-    oldEl.style.display = '';
-    if (oldPh) oldPh.style.display = 'none';
-  } else {
-    oldEl.removeAttribute('src');
-    oldEl.style.display = 'none';
-    if (oldPh) oldPh.style.display = 'flex';
+  try {
+    const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+    if (!card) { console.warn('[openCompare] no card for', imageId); return; }
+    const img = card.querySelector('.rc-img img');
+    const newSrc = img ? img.src : '';
+    if (!newSrc) { console.warn('[openCompare] no new img src for', imageId); return; }
+    const oldSrc = card.dataset.oldUrl || '';
+    const overlay = document.getElementById('cmp-overlay');
+    const oldEl = document.getElementById('cmp-old');
+    const oldPh = document.getElementById('cmp-old-ph');
+    const newEl = document.getElementById('cmp-new');
+    const titleEl = document.getElementById('cmp-title');
+    const metaEl = document.getElementById('cmp-meta');
+    if (!overlay || !oldEl || !newEl) {
+      console.error('[openCompare] modal DOM missing — overlay=', !!overlay, 'old=', !!oldEl, 'new=', !!newEl);
+      return;
+    }
+    if (oldSrc) {
+      oldEl.src = oldSrc;
+      oldEl.style.display = '';
+      if (oldPh) oldPh.style.display = 'none';
+    } else {
+      oldEl.removeAttribute('src');
+      oldEl.style.display = 'none';
+      if (oldPh) oldPh.style.display = 'flex';
+    }
+    newEl.src = newSrc;
+    if (titleEl) titleEl.textContent = 'Compare — ' + imageId;
+    const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
+    if (metaEl) metaEl.textContent = asset;
+    overlay.classList.add('open');
+  } catch (e) {
+    console.error('[openCompare] failed for', imageId, e);
   }
-  document.getElementById('cmp-new').src = newSrc;
-  document.getElementById('cmp-title').textContent = 'Compare — ' + imageId;
-  const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
-  document.getElementById('cmp-meta').textContent = asset;
-  document.getElementById('cmp-overlay').classList.add('open');
 }
 function closeCompare() {
   document.getElementById('cmp-overlay').classList.remove('open');
@@ -5777,11 +5796,13 @@ function paintDropApplied(card, info) {
       '<img class="rc-preview-img" src="' + info.preview_url + '" alt="" loading="lazy">' +
       '<button class="rc-zoom" type="button" data-zoom title="Zoom in"><span aria-hidden="true">⤢</span></button>';
   }
-  // Reveal Replace + Clear, enable Apply.
+  // Reveal Replace + Clear + Compare, enable Apply.
   const replaceBtn = card.querySelector('[data-replace]');
   const clearBtn = card.querySelector('[data-clear]');
+  const compareBtn = card.querySelector('[data-compare]');
   if (replaceBtn) replaceBtn.style.display = '';
   if (clearBtn) clearBtn.style.display = '';
+  if (compareBtn) compareBtn.style.display = '';
   const applyBtn = card.querySelector('[data-apply]');
   if (applyBtn) {
     applyBtn.disabled = false;
@@ -5823,8 +5844,10 @@ async function clearUploadedFile(imageId) {
     }
     const replaceBtn = card.querySelector('[data-replace]');
     const clearBtn = card.querySelector('[data-clear]');
+    const compareBtn = card.querySelector('[data-compare]');
     if (replaceBtn) replaceBtn.style.display = 'none';
     if (clearBtn) clearBtn.style.display = 'none';
+    if (compareBtn) compareBtn.style.display = 'none';
     const applyBtn = card.querySelector('[data-apply]');
     if (applyBtn) {
       applyBtn.disabled = true;

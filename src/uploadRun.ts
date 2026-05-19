@@ -435,9 +435,46 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
 // Per-row CSV mutation — set image_local_path + status after a
 // successful upload, OR clear them after a delete. We rewrite the
 // whole CSV; it's small (one row per picked image, typically <500).
+//
+// Concurrency: two operators on the same run dropping files for
+// different image_ids at the same time would otherwise race —
+// each reads the CSV, mutates one row, writes back; the second
+// write loses whatever the first wrote. Per-CSV in-process mutex
+// (a Promise chain keyed by csvPath) serialises updates so each
+// read sees the most recent write. Cross-process / cross-instance
+// races aren't a concern because Railway runs one process per
+// container and the volume is per-deployment.
 // ────────────────────────────────────────────────────────────────────────
+const CSV_WRITE_LOCKS = new Map<string, Promise<void>>();
+
+async function withCsvLock<T>(csvPath: string, fn: () => Promise<T>): Promise<T> {
+  const prev = CSV_WRITE_LOCKS.get(csvPath) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  CSV_WRITE_LOCKS.set(csvPath, prev.then(() => gate));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Best-effort cleanup so the map doesn't grow unbounded.
+    queueMicrotask(() => {
+      if (CSV_WRITE_LOCKS.get(csvPath) === prev.then(() => gate)) {
+        CSV_WRITE_LOCKS.delete(csvPath);
+      }
+    });
+  }
+}
 
 export async function updateCsvRowAfterUpload(
+  csvPath: string,
+  imageId: string,
+  patch: { image_local_path?: string; status?: string; error?: string },
+): Promise<void> {
+  return withCsvLock(csvPath, () => updateCsvRowAfterUploadInner(csvPath, imageId, patch));
+}
+
+async function updateCsvRowAfterUploadInner(
   csvPath: string,
   imageId: string,
   patch: { image_local_path?: string; status?: string; error?: string },
