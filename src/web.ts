@@ -4783,10 +4783,12 @@ const RUN_ID = window.location.pathname.split('/').pop();
 // Claude UX: a primary verb that mutates ("Thinking…", "Generating
 // image 3 of 7…") with a rotating secondary tip about the platform.
 const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
-// Declared at the very top of the script so functions called later
-// in the body (updateUploadProgress, etc.) can read it without TDZ.
-// "prepare" only for upload-mode runs; everything else is "apply".
-const RUN_STAGE = ${JSON.stringify(stage)};
+// Bound at parse time via window so anything called during script
+// init (updateUploadProgress, etc.) reads it without TDZ — const/let
+// declarations sit in TDZ until their line executes, and a stale
+// build kept tripping on it. window.* is initialised the moment
+// this line is parsed, no ordering hazard.
+window.RUN_STAGE = ${JSON.stringify(stage)};
 let onLogStream = null;
 (function () {
   const heroEl = document.getElementById('running-hero');
@@ -5794,7 +5796,7 @@ document.addEventListener('click', (ev) => {
 // __dzActiveImageId.
 
 function updateUploadProgress() {
-  if (RUN_STAGE !== 'prepare') return;
+  if (window.RUN_STAGE !== 'prepare') return;
   const total = document.querySelectorAll('.result-card.upload-mode').length;
   const done = document.querySelectorAll('.result-card.upload-mode:not([data-needs-file="1"])').length;
   const lbl = document.getElementById('dz-uploaded-count');
