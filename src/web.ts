@@ -359,6 +359,15 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   table.recent-runs td.applied-cell { font-variant-numeric: tabular-nums; text-align: right; }
   table.recent-runs td.applied-cell .has { color: #047857; font-weight: 600; }
   table.recent-runs td.applied-cell .has .check { margin-left: 4px; color: #16a34a; font-weight: 700; }
+  /* Type chip in the Type column — visually separates Generate vs
+     Upload runs at a glance. Sizes match the existing .pill style. */
+  .run-type-chip {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+  }
+  .run-type-chip.run-type-regen  { background: #e0e7ff; color: #3730a3; }
+  .run-type-chip.run-type-upload { background: #fef3c7; color: #92400e; }
+  table.recent-runs td.run-type-cell { white-space: nowrap; }
   table.recent-runs td.applied-cell .none { color: var(--ink-faint); }
   table.recent-runs tr.recent-row { cursor: pointer; }
   table.recent-runs tr.recent-row:hover td { background: #f8fafc; }
@@ -1137,6 +1146,8 @@ interface RecentRunSummary {
   applied: number;
   /** "blog" / "service+category" etc, comma/+-joined when multiple. */
   page_types: string | null;
+  /** "regen" (subprocess Generate run) or "upload" (operator drop). */
+  mode: "regen" | "upload";
   csv: string | null;
   html: string | null;
   run_id: string | null;
@@ -1184,6 +1195,7 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
         total,
         applied,
         page_types: typeof j.page_type === "string" ? j.page_type : Array.isArray(j.page_type) ? j.page_type.join("+") : null,
+        mode: j.mode === "upload" ? "upload" : "regen",
         csv: csvPath,
         html: htmlPath,
         run_id: runId,
@@ -1286,13 +1298,17 @@ async function homePage(res: ServerResponse) {
       const displayName = r.client_name ?? r.client;
       const nameInner = `${fav}<span>${esc(displayName)}</span>`;
       const pageTypeInner = r.page_types ? esc(r.page_types) : "—";
-      const searchKey = [displayName, r.page_types].filter(Boolean).join(" ").toLowerCase();
+      const typeLabel = r.mode === "upload" ? "Upload" : "Generate";
+      const typeIcon = r.mode === "upload" ? "↑" : "↻";
+      const typeChip = `<span class="run-type-chip run-type-${r.mode}" title="${r.mode === "upload" ? "Operator-uploaded replacement images" : "Replicate-generated images"}">${typeIcon} ${typeLabel}</span>`;
+      const searchKey = [displayName, r.page_types, typeLabel].filter(Boolean).join(" ").toLowerCase();
       const linkOpen = r.run_id ? `<a href="/runs/${esc(r.run_id)}" class="recent-link">` : `<span class="recent-link">`;
       const linkClose = r.run_id ? `</a>` : `</span>`;
       const rowOnClick = r.run_id ? ` onclick="location='/runs/${esc(r.run_id)}'"` : "";
       return `
-<tr class="recent-row apply-${applyState}" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}" data-apply-state="${applyState}" data-page="${pageIdx}"${rowOnClick}>
+<tr class="recent-row apply-${applyState}" data-search="${esc(searchKey)}" data-status="${statusKey}" data-applied="${r.applied > 0 ? "1" : "0"}" data-apply-state="${applyState}" data-mode="${r.mode}" data-page="${pageIdx}"${rowOnClick}>
   <td class="client">${linkOpen}${nameInner}${linkClose}</td>
+  <td class="run-type-cell">${linkOpen}${typeChip}${linkClose}</td>
   <td class="pt">${linkOpen}${pageTypeInner}${linkClose}</td>
   <td class="started">${linkOpen}<span class="ts-ist">${esc(istLabel)}</span>${linkClose}</td>
   <td class="num">${linkOpen}${totalLabel}${linkClose}</td>
@@ -1374,6 +1390,11 @@ ${recent.length > 0 ? `
       <option value="1">Has applies</option>
       <option value="0">Not yet applied</option>
     </select>
+    <select id="recent-mode-filter" onchange="filterRecentRuns()" title="Run type">
+      <option value="">All types</option>
+      <option value="regen">↻ Generate</option>
+      <option value="upload">↑ Upload</option>
+    </select>
   </div>
   ${tabsBar}
   <div style="overflow-x:auto">
@@ -1381,10 +1402,11 @@ ${recent.length > 0 ? `
       <thead>
         <tr>
           <th>Client</th>
+          <th>Type</th>
           <th>Page type</th>
           <th>Started</th>
           <th class="num" title="Total images the run was scheduled to process">Total</th>
-          <th class="num" title="Images successfully regenerated">Regen</th>
+          <th class="num" title="Images successfully regenerated / awaiting upload">Regen</th>
           <th class="num" title="Images uploaded to S3 from this run (Apply count)">Applied</th>
           <th>Status</th>
         </tr>
@@ -1419,16 +1441,18 @@ ${recent.length > 0 ? `
       const needle = (document.getElementById('recent-search').value || '').toLowerCase().trim();
       const statusF = document.getElementById('recent-status-filter').value;
       const appliedF = document.getElementById('recent-applied-filter').value;
+      const modeF = (document.getElementById('recent-mode-filter') || {}).value || '';
       const rows = document.querySelectorAll('#recent-tbody tr.recent-row');
-      const filtered = !!(needle || statusF || appliedF);
+      const filtered = !!(needle || statusF || appliedF || modeF);
       let visible = 0;
       for (const tr of rows) {
         const okSearch = !needle || (tr.dataset.search || '').includes(needle);
         const okStatus = !statusF || tr.dataset.status === statusF;
         const okApplied = !appliedF || tr.dataset.applied === appliedF;
+        const okMode = !modeF || tr.dataset.mode === modeF;
         // Tab only restricts when no other filter is active.
         const okTab = filtered || Number(tr.dataset.page || 0) === __recentActiveTab;
-        const hit = okSearch && okStatus && okApplied && okTab;
+        const hit = okSearch && okStatus && okApplied && okMode && okTab;
         tr.style.display = hit ? '' : 'none';
         if (hit) visible++;
       }
@@ -4448,7 +4472,7 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
         : `<button class="btn-regen" type="button" data-regen title="Regenerate this image">↻ Regenerate</button>
            <a class="btn-regen-custom" type="button" data-regen-custom title="Re-roll with one-off instructions for this image only" role="button" tabindex="0">↻ Custom…</a>`}
       ${oldUrl
-        ? `<button class="btn-compare" type="button" data-compare ${canCompare ? "" : 'style="display:none"'} title="Old (live) vs new (this run), side-by-side">⇄ Compare</button>`
+        ? `<button class="btn-compare" type="button" data-compare ${isUpload && !hasUploadedFile ? 'style="display:none"' : ""} title="Old (live) vs new (this run), side-by-side">⇄ Compare</button>`
         : ""}
       ${r.image_url_new || r.image_local_path
         ? `<a class="btn btn-download" href="/runs/${esc(id)}/download/${encodeURIComponent(r.image_id)}" title="Download this image (no recompression)" download>⬇ Download</a>`
@@ -4519,6 +4543,9 @@ ${clusterSections}
       <div class="cmp-pane">
         <div class="cmp-pane-h cmp-pane-h-new">New</div>
         <img id="cmp-new" alt="">
+        <div id="cmp-new-ph" class="cmp-ph" style="display:none">
+          <div class="sub">New image bytes no longer available.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -5418,18 +5445,19 @@ function openCompare(imageId) {
     if (!card) { console.warn('[openCompare] no card for', imageId); return; }
     const img = card.querySelector('.rc-img img');
     const newSrc = img ? img.src : '';
-    if (!newSrc) { console.warn('[openCompare] no new img src for', imageId); return; }
     const oldSrc = card.dataset.oldUrl || '';
     const overlay = document.getElementById('cmp-overlay');
     const oldEl = document.getElementById('cmp-old');
     const oldPh = document.getElementById('cmp-old-ph');
     const newEl = document.getElementById('cmp-new');
+    const newPh = document.getElementById('cmp-new-ph');
     const titleEl = document.getElementById('cmp-title');
     const metaEl = document.getElementById('cmp-meta');
     if (!overlay || !oldEl || !newEl) {
       console.error('[openCompare] modal DOM missing — overlay=', !!overlay, 'old=', !!oldEl, 'new=', !!newEl);
       return;
     }
+    // Old pane: prefer the saved live CDN url; placeholder otherwise.
     if (oldSrc) {
       oldEl.src = oldSrc;
       oldEl.style.display = '';
@@ -5437,9 +5465,38 @@ function openCompare(imageId) {
     } else {
       oldEl.removeAttribute('src');
       oldEl.style.display = 'none';
-      if (oldPh) oldPh.style.display = 'flex';
+      if (oldPh) {
+        oldPh.style.display = 'flex';
+        const sub = oldPh.querySelector('.sub');
+        if (sub) sub.textContent = 'No live image recorded for this slot.';
+      }
     }
-    newEl.src = newSrc;
+    // New pane: render whatever src we have (Compare always opens —
+    // even when the new file is gone the old one is independently
+    // valuable, so we never bail just because newSrc is empty).
+    if (newSrc) {
+      newEl.src = newSrc;
+      newEl.style.display = '';
+      if (newPh) newPh.style.display = 'none';
+    } else {
+      newEl.removeAttribute('src');
+      newEl.style.display = 'none';
+      if (newPh) newPh.style.display = 'flex';
+    }
+    // If the new pane fetches a broken /preview (file pruned, Replicate
+    // expired), swap to the placeholder dynamically so the operator
+    // sees a clear message instead of a broken-image icon.
+    if (newSrc) {
+      newEl.onerror = () => {
+        newEl.onerror = null;
+        newEl.style.display = 'none';
+        if (newPh) {
+          newPh.style.display = 'flex';
+          const sub = newPh.querySelector('.sub');
+          if (sub) sub.textContent = 'New image bytes no longer available (retention sweep ran or Replicate URL expired). Re-Regenerate to mint a fresh copy.';
+        }
+      };
+    }
     if (titleEl) titleEl.textContent = 'Compare — ' + imageId;
     const asset = card.querySelector('.pill') ? card.querySelector('.pill').textContent : '';
     if (metaEl) metaEl.textContent = asset;
