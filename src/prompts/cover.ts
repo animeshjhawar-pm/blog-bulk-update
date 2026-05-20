@@ -388,10 +388,21 @@ Title weight: ALWAYS bold (weight 700 or heavier).
 Subtitle weight: ALWAYS regular (weight 400). Never above 500.
 Pill label weight: regular or medium weight (400 to 500) in uppercase.
 
-Font family: use style_guide.typography display font when present. If the
-style_guide font feels mismatched to the cover tone, fall back to "bold
-geometric sans-serif", "modern bold sans-serif", or "clean bold display
-sans-serif" descriptors.
+Font family — DETERMINISTIC, NO DISCRETION:
+Resolve the brand font from style_guide.typography.fonts — take the entry
+whose "role" is "heading" and use its "family" value EXACTLY as the font
+to name in every quoted typography parameter. This is the brand's font;
+it is non-negotiable. Do NOT judge whether it "fits the cover tone", do
+NOT substitute a different font, do NOT pick a descriptor — name the
+exact family string every time, on every cover, so successive covers
+for the same brand are visually consistent.
+Only if the heading font's "family" is literally "not_found_in_source"
+(or style_guide.typography is absent entirely), use the single fixed
+descriptor "modern bold sans-serif" — never any other descriptor, never
+a choice between options.
+Whatever font is resolved here MUST also be the font implied by
+style_guide.generation_suffixes.cover_image — they describe the same
+brand, so the title clause and the appended style suffix never disagree.
 
 FONT FAMILY CONSISTENCY — title, subtitle, AND pill label MUST all be
 rendered in the SAME font family. Only the weight changes between them.
@@ -615,6 +626,11 @@ lifestyle-glossy register.
    (e.g. \`headline text reading "Bio-based emulsifiers" in Halyard
    Display\`).
 
+   [font name] in the templates below = the EXACT heading-role family
+   resolved per <typography_weight_rule>. Same string in the title, the
+   subtitle, and the pill — never improvise a different font per element
+   or per cover.
+
    TITLE:
    \`headline text reading "[DERIVED_TITLE]" in [font name], bold weight
    700 or heavier, large display size with strong typographic presence
@@ -756,6 +772,11 @@ CRITICAL VERBATIM RULES:
 
 CRITICAL TYPOGRAPHY AND LAYOUT RULES:
 - Title bold 700+, subtitle regular 400, same font family.
+- Font family is the EXACT heading-role family from
+  style_guide.typography.fonts — named verbatim, identically on every
+  cover. No per-cover judgement, no descriptor substitution. Only
+  "not_found_in_source" triggers the single fixed fallback
+  "modern bold sans-serif".
 - Pill is small editorial tag, never button-like.
 - Title at 55-60% column height with tight two-pill-height gap above.
 
