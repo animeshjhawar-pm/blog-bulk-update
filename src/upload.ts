@@ -263,9 +263,22 @@ async function uploadOne(args: {
     await putToS3(ps.url, bytes);
     await notify(base, projectId, opts.token, ps.upload_image_key, ps.refined_image_key);
 
+    // media_registry confirmation window. Gushwork's media-API
+    // asynchronously generates the 360/720/1080 variants and inserts
+    // the registry row AFTER notify() returns; under load that
+    // indexing can exceed the old 90s ceiling, producing spurious
+    // "uploaded_unconfirmed" results — the bytes are on S3, the row
+    // just hasn't landed yet, and repoint then skips the cluster.
+    // Default raised to 240s and made env-tunable
+    // (MEDIA_REGISTRY_TIMEOUT_MS) so a slow gushwork day can be
+    // ridden out without a code change. The poll returns the instant
+    // the row appears, so a higher ceiling never slows the happy path.
+    const envTimeout = Number.parseInt(process.env.MEDIA_REGISTRY_TIMEOUT_MS ?? "", 10);
+    const readyTimeout = opts.readyTimeoutMs
+      ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 240_000);
     const mr = await waitForMediaRow(
       ps.image_id,
-      opts.readyTimeoutMs ?? 90_000,
+      readyTimeout,
       opts.readyIntervalMs ?? 3_000,
     );
     const urls = (mr?.urls ?? {}) as Record<string, string>;
