@@ -113,30 +113,60 @@ const WIREFRAME_URLS: Partial<Record<AssetType, string>> = {
   thumbnail: "https://raw.githubusercontent.com/animeshjhawar-pm/imagegen-playground/main/public/thumbnail.png",
 };
 
-function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
+/**
+ * Resolve the brand logo URL for a project. Exported so the web UI's
+ * workspace logo-preview and the regen pipeline share ONE resolution
+ * path — they used to each hardcode the canonical-path guess
+ * independently, which meant the preview and the image-gen reference
+ * could disagree.
+ */
+export function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
   // Operator-edited override always wins.
   if (override && override.startsWith("http")) return override;
 
-  // Canonical brand logo (the asset image-gen prompts should use as
-  // image_input) is at the well-known per-staging path
-  //   https://file-host.link/website/<staging>/assets/logo/logo.webp
-  // We prefer this over the timestamped favicon-style entries in
-  // projects.logo_urls because the latter are usually 16×16 favicon
-  // PNGs that produce poor results when fed to Replicate as a
-  // reference image.
+  // The DB's projects.logo_urls is the AUTHORITATIVE source — it holds
+  // the exact URLs the live site renders. Resolution order:
+  //
+  //   1. header_logo  — the logo the live page header actually shows.
+  //                     This is what we want as the image-gen reference.
+  //   2. primary_logo / logo / primaryLogo — alternate naming clients use.
+  //   3. footer_logo  — same brand mark, just placed in the footer.
+  //   4. canonical path website/<staging>/assets/logo/logo.webp — a GUESS.
+  //      Older code used this FIRST, which was wrong: for clients whose
+  //      real logo lives under assets/uploaded-assets/<ts>_<hash>.webp
+  //      (e.g. Sarkinen Calibrating) the canonical path resolves to a
+  //      different, wrong file (Sarkinen's is a 363 KB asset, not the
+  //      11 KB brand logo). The DB value must win over the path guess.
+  //   5. any other logo_urls entry EXCEPT favicon / gbp_url — favicons
+  //      are tiny 16×16 PNGs that feed Replicate a poor reference;
+  //      gbp_url is a Google-Business-Profile link, not a brand mark.
+  //
+  // The canonical path stays in the chain only as a fallback for
+  // clients whose logo_urls is empty or carries nothing usable.
+  const lu = (project.logo_urls && typeof project.logo_urls === "object")
+    ? (project.logo_urls as Record<string, unknown>)
+    : null;
+  const pick = (k: string): string | null => {
+    const v = lu?.[k];
+    return typeof v === "string" && v.startsWith("http") ? v : null;
+  };
+
+  const named = pick("header_logo")
+    ?? pick("primary_logo") ?? pick("logo") ?? pick("primaryLogo")
+    ?? pick("footer_logo");
+  if (named) return named;
+
   if (project.staging_subdomain) {
     return `https://file-host.link/website/${project.staging_subdomain}/assets/logo/logo.webp`;
   }
 
-  // Last-resort fallback: anything in projects.logo_urls.
-  const lu = project.logo_urls as Record<string, unknown> | null;
-  if (!lu || typeof lu !== "object") return null;
-  for (const k of ["primary_logo", "logo", "primaryLogo"]) {
-    const v = lu[k];
-    if (typeof v === "string" && v.startsWith("http")) return v;
-  }
-  for (const v of Object.values(lu)) {
-    if (typeof v === "string" && v.startsWith("http")) return v;
+  // Nothing named, no staging subdomain — take any logo_urls value
+  // that isn't a favicon or a GBP link.
+  if (lu) {
+    for (const [k, v] of Object.entries(lu)) {
+      if (k === "favicon" || k === "gbp_url") continue;
+      if (typeof v === "string" && v.startsWith("http")) return v;
+    }
   }
   return null;
 }

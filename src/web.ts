@@ -22,6 +22,7 @@ import {
   type PageType,
 } from "./db.js";
 import { collectImageRecords, prefetchBlogMarkdowns, type ImageRecord } from "./pageInfo.js";
+import { pickLogoUrl } from "./regen.js";
 import { loadEnv } from "./env.js";
 import {
   loadBrandGuidelines,
@@ -2045,12 +2046,11 @@ async function workspacePage(
        logoUrls.primaryLogo ??
        Object.values(logoUrls).find((v) => typeof v === "string" && (v as string).startsWith("http")))
     : null) as string | null | undefined;
-  // The canonical brand logo (image-gen `image_input`). This is the
-  // well-known asset/logo/logo.webp path per staging_subdomain — a real
-  // logo file rather than a 16×16 favicon. Operators can override.
-  const primaryLogo = project.staging_subdomain
-    ? `https://file-host.link/website/${project.staging_subdomain}/assets/logo/logo.webp`
-    : null;
+  // The brand logo image-gen uses as image_input. Resolved via the
+  // SAME pickLogoUrl the regen pipeline uses, so the workspace preview
+  // and the actual generation reference can never disagree. Prefers
+  // the DB's logo_urls.header_logo over the canonical-path guess.
+  const primaryLogo = pickLogoUrl(project, null);
 
   const awsBanner = hasAwsCreds
     ? ""
@@ -3854,23 +3854,14 @@ async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: 
   const target = await saveProjectOverrides(slug, { logo_url: logo_url || undefined });
 
   // Compute the effective logo so the client can hot-swap the preview.
+  // Same pickLogoUrl resolver as regen + workspace render — one source
+  // of truth. logo_url (operator override) wins; else the DB resolves.
   let effective: string | null = logo_url || null;
   if (!effective) {
     const entry = resolveClient(slug);
     if (entry) {
       const project = await lookupProjectById(entry.projectId);
-      const lu = project?.logo_urls as Record<string, unknown> | null;
-      if (lu && typeof lu === "object") {
-        for (const k of ["primary_logo", "logo", "primaryLogo"]) {
-          const v = lu[k];
-          if (typeof v === "string" && v.startsWith("http")) { effective = v; break; }
-        }
-        if (!effective) {
-          for (const v of Object.values(lu)) {
-            if (typeof v === "string" && v.startsWith("http")) { effective = v; break; }
-          }
-        }
-      }
+      if (project) effective = pickLogoUrl(project, null);
     }
   }
   sendJson(res, 200, { ok: true, path: target, logo_url, effective_logo: effective });
