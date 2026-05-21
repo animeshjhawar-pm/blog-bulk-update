@@ -1479,7 +1479,14 @@ ${recent.length > 0 ? `
         if (hit) visible++;
       }
       const total = rows.length;
-      document.getElementById('recent-count').textContent = filtered ? (visible + ' / ' + total) : total;
+      // Count chip ALWAYS reflects what's actually on screen. Before,
+      // an unfiltered view showed the grand total (e.g. 200) while
+      // only the active tab's 50 rows were visible — the number
+      // didn't match the table. Now: "<visible> of <total>" whenever
+      // they differ (filtered, or paged into a tab), bare total when
+      // every row is shown.
+      document.getElementById('recent-count').textContent =
+        visible === total ? String(total) : (visible + ' of ' + total);
       document.getElementById('recent-empty').style.display = (filtered && visible === 0) ? 'block' : 'none';
     }
     // Initial paint: show only the first tab's rows.
