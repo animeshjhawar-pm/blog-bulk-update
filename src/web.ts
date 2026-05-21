@@ -3538,7 +3538,16 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     dryRun: false,
     mock: false,
     useSavedToken: true,
-    pageType: extractPageTypeFromArgs(parent.args),
+    // Pass ALL page types. extractPageTypeFromArgs returned undefined
+    // for blog-only runs (the --page-type arg is omitted for blog) and
+    // for multi-type runs (the comma-joined value matched no single
+    // type), so a service/category card in a multi-type run would
+    // re-resolve against the blog cluster list, find nothing, and the
+    // subprocess would exit 0 with no CSV ("nothing to do"). The
+    // cluster_id + image_id filters in collectImageRecords already
+    // narrow precisely — handing it all three page types just means
+    // the cluster is always in the candidate set whatever its type.
+    pageType: "blog,service,category",
     provider: extractProviderFromArgs(parent.args),
     promptOverrideFile,
     extraInstructionsFile,
@@ -3552,8 +3561,24 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     child.proc?.once("close", onClose);
   });
 
-  if (child.exitCode !== 0 || !child.csvPath) {
-    return sendJson(res, 500, { error: `regen subprocess failed (exit ${child.exitCode})`, run_id: child.id });
+  if (child.exitCode !== 0) {
+    // Genuine non-zero exit — the subprocess crashed.
+    return sendJson(res, 500, { error: `regen subprocess crashed (exit ${child.exitCode}). Check the run log.`, run_id: child.id });
+  }
+  if (!child.csvPath) {
+    // exit 0 but no CSV = the CLI hit its "nothing to do — exiting"
+    // path: collectImageRecords resolved ZERO records for this
+    // cluster_id + image_id. The subprocess didn't fail — it just
+    // found nothing to regenerate. Almost always because the
+    // image_id no longer resolves in the cluster's CURRENT page_info:
+    // either it was already applied (apply replaces the id), or
+    // Stormbreaker re-rendered the page and the MDX <Image> ids
+    // changed. Surface that instead of the nonsensical "failed
+    // (exit 0)".
+    return sendJson(res, 409, {
+      error: `Couldn't regenerate ${imageId}: it no longer matches any image in the cluster's current page_info. This usually means the image was already applied (Apply replaces the id) or the page was re-rendered upstream since this run was created. Re-import the cluster and start a fresh run.`,
+      run_id: child.id,
+    });
   }
   const childRows = await readRunCsvOrEmpty(child.csvPath);
   const childRow = childRows.find((r) => r.image_id === imageId);
@@ -3660,12 +3685,6 @@ async function updateParentCsvRow(
   await fs.rename(tmp, csvPath);
 }
 
-function extractPageTypeFromArgs(args: string[]): PageType | undefined {
-  const i = args.indexOf("--page-type");
-  if (i < 0) return undefined;
-  const v = args[i + 1];
-  return v === "service" || v === "category" || v === "blog" ? v : undefined;
-}
 function extractProviderFromArgs(args: string[]): string | undefined {
   const i = args.indexOf("--provider");
   return i >= 0 ? args[i + 1] : undefined;
