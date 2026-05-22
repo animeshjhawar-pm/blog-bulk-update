@@ -29,8 +29,17 @@ import { runOutDir } from "./runOutDir.js";
  */
 
 export interface RetentionConfig {
+  /** RECORD cap — manifest + csv + html. A run "exists" as long as its
+   *  record does (it stays in the runs list, the CSV is inspectable,
+   *  the run page renders). These artefacts are tiny (~100 KB/run). */
   retentionHours: number;
   maxRunsKept: number;
+  /** IMAGE cap — the runs/<id>/images/ directory, the heavy payload.
+   *  Pruned on a tighter window than the record. A run whose images
+   *  are pruned still shows in the list and renders; only the per-image
+   *  previews / downloads are gone (the /preview endpoint 410s). */
+  imageRetentionHours: number;
+  imageMaxRunsKept: number;
   /** How long a Replicate output URL is treated as potentially live.
    * Defaults to 1h — past this point, openImageStream skips the
    * remote fallback to avoid burning a TCP timeout on every miss. */
@@ -40,17 +49,22 @@ export interface RetentionConfig {
 export function loadRetentionConfig(): RetentionConfig {
   const hours = Number.parseInt(process.env.DOWNLOAD_RETENTION_HOURS ?? "", 10);
   const max = Number.parseInt(process.env.MAX_RUNS_KEPT ?? "", 10);
+  const imgHours = Number.parseInt(process.env.IMAGE_RETENTION_HOURS ?? "", 10);
+  const imgMax = Number.parseInt(process.env.IMAGE_MAX_RUNS_KEPT ?? "", 10);
   const repl = Number.parseFloat(process.env.REPLICATE_URL_TTL_HOURS ?? "");
   return {
-    // Default bumped from 7d -> 30d so the recent-runs UI (which
-    // surfaces up to 200 runs across 4 tabs) doesn't silently lose
-    // historical runs. Files live on the Railway volume mounted at
-    // RUN_OUT_DIR, so disk pressure is the only reason to evict.
-    retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 720, // 30 days
-    // Bumped from 50 -> 250 so the UI's 200-row window never gets
-    // pruned out from under the operator. The cap protects the
-    // volume from runaway growth on long-running deployments.
-    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 250,
+    // RECORD retention — very long. The manifest + csv are tiny, so a
+    // run can "stay" (visible, inspectable) for a year / 5000 runs
+    // without meaningful disk cost. This is what makes runs survive
+    // deploys AND survive the sweep — the operator asked for runs to
+    // persist, and the record is what persists.
+    retentionHours: Number.isFinite(hours) && hours > 0 ? hours : 8760, // 1 year
+    maxRunsKept: Number.isFinite(max) && max > 0 ? max : 5000,
+    // IMAGE retention — tighter. The runs/<id>/images/ dirs are the
+    // disk hog; pruning them keeps the volume bounded. Defaults: keep
+    // the last 150 runs' images, or 14 days, whichever trips first.
+    imageRetentionHours: Number.isFinite(imgHours) && imgHours > 0 ? imgHours : 336, // 14 days
+    imageMaxRunsKept: Number.isFinite(imgMax) && imgMax > 0 ? imgMax : 150,
     replicateUrlTtlHours: Number.isFinite(repl) && repl > 0 ? repl : 1,
   };
 }
@@ -100,7 +114,10 @@ async function rmrfIfExists(p: string): Promise<void> {
 
 export interface SweepResult {
   scanned: number;
+  /** Runs fully evicted — record + images gone (past the long window). */
   evicted: number;
+  /** Runs that kept their record but had the heavy images dir pruned. */
+  imagesOnlyPruned: number;
   bytesFreed: number;
   reasonByRun: Record<string, "age" | "count">;
   /** Per-run-id image dirs that had no surviving manifest (orphans). */
@@ -136,6 +153,7 @@ export async function sweepRunRetention(
   const result: SweepResult = {
     scanned: 0,
     evicted: 0,
+    imagesOnlyPruned: 0,
     bytesFreed: 0,
     reasonByRun: {},
     orphanRunsDeleted: 0,
@@ -160,20 +178,47 @@ export async function sweepRunRetention(
   entries.sort((a, b) => b.startedAtMs - a.startedAtMs);
 
   const now = Date.now();
-  const ageCutoffMs = now - cfg.retentionHours * 3600 * 1000;
-  const toEvict: Array<{ entry: ManifestEntry; reason: "age" | "count" }> = [];
+  const recordCutoffMs = now - cfg.retentionHours * 3600 * 1000;
+  const imageCutoffMs = now - cfg.imageRetentionHours * 3600 * 1000;
+
+  // Two-tier classification per run (entries are newest-first):
+  //   recordExpired — beyond the long record window → evict EVERYTHING
+  //                   (manifest + csv + html + images). The run is gone.
+  //   imageExpired  — within the record window but beyond the tighter
+  //                   image window → prune ONLY the images dir. The run
+  //                   stays in the list, the CSV stays inspectable; just
+  //                   the per-image previews/downloads go.
+  const fullEvict: ManifestEntry[] = [];
+  const imageOnly: ManifestEntry[] = [];
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i]!;
-    if (i >= cfg.maxRunsKept) {
-      toEvict.push({ entry: e, reason: "count" });
+    const recordExpired =
+      i >= cfg.maxRunsKept ||
+      (e.startedAtMs > 0 && e.startedAtMs < recordCutoffMs);
+    if (recordExpired) {
+      fullEvict.push(e);
       continue;
     }
-    if (e.startedAtMs > 0 && e.startedAtMs < ageCutoffMs) {
-      toEvict.push({ entry: e, reason: "age" });
-    }
+    const imageExpired =
+      i >= cfg.imageMaxRunsKept ||
+      (e.startedAtMs > 0 && e.startedAtMs < imageCutoffMs);
+    if (imageExpired) imageOnly.push(e);
   }
 
-  for (const { entry, reason } of toEvict) {
+  // Tier 2 — image-only prune. Keep the run record; drop the heavy dir.
+  for (const entry of imageOnly) {
+    const runImagesDir = entry.runId ? path.join(outDir, "runs", entry.runId) : null;
+    if (!runImagesDir) continue;
+    const sz = await dirSize(runImagesDir);
+    if (sz === 0) continue; // already pruned on a prior sweep
+    await rmrfIfExists(runImagesDir);
+    result.bytesFreed += sz;
+    result.imagesOnlyPruned++;
+  }
+
+  // Tier 1 — full eviction. The run is past the record window entirely.
+  for (const entry of fullEvict) {
+    const reason: "age" | "count" = "count"; // (kept for reasonByRun shape)
     const runImagesDir = entry.runId ? path.join(outDir, "runs", entry.runId) : null;
     let freed = 0;
     if (runImagesDir) freed += await dirSize(runImagesDir);
@@ -200,10 +245,13 @@ export async function sweepRunRetention(
   // out/runs/<runId>/ folders whose manifest has been deleted (or
   // was never written — e.g. the CLI crashed mid-startup) are
   // unreferenced and can be reclaimed. Cross-check against the
-  // *remaining* manifests after step 1.
+  // manifests that still have a record after the full-evict pass.
+  // imageOnly runs keep their record, so they are NOT orphans even
+  // though their image dir was just pruned.
+  const fullyEvicted = new Set(fullEvict.map((e) => e.manifestPath));
   const remainingRunIds = new Set<string>();
   for (const e of entries) {
-    if (e.runId && !toEvict.find((x) => x.entry.manifestPath === e.manifestPath)) {
+    if (e.runId && !fullyEvicted.has(e.manifestPath)) {
       remainingRunIds.add(e.runId);
     }
   }
@@ -229,7 +277,7 @@ export async function sweepRunRetention(
   // CSV is tiny; we never load image bytes.
   try {
     const refSet = await buildLegacyRefSet(outDir, entries.filter((e) =>
-      !toEvict.find((x) => x.entry.manifestPath === e.manifestPath)));
+      !fullyEvicted.has(e.manifestPath)));
     const legacyRoot = path.join(outDir, "images");
     const slugDirs = await fs.readdir(legacyRoot, { withFileTypes: true });
     for (const sd of slugDirs) {

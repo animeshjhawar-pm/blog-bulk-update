@@ -7083,14 +7083,17 @@ export function startWebServer(port: number): void {
     // requests.
     const cfg = loadRetentionConfig();
     process.stdout.write(
-      `web: retention = keep last ${cfg.maxRunsKept} runs OR last ${cfg.retentionHours}h\n`,
+      `web: retention = records kept ${cfg.maxRunsKept} runs / ${cfg.retentionHours}h · `
+      + `images kept ${cfg.imageMaxRunsKept} runs / ${cfg.imageRetentionHours}h\n`,
     );
     const runSweep = () => {
       sweepRunRetention(cfg)
         .then((r) => {
-          if (r.evicted > 0) {
+          if (r.evicted > 0 || r.imagesOnlyPruned > 0) {
             process.stdout.write(
-              `retention: evicted ${r.evicted}/${r.scanned} runs · freed ${(r.bytesFreed / 1024 / 1024).toFixed(1)} MB\n`,
+              `retention: ${r.evicted}/${r.scanned} runs fully evicted, `
+              + `${r.imagesOnlyPruned} had images-only pruned (record kept) · `
+              + `freed ${(r.bytesFreed / 1024 / 1024).toFixed(1)} MB\n`,
             );
           }
         })
