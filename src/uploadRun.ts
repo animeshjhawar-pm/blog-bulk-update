@@ -193,25 +193,28 @@ export async function validateAndCanonicalise(
     if (Number.isFinite(target)) {
       const delta = Math.abs(actual - target) / target;
       // Tiered handling:
-      //   0%-5%   silent accept (e.g. 1920x1080 → 16:9)
-      //   5%-15%  warn (yellow banner in card) but accept; minor
-      //           differences are tolerable (some downstream
-      //           renderers will fit/cover them).
-      //   >15%   REJECT. A 1:1 image into a 16:9 slot is a 44%
-      //          delta — that's a wrong image, not a marginal
-      //          mismatch, and it will publish to production
-      //          looking wrong. Block at intake so the operator
-      //          re-exports at the correct dimensions instead
-      //          of finding out from the live page.
-      if (delta > 0.15) {
+      //   0%-8%    silent accept (e.g. 1920x1080 → 16:9).
+      //   8%-40%   warn (yellow banner) but ACCEPT. This band covers
+      //            every reasonable landscape-to-landscape crop the
+      //            operator might supply — 16:9 into a 3:2 thumbnail
+      //            slot is 18.5%, 4:3 into 16:9 is 25%, 1:1 into 3:2
+      //            is 33%. The downstream renderer fits/covers these;
+      //            blocking them just stops legitimate uploads (the
+      //            old 15% ceiling rejected the very common 16:9→3:2
+      //            thumbnail case and made uploads "not work").
+      //   >40%     REJECT. Only genuinely-wrong shapes land here —
+      //            a square or portrait image dropped into a wide
+      //            slot (1:1→16:9 is 44%, 9:16 portrait is far worse).
+      //            Those aren't a crop, they're the wrong asset.
+      if (delta > 0.40) {
         return {
           ok: false,
           status: 422,
-          error: `aspect mismatch too large — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Crop or re-export to match the target aspect ratio before re-dropping. Letting this through would push a wrongly-shaped image to the live page.`,
+          error: `aspect mismatch too large — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). That's not a crop, it's the wrong shape (a square or portrait image into a wide slot). Re-export landscape to match before re-dropping.`,
         };
       }
-      if (delta > 0.05) {
-        aspectWarning = `aspect mismatch — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Within tolerance, but the live page may show fit/cover artefacts.`;
+      if (delta > 0.08) {
+        aspectWarning = `aspect mismatch — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Accepted; the live page will fit/cover the difference.`;
       }
     }
   }
