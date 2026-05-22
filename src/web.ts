@@ -3500,7 +3500,6 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   // prior attempt (lets us recover a prediction that completed after
   // our 280s polling budget expired).
   let promptOverrideFile: string | undefined;
-  let resumePredictionId: string | undefined;
   if (parent.csvPath) {
     const rows = await readRunCsvOrEmpty(parent.csvPath);
     const row = rows.find((r) => r.image_id === imageId);
@@ -3513,8 +3512,14 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
         await fs.mkdir(tmpDir, { recursive: true });
         await fs.writeFile(promptOverrideFile, row.prompt_used, "utf8");
       }
-      const pid = row.prediction_id?.trim();
-      if (pid) resumePredictionId = pid;
+      // NOTE: we deliberately do NOT carry the parent row's
+      // prediction_id forward as a resume id. Resuming makes
+      // Replicate re-poll the OLD prediction and hand back the
+      // IDENTICAL image — which is exactly the "Regenerate just
+      // returns the same picture" bug. Regenerate must always do a
+      // fresh Nano Banana generation. The --resume-prediction-id
+      // CLI flag still exists for genuine timeout-recovery, but the
+      // Regenerate button never triggers it.
     }
   }
   if (!clusterId) return sendJson(res, 400, { error: "cluster_id required (and not found in parent CSV)" });
@@ -3532,11 +3537,6 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     await fs.mkdir(tmpDir, { recursive: true });
     await fs.writeFile(extraInstructionsFile, customInstructions, "utf8");
   }
-
-  // Resumption only makes sense when the regen is meant to be the
-  // SAME image — custom instructions are a deliberate ask for a new
-  // image, so we suppress the resume path in that case.
-  const effectiveResumeId = customInstructions.length === 0 ? resumePredictionId : undefined;
 
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
   // We reuse the parent's client/page_type so the subprocess loads the
@@ -3561,7 +3561,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     provider: extractProviderFromArgs(parent.args),
     promptOverrideFile,
     extraInstructionsFile,
-    resumePredictionId: effectiveResumeId,
+    // No resume — every Regenerate is a fresh Nano Banana generation.
   });
 
   // Wait for the subprocess to finish, then read its CSV for the new URL.
@@ -3592,8 +3592,24 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   }
   const childRows = await readRunCsvOrEmpty(child.csvPath);
   const childRow = childRows.find((r) => r.image_id === imageId);
-  if (!childRow || !childRow.image_url_new) {
-    return sendJson(res, 500, { error: `no new image URL produced for ${imageId}`, run_id: child.id });
+  if (!childRow) {
+    return sendJson(res, 500, { error: `regen produced no CSV row for ${imageId}`, run_id: child.id });
+  }
+  if (!childRow.image_url_new) {
+    // The subprocess ran fine (exit 0) but THIS row's image
+    // generation failed — regen.ts writes status=failed + the real
+    // error into the CSV's `error` column and keeps going (the
+    // never-abort-mid-flight contract). The old handler threw that
+    // error away and returned a generic "no new image URL produced",
+    // leaving the operator with nothing actionable. Surface the
+    // actual cause. Replicate empty-output / timeout is transient
+    // (regen already retries empty output 3×) — a second Regenerate
+    // click usually succeeds, so say so.
+    const why = (childRow.error || "").trim() || "the image model returned no output";
+    return sendJson(res, 502, {
+      error: `Regeneration failed for ${imageId}: ${why} — this is usually a transient image-model error (empty output or a slow Replicate prediction). Click Regenerate again to retry.`,
+      run_id: child.id,
+    });
   }
 
   // CRITICAL: write the regenerated columns back into the PARENT
