@@ -4,7 +4,7 @@ import { runOutDir } from "./runOutDir.js";
 import { parse as csvParse } from "csv-parse/sync";
 import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
-import { closePool, getClusterForApply } from "./db.js";
+import { closePool, getClusterForApply, updateClusterPageInfo } from "./db.js";
 import { makeLimiter } from "./concurrency.js";
 
 /**
@@ -198,15 +198,31 @@ async function repointCluster(args: {
   }
 
   // Gate 2: every `old` must be present in the current page_info.
-  // If it isn't, the old image_id was ALREADY swapped out — an
-  // earlier apply succeeded for it, or the page was re-rendered
-  // upstream. That is NOT a failure: the live page is already
-  // updated. Classify as "superseded" so the UI shows it neutrally
-  // ("already applied") rather than as a scary red FAILED card.
+  // If an `old` is absent there are TWO distinct cases — and they
+  // must NOT be conflated (doing so paints a genuine failure as a
+  // green "already applied" card, masking that nothing happened):
+  //
+  //  (a) The matching `new` id IS present. A previous apply of THIS
+  //      mapping already swapped old→new. Genuinely idempotent —
+  //      "superseded": nothing to do, the live page is updated.
+  //
+  //  (b) Neither old nor new is present. The recorded image_id no
+  //      longer matches the live page_info at all — the page was
+  //      re-rendered upstream, or the run is stale. This is a REAL
+  //      FAILURE: the operator's replacement will NOT go live and
+  //      they must be told so, loudly.
   for (const p of pairs) {
     if (!original.includes(p.old)) {
-      out.status = "superseded";
-      out.reason = `image_id ${p.old.slice(0, 60)} is no longer in the live page_info — it was already applied (or the page was re-rendered upstream). Nothing to do; the live page is already updated.`;
+      if (p.old !== p.neu && original.includes(p.neu)) {
+        out.status = "superseded";
+        out.reason = `image_id ${p.old.slice(0, 60)} was already replaced by ${p.neu.slice(0, 60)} in the live page_info — already applied. Nothing to do.`;
+      } else {
+        out.status = "failed";
+        out.reason = `image_id ${p.old.slice(0, 60)} is NOT in the live page_info, and neither is the intended replacement — the recorded mapping is stale (the page was re-rendered upstream, or this run's image_id no longer matches live page_info). Nothing was written; re-import the cluster and create a fresh run.`;
+      }
+      process.stderr.write(
+        `[${out.status}] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`,
+      );
       return out;
     }
   }
@@ -258,7 +274,35 @@ async function repointCluster(args: {
     return out;
   }
 
-  // --apply: one atomic PUT of the full new page_info.
+  // --apply: persist the new page_info, then PROVE it took.
+  //
+  // History: the only writer used to be the seo-v2 `/file` PUT. It
+  // was observed to return HTTP 200 while NOT persisting for some
+  // service pages — the handler trusted the status code, marked the
+  // cluster "applied", and the operator's replacement silently never
+  // went live. So the contract is now: write, then re-read the live
+  // page_info from the DB and verify the swap is actually there. A
+  // cluster is "applied" ONLY if that read-back proves it.
+  //
+  // Writers, in order:
+  //   1. `/file` PUT — kept for whatever cache / re-render side
+  //      effect it carries; its HTTP status is logged but no longer
+  //      trusted as proof.
+  //   2. Direct `clusters.page_info` UPDATE — the canonical
+  //      mechanism (mirrors stormbreaker's update_cluster_page_info).
+  //      Used as the authoritative write when the PUT didn't take.
+  const verifyApplied = async (): Promise<boolean> => {
+    const fresh = await getClusterForApply(clusterId);
+    if (!fresh || !fresh.page_info) return false;
+    const live = JSON.stringify(fresh.page_info);
+    for (const p of pairs) {
+      if (p.old !== p.neu && live.includes(p.old)) return false; // old survived
+      if (!live.includes(p.neu)) return false;                   // new missing
+    }
+    return true;
+  };
+
+  let putNote = "";
   try {
     const resp = await fetch(`${base}/${projectId}/file`, {
       method: "PUT",
@@ -273,20 +317,48 @@ async function repointCluster(args: {
         file_content: reparsed,
       }),
     });
-    if (!resp.ok) {
-      out.reason = `PUT /file HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`;
-      return out;
-    }
+    const bodyText = (await resp.text()).slice(0, 300);
+    putNote = `PUT /file HTTP ${resp.status}${bodyText ? ` ${bodyText}` : ""}`;
+  } catch (err) {
+    putNote = `PUT /file threw: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  // Verify the PUT actually persisted.
+  if (await verifyApplied()) {
     out.status = "applied";
-    out.reason = `PUT ok — ${out.replacements} occurrence(s) repointed: ${perPair}`;
+    out.reason = `applied via /file PUT — ${out.replacements} occurrence(s) repointed: ${perPair}`;
     process.stderr.write(
-      `[applied] cluster=${clusterId} client=${clientSlug} repl=${out.replacements}\n`,
+      `[applied] cluster=${clusterId} client=${clientSlug} repl=${out.replacements} (${putNote})\n`,
     );
     return out;
+  }
+
+  // PUT did not take — fall back to a direct DB write of page_info.
+  process.stderr.write(
+    `[repoint] cluster=${clusterId}: /file PUT did not persist (${putNote}) — falling back to direct clusters.page_info write\n`,
+  );
+  try {
+    await updateClusterPageInfo(clusterId, reparsed);
   } catch (err) {
-    out.reason = `PUT failed: ${err instanceof Error ? err.message : String(err)}`;
+    out.reason = `page_info not persisted. ${putNote}. Direct DB write also failed: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    process.stderr.write(`[failed] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`);
     return out;
   }
+
+  if (await verifyApplied()) {
+    out.status = "applied";
+    out.reason = `applied via direct DB write (the /file PUT did not persist: ${putNote}) — ${out.replacements} occurrence(s) repointed: ${perPair}`;
+    process.stderr.write(
+      `[applied] cluster=${clusterId} client=${clientSlug} repl=${out.replacements} (DB-fallback; ${putNote})\n`,
+    );
+    return out;
+  }
+
+  out.reason = `page_info write did not verify. ${putNote}. A direct DB write was attempted but the live page_info still does not show the new image id(s) — nothing reliable to report as applied.`;
+  process.stderr.write(`[failed] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`);
+  return out;
 }
 
 export interface RepointCoreOptions {
@@ -344,6 +416,13 @@ export async function repointMappingRows(
             previewDir,
           });
           outcomes.push(oc);
+          // Log every non-applied/non-dry-run outcome — those paths
+          // (gate 1 skip, cluster-not-found, project mismatch) were
+          // previously silent, so a skipped cluster left no trace in
+          // the Railway logs to diagnose from.
+          if (oc.status !== "applied" && oc.status !== "dry-run") {
+            process.stderr.write(`[${oc.status}] cluster=${clusterId} :: ${oc.reason}\n`);
+          }
           if (opts.failFast && (oc.status === "failed" || oc.status === "skipped")) {
             abortBox.err = new Error(`cluster ${clusterId}: ${oc.reason}`);
           }
