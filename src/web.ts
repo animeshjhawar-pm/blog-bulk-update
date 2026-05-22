@@ -3196,6 +3196,11 @@ async function runRepointPipeline(
     const oc = ocByCluster.get(m.cluster_id);
     const uploaded = m.upload_status === "uploaded";
     const repOk = oc ? oc.status === "applied" || oc.status === "dry-run" : false;
+    // "superseded" — the old image_id was already swapped out of
+    // page_info by an earlier apply. NOT a failure: the live page is
+    // already updated. Treated as its own outcome so the UI shows it
+    // neutrally instead of as a red FAILED card.
+    const superseded = oc?.status === "superseded";
     const ok = uploaded && repOk;
     const uploadStep = {
       n: 1,
@@ -3214,7 +3219,9 @@ async function runRepointPipeline(
           ? "ok"
           : oc.status === "dry-run"
             ? "skipped"
-            : "error",
+            : oc.status === "superseded"
+              ? "skipped"
+              : "error",
       detail: oc ? oc.reason : "no cluster outcome (upload failed?)",
     };
     // Reason priority: row-level upload error wins over cluster
@@ -3232,6 +3239,9 @@ async function runRepointPipeline(
         : uploadStep.detail;
     return {
       ok,
+      // superseded rows are NOT failures — flag them so the client
+      // paints them as "already applied" rather than red FAILED.
+      superseded,
       dry_run: dryRun,
       image_id_old: m.old_image_id,
       image_id_new: m.new_image_id,
@@ -3243,6 +3253,7 @@ async function runRepointPipeline(
     };
   });
   const okN = results.filter((r) => r.ok).length;
+  const supersededN = results.filter((r) => r.superseded).length;
   // Persist a sidecar so the recent-runs view can show how many
   // images have actually been pushed to S3 via this run. We count
   // every successful UPLOAD (the persistent side-effect — bytes on
@@ -3257,10 +3268,17 @@ async function runRepointPipeline(
     if (uploadedIds.length > 0) void recordAppliedImages(runId, uploadedIds);
   }
   const payload = {
-    ok: results.every((r) => r.ok),
+    // A run is "ok" if every row either applied or was superseded
+    // (already-applied is a success outcome, not a failure).
+    ok: results.every((r) => r.ok || r.superseded),
     dry_run: dryRun,
     scope: scopeLabel,
-    summary: { total: results.length, applied: okN, failed: results.length - okN },
+    summary: {
+      total: results.length,
+      applied: okN,
+      superseded: supersededN,
+      failed: results.length - okN - supersededN,
+    },
     results,
     // Single-scope (one image) clients read these top-level fields.
     ...(results.length === 1 ? results[0] : {}),
@@ -5192,10 +5210,15 @@ function showApplySummaryModal(scopeLabel, results) {
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:10001;';
   const ok = results.filter((r) => r.ok).length;
-  const failed = results.length - ok;
+  const supersededN = results.filter((r) => r.superseded).length;
+  const failed = results.length - ok - supersededN;
   const rows = results.map((r, i) => {
-    const status = r.ok ? (r.dry_run ? 'DRY OK' : 'APPLIED') : 'FAILED';
-    const colour = r.ok ? (r.dry_run ? '#b45309' : '#16a34a') : '#dc2626';
+    const status = r.superseded ? 'ALREADY APPLIED'
+      : r.ok ? (r.dry_run ? 'DRY OK' : 'APPLIED')
+        : 'FAILED';
+    const colour = r.superseded ? '#3730a3'
+      : r.ok ? (r.dry_run ? '#b45309' : '#16a34a')
+        : '#dc2626';
     return '<div class="bca-row" data-i="' + i + '" style="display:flex;justify-content:space-between;gap:10px;padding:7px 10px;border-bottom:1px solid #eee;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12px;">'
       + '<span style="color:#666;flex:0 0 28px;">' + (i + 1) + '.</span>'
       + '<span style="flex:1;word-break:break-all;">' + escapeHtml(r.image_id_old || '?') + '</span>'
@@ -5266,7 +5289,13 @@ async function applyOne(imageId, opts) {
     // to see WHERE it would have failed too. State only flips to
     // 'applied' on a successful real (non-dry) run.
     showApplyTraceModal(imageId, j);
-    if (j.ok && !j.dry_run) {
+    if (j.superseded) {
+      // The old image_id was already swapped out of page_info by an
+      // earlier apply — the live page is already updated. Not a
+      // failure; paint it 'applied' so the card reads as done.
+      stateOf.set(imageId, 'applied');
+      paintCard(imageId);
+    } else if (j.ok && !j.dry_run) {
       stateOf.set(imageId, 'applied'); paintCard(imageId);
     } else if (j.ok && j.dry_run) {
       // Dry run passed — leave card in its prior state ('pending').
@@ -5311,9 +5340,11 @@ function showApplyTraceModal(imageId, payload) {
   ).join('');
   const headBadge = payload.dry_run
     ? '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">DRY RUN</span>'
-    : payload.ok
-      ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">APPLIED</span>'
-      : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">FAILED</span>';
+    : payload.superseded
+      ? '<span style="background:#e0e7ff;color:#3730a3;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">ALREADY APPLIED</span>'
+      : payload.ok
+        ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">APPLIED</span>'
+        : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">FAILED</span>';
   body.innerHTML =
     '<div style="font-family:ui-sans-serif,system-ui,sans-serif;font-size:12px;color:#555;margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
     + headBadge
@@ -5323,9 +5354,11 @@ function showApplyTraceModal(imageId, payload) {
     + (rows || '<div style="color:#888;">No steps recorded.</div>');
   const footMsg = payload.dry_run
     ? 'Image uploaded (new media id minted); page_info NOT written. Backup + preview JSON saved under out/repoint-*.'
-    : payload.ok
-      ? 'page_info repointed to the new image id and PUT to production. Per-cluster backup saved under out/repoint-backups.'
-      : ('Failed: ' + escapeHtml(payload.reason || 'unknown'));
+    : payload.superseded
+      ? 'Already applied — this image_id was already swapped out of the live page_info by an earlier apply. The live page is up to date; nothing to do. (The upload step still ran and minted a new id, which is now unused.)'
+      : payload.ok
+        ? 'page_info repointed to the new image id and PUT to production. Per-cluster backup saved under out/repoint-backups.'
+        : ('Failed: ' + escapeHtml(payload.reason || 'unknown'));
   foot.innerHTML = '<div>' + footMsg + '</div><div style="color:#888;">' + (payload.elapsed_ms != null ? payload.elapsed_ms + 'ms' : '') + '</div>';
   overlay.style.display = 'flex';
 }
@@ -5346,7 +5379,12 @@ function applyServerResults(results, opts) {
   for (const r of results) {
     const oldId = r.image_id_old || '';
     if (!oldId) continue;
-    if (r.ok) {
+    if (r.superseded) {
+      // Already-applied (old id gone from page_info) — a success
+      // outcome, not a failure. Paint 'applied'.
+      stateOf.set(oldId, 'applied');
+      paintCard(oldId);
+    } else if (r.ok) {
       // Dry-run successes don't flip a card to 'applied' — nothing
       // was actually written to S3. Revert it to its prior state so
       // the operator can re-run for real once creds land.

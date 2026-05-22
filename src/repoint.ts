@@ -68,7 +68,11 @@ export interface ClusterOutcome {
   project_id: string;
   client_slug: string;
   images: number;
-  status: "applied" | "dry-run" | "skipped" | "failed";
+  // "superseded" — the old image_id is no longer in the live
+  // page_info, which means an earlier apply already replaced it (or
+  // the page was re-rendered upstream). NOT a failure: the slot is
+  // already updated, there is simply nothing left to do.
+  status: "applied" | "dry-run" | "skipped" | "failed" | "superseded";
   reason: string;
   replacements: number;
   backup_path: string;
@@ -193,11 +197,16 @@ async function repointCluster(args: {
     }
   }
 
-  // Gate 2: every `old` must be present in the current page_info,
-  // else the mapping is stale or the cluster changed underneath us.
+  // Gate 2: every `old` must be present in the current page_info.
+  // If it isn't, the old image_id was ALREADY swapped out — an
+  // earlier apply succeeded for it, or the page was re-rendered
+  // upstream. That is NOT a failure: the live page is already
+  // updated. Classify as "superseded" so the UI shows it neutrally
+  // ("already applied") rather than as a scary red FAILED card.
   for (const p of pairs) {
     if (!original.includes(p.old)) {
-      out.reason = `expected identifier not found in current page_info: ${p.old.slice(0, 60)} — mapping stale, not writing`;
+      out.status = "superseded";
+      out.reason = `image_id ${p.old.slice(0, 60)} is no longer in the live page_info — it was already applied (or the page was re-rendered upstream). Nothing to do; the live page is already updated.`;
       return out;
     }
   }
@@ -386,7 +395,7 @@ export async function runRepoint(opts: RepointOptions): Promise<void> {
   await closePool();
   process.stderr.write(
     `repoint: done — applied=${tally("applied")} dry-run=${tally("dry-run")} ` +
-      `skipped=${tally("skipped")} failed=${tally("failed")}\n` +
+      `superseded=${tally("superseded")} skipped=${tally("skipped")} failed=${tally("failed")}\n` +
       `repoint: report = ${outPath}\n` +
       `repoint: backups = ${backupDir}\n`,
   );
