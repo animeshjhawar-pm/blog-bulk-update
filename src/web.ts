@@ -2057,7 +2057,15 @@ async function workspacePage(
   // SAME pickLogoUrl the regen pipeline uses, so the workspace preview
   // and the actual generation reference can never disagree. Prefers
   // the DB's logo_urls.header_logo over the canonical-path guess.
-  const primaryLogo = pickLogoUrl(project, null);
+  // Passing the operator override + logo_disabled flag means the
+  // preview reflects exactly what regen will use — including "no logo"
+  // when the operator cleared the field.
+  const primaryLogo = pickLogoUrl(project, overrides.logo_url ?? null, overrides.logo_disabled === true);
+  // The pure DB-resolved logo, ignoring override + disabled flag —
+  // used as the input PLACEHOLDER so that even when the logo is
+  // disabled (field empty) the operator can still see what the
+  // default would be and retype it to re-enable.
+  const dbDefaultLogo = pickLogoUrl(project, null, false);
 
   const awsBanner = hasAwsCreds
     ? ""
@@ -2132,12 +2140,12 @@ ${awsBanner}
           : `<div id="logo-preview" class="logo-preview no-logo">no logo</div>`}
       </div>
       <form id="logo-form" onsubmit="saveLogo(event)" style="flex:1">
-        <label style="font-size:12px;color:var(--ink-muted)">Logo URL (overrides the project's primary_logo) — image-gen reads this exact URL.</label>
+        <label style="font-size:12px;color:var(--ink-muted)">Logo URL — image-gen reads this exact URL. Clear the field and Save to generate with <strong>no logo</strong>.</label>
         <div style="display:flex;gap:8px;margin-top:4px">
-          <input type="text" id="logo-url-input" placeholder="https://…/logo.png" value="${esc(overrides.logo_url ?? "")}" style="flex:1">
+          <input type="text" id="logo-url-input" placeholder="${esc(dbDefaultLogo || "https://…/logo.png")}" value="${esc(effectiveLogo)}" style="flex:1">
           <button class="primary" type="submit">Save</button>
         </div>
-        <span id="logo-status" class="sub" style="margin-top:4px;display:inline-block"></span>
+        <span id="logo-status" class="sub" style="margin-top:4px;display:inline-block">${overrides.logo_disabled ? "logo disabled — generating with no logo" : ""}</span>
       </form>
     </div>
 
@@ -2659,8 +2667,10 @@ async function saveLogo(e) {
     } else {
       wrap.innerHTML = '<div id="logo-preview" class="logo-preview no-logo">no logo</div>';
     }
-    status.textContent = url ? 'saved ✓ override active' : 'saved ✓ (using project default)';
-    setTimeout(() => { status.textContent = ''; }, 2200);
+    status.textContent = url
+      ? 'saved ✓ override active'
+      : 'saved ✓ — logo disabled, images will generate with no logo';
+    setTimeout(() => { status.textContent = ''; }, 3200);
   } catch (err) {
     status.textContent = 'error: ' + err.message;
   }
@@ -3877,20 +3887,32 @@ async function saveLogoHandler(req: IncomingMessage, res: ServerResponse, slug: 
   if (logo_url && !/^https?:\/\//.test(logo_url)) {
     return sendJson(res, 400, { error: "logo_url must start with http(s)://" });
   }
-  const target = await saveProjectOverrides(slug, { logo_url: logo_url || undefined });
 
-  // Compute the effective logo so the client can hot-swap the preview.
-  // Same pickLogoUrl resolver as regen + workspace render — one source
-  // of truth. logo_url (operator override) wins; else the DB resolves.
-  let effective: string | null = logo_url || null;
-  if (!effective) {
-    const entry = resolveClient(slug);
-    if (entry) {
-      const project = await lookupProjectById(entry.projectId);
-      if (project) effective = pickLogoUrl(project, null);
+  // Empty submission = the operator deliberately cleared the field.
+  // That means "generate with NO logo" — record logo_disabled so the
+  // distinction from "no override → fall back to DB logo" is kept.
+  // A real URL = an override; it also clears any prior disabled flag.
+  const disabled = logo_url === "";
+  const target = await saveProjectOverrides(slug, {
+    logo_url: disabled ? "" : logo_url,
+    logo_disabled: disabled,
+  });
+
+  // Effective logo for the client to hot-swap the preview. Disabled →
+  // explicitly null (no logo). Otherwise the SAME pickLogoUrl resolver
+  // regen + the workspace render use, so preview === generation ref.
+  let effective: string | null = null;
+  if (!disabled) {
+    effective = logo_url || null;
+    if (!effective) {
+      const entry = resolveClient(slug);
+      if (entry) {
+        const project = await lookupProjectById(entry.projectId);
+        if (project) effective = pickLogoUrl(project, null);
+      }
     }
   }
-  sendJson(res, 200, { ok: true, path: target, logo_url, effective_logo: effective });
+  sendJson(res, 200, { ok: true, path: target, logo_url, logo_disabled: disabled, effective_logo: effective });
 }
 
 // ────────────────────────────────────────────────────────────────────────

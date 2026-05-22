@@ -120,7 +120,18 @@ const WIREFRAME_URLS: Partial<Record<AssetType, string>> = {
  * independently, which meant the preview and the image-gen reference
  * could disagree.
  */
-export function pickLogoUrl(project: ProjectRow, override: string | null): string | null {
+export function pickLogoUrl(
+  project: ProjectRow,
+  override: string | null,
+  disabled = false,
+): string | null {
+  // Operator explicitly cleared the logo field and saved — generate
+  // with NO logo reference. Returning null is safe end-to-end: regen
+  // pushes the logo into imageInput only `if (logoUrl)`, so a null
+  // here simply omits it; the workspace preview shows the "no logo"
+  // state. The pipeline does not break.
+  if (disabled) return null;
+
   // Operator-edited override always wins.
   if (override && override.startsWith("http")) return override;
 
@@ -463,7 +474,11 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   }
 
   const overrides = await loadProjectOverrides(slug);
-  if (overrides.logo_url) {
+  if (overrides.logo_disabled) {
+    process.stderr.write(
+      `regen: logo DISABLED by operator (${slug}-overrides.json) — generating with no logo reference\n`,
+    );
+  } else if (overrides.logo_url) {
     process.stderr.write(
       `regen: logo_url=overridden by graphic-tokens/${slug}-overrides.json (${overrides.logo_url.slice(0, 60)}…)\n`,
     );
@@ -555,7 +570,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   };
   await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
 
-  const logoUrl = pickLogoUrl(project, overrides.logo_url ?? null);
+  const logoUrl = pickLogoUrl(project, overrides.logo_url ?? null, overrides.logo_disabled === true);
   if (!logoUrl) {
     process.stderr.write(
       `regen: warning — no primary_logo URL found in projects.logo_urls; image_input will be empty\n`,

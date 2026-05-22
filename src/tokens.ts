@@ -116,6 +116,14 @@ export async function saveBrandGuidelines(slug: string, text: string): Promise<s
 export interface ProjectOverrides {
   /** When set, overrides projects.logo_urls.primary_logo for prompts + UI. */
   logo_url?: string;
+  /**
+   * Operator explicitly cleared the logo field and saved. This is
+   * DISTINCT from "no override" (empty file): logo_disabled=true means
+   * "generate with NO logo reference image at all", whereas an absent
+   * override means "fall back to the DB-resolved brand logo". Without
+   * this flag a cleared field just reset to the default.
+   */
+  logo_disabled?: boolean;
 }
 
 export function overridesPath(slug: string): string {
@@ -134,8 +142,16 @@ export async function saveProjectOverrides(
 ): Promise<string> {
   const cur = await loadProjectOverrides(slug);
   const next: ProjectOverrides = { ...cur, ...patch };
+  // Drop every falsy value — empty-string logo_url, false logo_disabled,
+  // undefined — so the persisted file only ever carries meaningful
+  // settings. (Previously only blank strings were dropped, leaving
+  // `false` booleans as noise.)
   for (const k of Object.keys(next) as (keyof ProjectOverrides)[]) {
-    if (typeof next[k] === "string" && (next[k] as string).trim() === "") delete next[k];
+    const v = next[k];
+    if (v === "" || v === false || v == null
+      || (typeof v === "string" && v.trim() === "")) {
+      delete next[k];
+    }
   }
   return writeOperator(`${slug}-overrides.json`, JSON.stringify(next, null, 2) + "\n");
 }
