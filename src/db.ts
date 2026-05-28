@@ -336,23 +336,3 @@ export async function getClusterForApply(clusterId: string): Promise<ClusterForA
   const r = await getPool().query<ClusterForApply>(sql, [clusterId]);
   return r.rows[0] ?? null;
 }
-
-/**
- * Overwrite a cluster's page_info with the supplied JSONB. The apply
- * pipeline reads, mutates the targeted image_id field (or rewrites
- * the matching <Image imageId="…"/> in blog_text.md), and persists
- * via this call. We update u_at to NOW() so any downstream consumers
- * that order by it see the fresh data.
- */
-export async function updateClusterPageInfo(
-  clusterId: string,
-  pageInfo: unknown,
-): Promise<void> {
-  const sql = `
-    UPDATE clusters
-    SET page_info = $1::jsonb,
-        u_at = NOW()
-    WHERE id = $2::uuid
-  `;
-  await getPool().query(sql, [JSON.stringify(pageInfo), clusterId]);
-}
