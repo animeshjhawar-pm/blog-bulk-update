@@ -3181,6 +3181,20 @@ async function runRepointPipeline(
     concurrency: 4,
     failFast: false,
   });
+  if (up.uploadable === 0 || up.mapping.length === 0) {
+    const statuses = [...new Set(scopeRows.map((r) => (r.status ?? "").trim() || "(empty)"))].join(", ");
+    return sendJson(res, 422, {
+      ok: false,
+      dry_run: dryRun,
+      scope: scopeLabel,
+      summary: { total: 0, applied: 0, superseded: 0, failed: scopeRows.length },
+      results: [],
+      reason:
+        `No uploadable image rows in scope. Expected a generated row with status=completed ` +
+        `or an uploaded replacement row with status=ready, plus image_local_path/image_url_new. ` +
+        `Seen status value(s): ${statuses || "(none)"}.`,
+    });
+  }
   const rep = await repointMappingRows(up.mapping, {
     token: tk.token,
     apply: !dryRun,

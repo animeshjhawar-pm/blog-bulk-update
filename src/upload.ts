@@ -323,7 +323,7 @@ export async function uploadRows(
   const base = opts.baseUrl ?? DEFAULT_BASE_URL;
   const rows = allRows.filter(
     (r) =>
-      (r.status ?? "").trim() === "completed" &&
+      ["completed", "ready"].includes((r.status ?? "").trim()) &&
       ((r.image_local_path ?? "").trim() || (r.image_url_new ?? "").trim()),
   );
   const skipped = allRows.length - rows.length;
