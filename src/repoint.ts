@@ -4,7 +4,7 @@ import { runOutDir } from "./runOutDir.js";
 import { parse as csvParse } from "csv-parse/sync";
 import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
-import { closePool, getClusterForApply, updateClusterPageInfo } from "./db.js";
+import { closePool, getClusterForApply } from "./db.js";
 import { makeLimiter } from "./concurrency.js";
 
 /**
@@ -284,13 +284,8 @@ async function repointCluster(args: {
   // page_info from the DB and verify the swap is actually there. A
   // cluster is "applied" ONLY if that read-back proves it.
   //
-  // Writers, in order:
-  //   1. `/file` PUT — kept for whatever cache / re-render side
-  //      effect it carries; its HTTP status is logged but no longer
-  //      trusted as proof.
-  //   2. Direct `clusters.page_info` UPDATE — the canonical
-  //      mechanism (mirrors stormbreaker's update_cluster_page_info).
-  //      Used as the authoritative write when the PUT didn't take.
+  // Writer: `/file` PUT only. It is the platform publish surface and
+  // the only path allowed to mutate page_info from this tool.
   const verifyApplied = async (): Promise<boolean> => {
     const fresh = await getClusterForApply(clusterId);
     if (!fresh || !fresh.page_info) return false;
@@ -333,30 +328,10 @@ async function repointCluster(args: {
     return out;
   }
 
-  // PUT did not take — fall back to a direct DB write of page_info.
-  process.stderr.write(
-    `[repoint] cluster=${clusterId}: /file PUT did not persist (${putNote}) — falling back to direct clusters.page_info write\n`,
-  );
-  try {
-    await updateClusterPageInfo(clusterId, reparsed);
-  } catch (err) {
-    out.reason = `page_info not persisted. ${putNote}. Direct DB write also failed: ${
-      err instanceof Error ? err.message : String(err)
-    }`;
-    process.stderr.write(`[failed] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`);
-    return out;
-  }
-
-  if (await verifyApplied()) {
-    out.status = "applied";
-    out.reason = `applied via direct DB write (the /file PUT did not persist: ${putNote}) — ${out.replacements} occurrence(s) repointed: ${perPair}`;
-    process.stderr.write(
-      `[applied] cluster=${clusterId} client=${clientSlug} repl=${out.replacements} (DB-fallback; ${putNote})\n`,
-    );
-    return out;
-  }
-
-  out.reason = `page_info write did not verify. ${putNote}. A direct DB write was attempted but the live page_info still does not show the new image id(s) — nothing reliable to report as applied.`;
+  out.reason =
+    `page_info write did not verify after ${putNote}. ` +
+    `No direct DB fallback was attempted; /file is the only allowed publish path. ` +
+    `Nothing reliable can be reported as applied.`;
   process.stderr.write(`[failed] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`);
   return out;
 }

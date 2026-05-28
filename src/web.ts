@@ -1149,7 +1149,7 @@ interface RecentRunSummary {
   failed: number;
   /** Total rows the run was scheduled to process; null for very old manifests. */
   total: number | null;
-  /** Images successfully Applied-to-S3 for this run (sidecar). */
+  /** Images successfully repointed in page_info for this run (sidecar). */
   applied: number;
   /** "blog" / "service+category" etc, comma/+-joined when multiple. */
   page_types: string | null;
@@ -1292,7 +1292,7 @@ async function homePage(res: ServerResponse) {
       const regeneratedLabel = (r.ok || r.failed) ? String(r.ok) : "—";
       const appliedPct = r.ok > 0 ? Math.round((r.applied / r.ok) * 100) : 0;
       // Apply-state classification:
-      //   full    — every regenerated image was also applied to S3
+      //   full    — every regenerated image was also repointed in page_info
       //   partial — some applied, some still pending
       //   none    — nothing applied yet
       // The full case gets a left-edge green stripe + chip in the row
@@ -1303,9 +1303,9 @@ async function homePage(res: ServerResponse) {
           ? "partial"
           : "none";
       const appliedInner = applyState === "full"
-        ? `<span class="has all" title="all ${r.applied} regenerated images uploaded to S3">${r.applied}<span class="check">✓</span></span>`
+        ? `<span class="has all" title="all ${r.applied} regenerated images repointed in page_info">${r.applied}<span class="check">✓</span></span>`
         : applyState === "partial"
-          ? `<span class="has" title="${r.applied} of ${r.ok} regenerated images uploaded to S3 (${appliedPct}%)">${r.applied}</span>`
+          ? `<span class="has" title="${r.applied} of ${r.ok} regenerated images repointed in page_info (${appliedPct}%)">${r.applied}</span>`
           : `<span class="none">0</span>`;
       const fav = `<img src="${esc(faviconFor(r.client_url))}" alt="" class="fav" loading="lazy">`;
       const displayName = r.client_name ?? r.client;
@@ -1429,7 +1429,7 @@ ${recent.length > 0 ? `
           <th>Started</th>
           <th class="num" title="Total images the run was scheduled to process">Total</th>
           <th class="num" title="Images successfully regenerated / awaiting upload">Regen</th>
-          <th class="num" title="Images uploaded to S3 from this run (Apply count)">Applied</th>
+          <th class="num" title="Images repointed in page_info from this run">Applied</th>
           <th>Status</th>
         </tr>
       </thead>
@@ -3255,17 +3255,19 @@ async function runRepointPipeline(
   const okN = results.filter((r) => r.ok).length;
   const supersededN = results.filter((r) => r.superseded).length;
   // Persist a sidecar so the recent-runs view can show how many
-  // images have actually been pushed to S3 via this run. We count
-  // every successful UPLOAD (the persistent side-effect — bytes on
-  // S3) regardless of dry_run, because dry-run still uploads; only
-  // the page_info repoint PUT is gated on dry_run. Each id is set-
-  // unioned in the sidecar so re-applies don't double-count.
-  if (runId) {
-    const uploadedIds = up.mapping
-      .filter((m) => m.upload_status === "uploaded")
-      .map((m) => m.old_image_id)
+  // images have actually been repointed in page_info via this run.
+  //
+  // Important: upload success is NOT publish success. Dry-runs still
+  // upload and mint media ids, and a cluster can upload cleanly but
+  // fail/skip the page_info repoint gate. Counting those uploads made
+  // the home page say "applied" even though the live page kept pointing
+  // at the old image. Only record real, non-dry-run repoint successes.
+  if (runId && !dryRun) {
+    const appliedIds = results
+      .filter((r) => r.ok || r.superseded)
+      .map((r) => r.image_id_old)
       .filter(Boolean);
-    if (uploadedIds.length > 0) void recordAppliedImages(runId, uploadedIds);
+    if (appliedIds.length > 0) void recordAppliedImages(runId, appliedIds);
   }
   const payload = {
     // A run is "ok" if every row either applied or was superseded
@@ -3860,7 +3862,10 @@ async function ensureExtractionInFlight(slug: string): Promise<{ tokenPath: stri
     }
   })();
   EXTRACTING_TOKENS.set(slug, p);
-  p.finally(() => EXTRACTING_TOKENS.delete(slug));
+  void p.then(
+    () => EXTRACTING_TOKENS.delete(slug),
+    () => EXTRACTING_TOKENS.delete(slug),
+  );
   return p;
 }
 
@@ -5024,7 +5029,7 @@ function paintCard(imageId, opts) {
   }
   const errLine = card.querySelector('.rc-status-line');
   if (errLine) {
-    errLine.textContent = (s === 'failed' && opts && opts.error) ? opts.error : '';
+    errLine.textContent = (s === 'failed' && opts && opts.error) ? ('Reason: ' + opts.error) : '';
     errLine.style.display = (s === 'failed' && opts && opts.error) ? 'block' : 'none';
   }
 }
@@ -5212,6 +5217,19 @@ function showApplySummaryModal(scopeLabel, results) {
   const ok = results.filter((r) => r.ok).length;
   const supersededN = results.filter((r) => r.superseded).length;
   const failed = results.length - ok - supersededN;
+  const failedReasons = results
+    .filter((r) => !r.ok && !r.superseded)
+    .map((r) => (r.reason || 'Unknown failure').trim())
+    .filter(Boolean);
+  const reasonSummary = failedReasons.length
+    ? '<div style="padding:10px 18px;border-bottom:1px solid #f0f0f0;background:#fef2f2;color:#991b1b;font-size:12px;">'
+      + '<div style="font-weight:600;margin-bottom:4px;">Failure reasons</div>'
+      + failedReasons.slice(0, 5).map((reason) =>
+        '<div style="margin-top:3px;white-space:normal;word-break:break-word;">&bull; ' + escapeHtml(reason) + '</div>'
+      ).join('')
+      + (failedReasons.length > 5 ? '<div style="margin-top:4px;color:#7f1d1d;">+' + (failedReasons.length - 5) + ' more - click failed rows for details.</div>' : '')
+      + '</div>'
+    : '';
   const rows = results.map((r, i) => {
     const status = r.superseded ? 'ALREADY APPLIED'
       : r.ok ? (r.dry_run ? 'DRY OK' : 'APPLIED')
@@ -5219,10 +5237,14 @@ function showApplySummaryModal(scopeLabel, results) {
     const colour = r.superseded ? '#3730a3'
       : r.ok ? (r.dry_run ? '#b45309' : '#16a34a')
         : '#dc2626';
-    return '<div class="bca-row" data-i="' + i + '" style="display:flex;justify-content:space-between;gap:10px;padding:7px 10px;border-bottom:1px solid #eee;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12px;">'
-      + '<span style="color:#666;flex:0 0 28px;">' + (i + 1) + '.</span>'
-      + '<span style="flex:1;word-break:break-all;">' + escapeHtml(r.image_id_old || '?') + '</span>'
+    const reason = r.reason ? escapeHtml(r.reason) : '';
+    return '<div class="bca-row" data-i="' + i + '" title="' + (reason || 'Click for execution trace') + '" style="display:grid;grid-template-columns:28px minmax(160px,1fr) 140px minmax(180px,1.2fr);gap:10px;padding:7px 10px;border-bottom:1px solid #eee;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12px;align-items:start;">'
+      + '<span style="color:#666;">' + (i + 1) + '.</span>'
+      + '<span style="word-break:break-all;">' + escapeHtml(r.image_id_old || '?') + '</span>'
       + '<span style="font-weight:600;color:' + colour + ';">' + status + '</span>'
+      + '<span style="color:' + (r.ok || r.superseded ? '#888' : '#991b1b') + ';white-space:normal;word-break:break-word;">'
+      + (reason || (r.superseded ? 'Old id already absent from live page_info.' : r.ok ? 'Completed.' : 'Unknown failure.'))
+      + '</span>'
       + '</div>';
   }).join('');
   overlay.innerHTML = '<div style="background:#fff;color:#111;max-width:760px;width:92%;max-height:86vh;border-radius:8px;display:flex;flex-direction:column;box-shadow:0 18px 48px rgba(0,0,0,0.32);overflow:hidden;font-family:ui-sans-serif,system-ui,sans-serif;">'
@@ -5236,6 +5258,7 @@ function showApplySummaryModal(scopeLabel, results) {
     + '<span style="color:#dc2626;font-weight:600;">' + failed + ' failed</span>'
     + ' &middot; click a row to see its step-by-step trace'
     + '</div>'
+    + reasonSummary
     + '<div style="overflow:auto;flex:1;">' + (rows || '<div style="padding:14px;color:#888;">No results.</div>') + '</div>'
     + '</div>';
   document.body.appendChild(overlay);
