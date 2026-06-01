@@ -59,6 +59,26 @@ export async function lookupProjectById(projectId: string): Promise<ProjectRow |
 }
 
 /**
+ * Read the pre-extracted graphic_token JSONB for a project. Returns
+ * null when the row is missing or the column is empty/blank — callers
+ * use that signal to fall back to live Firecrawl + Portkey extraction.
+ * The schema's source of truth for brand styling now lives here, so
+ * this is the preferred read path; the in-process extraction is a
+ * compatibility fallback for projects that haven't been backfilled.
+ */
+export async function lookupProjectGraphicToken(
+  projectId: string,
+): Promise<Record<string, unknown> | null> {
+  const sql = `SELECT graphic_token FROM projects WHERE id = $1::uuid LIMIT 1`;
+  const res = await getPool().query<{ graphic_token: unknown }>(sql, [projectId]);
+  const raw = res.rows[0]?.graphic_token;
+  if (raw == null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (Object.keys(raw as object).length === 0) return null;
+  return raw as Record<string, unknown>;
+}
+
+/**
  * page_info is JSONB and per-project freeform — every key is optional,
  * the only thing we actually count on is `page_info` being an object.
  */
