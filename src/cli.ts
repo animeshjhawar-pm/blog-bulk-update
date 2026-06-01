@@ -445,6 +445,124 @@ program
   );
 
 program
+  .command("upload-generate")
+  .description(
+    "Upload-&-Generate: per-image product files supplied via a JSON manifest are composited into AI-generated backgrounds. Output CSV is identical in shape to a regen run (same Apply pipeline downstream).",
+  )
+  .requiredOption("--client <slug>", `client slug (allow-list: ${clientSlugList().join(", ") || "<empty>"})`)
+  .requiredOption(
+    "--products-manifest <path>",
+    "JSON file mapping image_id -> absolute path of the operator's product image. Keys must be the same image_ids passed via --image-ids.",
+  )
+  .option("--cluster-ids <list>", "comma-separated cluster UUIDs to restrict to")
+  .option("--image-ids <list>", "comma-separated image_id values to restrict to (must match the keys in --products-manifest)")
+  .option(
+    "--page-type <types>",
+    "page_type(s) — single value (blog/service/category) or comma-separated. Default blog.",
+    "blog",
+  )
+  .option("--run-id <id>", "stamp this run with a stable id (web UI uses this to link /runs/<id>)")
+  .addOption(
+    new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
+  )
+  .option("--concurrency <n>", "parallel images", "3")
+  .option(
+    "--extra-instructions-file <path>",
+    "merge this file's text into the per-image top-priority block (same shape as the regen flag)",
+  )
+  .option(
+    "--prompt-overrides-file <path>",
+    "JSON file with per-run system+user template overrides keyed by prompt group",
+  )
+  .action(
+    async (opts: {
+      client: string;
+      productsManifest: string;
+      clusterIds?: string;
+      imageIds?: string;
+      pageType?: string;
+      runId?: string;
+      provider?: Provider;
+      concurrency: string;
+      extraInstructionsFile?: string;
+      promptOverridesFile?: string;
+    }) => {
+      requireKnownClient(opts.client);
+      try {
+        const fs = await import("node:fs/promises");
+        const raw = await fs.readFile(opts.productsManifest, "utf8");
+        let products: Record<string, string>;
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("manifest must be a JSON object of image_id -> path");
+          }
+          products = {};
+          for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (typeof v !== "string" || !v.trim()) {
+              throw new Error(`manifest entry for ${k} is not a non-empty string path`);
+            }
+            products[k] = v;
+          }
+        } catch (err) {
+          process.stderr.write(
+            `upload-generate: --products-manifest is not valid JSON: ${(err as Error).message}\n`,
+          );
+          process.exit(2);
+        }
+
+        const clusterIds = parseClusterIds(opts.clusterIds);
+        const imageIds = parseClusterIds(opts.imageIds);
+        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 3);
+
+        let extraInstructions: string | undefined;
+        let promptOverrides: import("./buildPrompt.js").PromptOverrides | undefined;
+        if (opts.extraInstructionsFile) {
+          extraInstructions = (await fs.readFile(opts.extraInstructionsFile, "utf8")).trim();
+        }
+        if (opts.promptOverridesFile) {
+          const raw = await fs.readFile(opts.promptOverridesFile, "utf8");
+          try {
+            promptOverrides = JSON.parse(raw);
+          } catch (err) {
+            process.stderr.write(
+              `upload-generate: ignoring --prompt-overrides-file (invalid JSON): ${(err as Error).message}\n`,
+            );
+          }
+        }
+
+        const validPt = new Set(["blog", "service", "category"]);
+        const ptList = (opts.pageType ?? "blog")
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s): s is "blog" | "service" | "category" => validPt.has(s));
+        if (ptList.length === 0) ptList.push("blog");
+        const pageType = ptList.length === 1 ? ptList[0]! : ptList;
+
+        const { runUploadGenerate } = await import("./uploadGenerate.js");
+        await runUploadGenerate({
+          client: opts.client,
+          products,
+          clusterIds,
+          imageIds,
+          pageType,
+          runId: opts.runId,
+          provider: opts.provider,
+          concurrency,
+          extraInstructions,
+          promptOverrides,
+        });
+      } catch (err) {
+        process.stderr.write(
+          `upload-generate failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+        await closePool();
+      }
+    },
+  );
+
+program
   .command("web")
   .description("Start the web UI for picking clusters + triggering regen runs.")
   .option("--port <n>", "port to bind (defaults to $PORT or 3000)")

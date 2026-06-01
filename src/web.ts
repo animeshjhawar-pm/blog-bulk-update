@@ -107,12 +107,14 @@ interface RunState {
   proc: ChildProcess;
   listeners: Set<ServerResponse>;
   /**
-   * "regen" — generated via Replicate/fal subprocess (default).
-   * "upload" — operator dropped client-provided replacement images.
-   * The Apply pipeline is identical for both; only the source of
-   * image_local_path differs (regen subprocess vs HTTP upload).
+   * "regen"           — generated via Replicate/fal subprocess (default).
+   * "upload"          — operator dropped client-provided replacement images.
+   * "upload-generate" — operator dropped a PRODUCT image per slot; the CLI
+   *                     generates a scene with an empty zone and sharp
+   *                     composites the product on top. The Apply pipeline
+   *                     downstream is identical for all three.
    */
-  mode?: "regen" | "upload";
+  mode?: "regen" | "upload" | "upload-generate";
 }
 
 const RUNS = new Map<string, RunState>();
@@ -368,6 +370,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   }
   .run-type-chip.run-type-regen  { background: #e0e7ff; color: #3730a3; }
   .run-type-chip.run-type-upload { background: #fef3c7; color: #92400e; }
+  .run-type-chip.run-type-upload-generate { background: #d1fae5; color: #047857; }
   table.recent-runs td.run-type-cell { white-space: nowrap; }
   /* "Run by" — shows email local-part, full email on hover. Falls
      back to a muted dash for legacy runs (created before this
@@ -412,6 +415,174 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     color: var(--ink); font-weight: 600;
     border-bottom-color: var(--brand, #2563eb);
   }
+
+  /* Upload-&-Generate modal — scoped styles. All rules below are
+     prefixed with .upgen-* or live inside #upgen-overlay so they
+     only affect the new modal. The existing .result-card .rc-dropzone
+     rules and global .pill rules are not modified — the upload-
+     replacements flow, run pages, and recent-runs chips render
+     identically to before. */
+
+  /* Modal overlay sizing: clamp to 85vh so the modal never exceeds
+     the viewport. The internal layout (header / instructions /
+     scroll area / footer) is flex so the header and footer stay
+     pinned while the cluster sections scroll. */
+  #upgen-overlay .cmp-modal { max-height: 85vh; }
+
+  /* Header + instructions block + footer should never scroll out
+     of view. The modal already uses flex column with overflow:hidden
+     on .cmp-modal, but we make the footer's stickiness explicit
+     against any layout regressions. */
+  #upgen-overlay .upgen-footer {
+    border-top: 1px solid var(--border);
+    background: #fff;
+    padding: 14px 18px;
+    display: flex; gap: 8px; align-items: center;
+    flex-shrink: 0;
+  }
+
+  /* Dropzone — generous height so the icon + label + browse + format
+     hint all read cleanly, and never collapses below 160px even
+     when the modal is narrow or has many cluster sections. */
+  .upgen-dropzone {
+    width: 100%;
+    min-height: 160px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    border: 2px dashed var(--border-strong);
+    border-radius: 8px; background: #fafbfc; color: var(--ink-muted);
+    text-align: center; padding: 20px 14px; cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+    box-sizing: border-box; gap: 4px;
+    flex-shrink: 0;
+  }
+  .upgen-dropzone:hover {
+    background: #eef2ff;
+    border-color: var(--brand);
+    color: var(--brand);
+    border-style: solid;
+  }
+  .upgen-dropzone.dragover {
+    background: var(--accent-bg);
+    border-color: var(--brand);
+    border-style: solid;
+    color: var(--brand);
+  }
+  .upgen-dropzone .dz-icon { font-size: 28px; line-height: 1; margin-bottom: 4px; }
+  .upgen-dropzone .dz-text { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .upgen-dropzone:hover .dz-text { color: var(--brand); }
+  .upgen-dropzone .dz-sub  { font-size: 11.5px; color: var(--ink-faint); }
+  .upgen-dropzone .dz-browse-link {
+    font-size: 11.5px; color: var(--brand);
+    text-decoration: underline; text-underline-offset: 2px;
+    margin-top: 2px;
+  }
+  .upgen-dropzone.uploading,
+  .upgen-dropzone.error { cursor: default; }
+  .upgen-dropzone.uploading {
+    background: #eff6ff; border-color: var(--brand);
+    border-style: solid; color: var(--brand);
+  }
+  .upgen-dropzone.error {
+    background: #fef2f2; border-color: #fca5a5;
+    color: #991b1b; border-style: solid;
+  }
+  .upgen-dropzone .dz-progress {
+    font-variant-numeric: tabular-nums;
+    font-size: 12px; margin-top: 6px;
+  }
+  .upgen-dropzone .dz-err-msg {
+    font-size: 11.5px; margin-top: 4px;
+    max-width: 220px; word-break: break-word;
+  }
+
+  /* Cluster section card. Stronger hierarchy than a flat list.
+     flex-shrink:0 is CRITICAL: #upgen-zones is a flex column, and
+     without this the browser would proportionally shrink every
+     section to fit the visible viewport — squishing every dropzone
+     into nothing once you have >3-4 clusters. With flex-shrink:0
+     each section retains its natural height, the total overflows
+     #upgen-zones, and overflow-y:auto kicks in to give a scrollbar. */
+  .upgen-cluster-section {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px; background: #fff;
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .upgen-cluster-header {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+    background: #f8fafc;
+  }
+  .upgen-cluster-header .topic {
+    flex: 1; min-width: 0;
+    font-size: 16px; font-weight: 600;
+    color: var(--ink); line-height: 1.35;
+    word-break: break-word;
+  }
+  .upgen-cluster-header .cid {
+    font-size: 11px; color: var(--ink-faint);
+    font-family: ui-monospace, Menlo, monospace;
+    margin-top: 4px; word-break: break-all;
+  }
+  .upgen-cluster-header .hint {
+    flex: 0 0 auto;
+    font-size: 11.5px; color: var(--ink-muted);
+    white-space: nowrap;
+    background: var(--accent-bg); color: var(--brand);
+    padding: 4px 10px; border-radius: 999px;
+    align-self: center;
+  }
+
+  /* Slot card holding one dropzone. Wider min-column + more padding. */
+  .upgen-slot-grid {
+    padding: 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .upgen-slot {
+    border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+    background: #fff;
+    display: flex; flex-direction: column; gap: 10px;
+    min-height: 240px;
+    box-sizing: border-box;
+  }
+  .upgen-slot-head {
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  /* Scoped pill contrast fix — only inside the upgen modal.
+     The global .pill class stays at its existing tight padding so
+     other places (workspace cluster table, run pages, etc.) render
+     unchanged. */
+  #upgen-overlay .pill {
+    padding: 4px 10px; font-size: 12px; font-weight: 600;
+  }
+
+  /* Asset-type filter row above the cluster table. Pure add-on:
+     all chips ticked by default so cluster-tick behaviour is
+     identical to before. Operator unticks chips to scope what
+     gets auto-selected when a cluster row is ticked. */
+  .asset-filter-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 18px; border-bottom: 1px solid var(--border);
+    background: #fafbfc; flex-wrap: wrap; font-size: 12px;
+  }
+  .asset-filter-row .label {
+    color: var(--ink-muted); font-weight: 500; margin-right: 4px;
+  }
+  .asset-filter-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 9px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--border-strong); background: #fff;
+    user-select: none; transition: background .12s, border-color .12s;
+  }
+  .asset-filter-chip:hover { background: #f1f5f9; }
+  .asset-filter-chip input { margin: 0; width: 13px; height: 13px; cursor: pointer; }
+  .asset-filter-chip.on { background: var(--accent-bg); border-color: var(--brand); color: var(--brand); }
+  .asset-filter-chip .ct { color: var(--ink-faint); font-size: 11px; }
 
   /* Single-line toolbar: title + count + search + filter dropdowns
      all on one row. Search bar takes the spare horizontal space
@@ -1153,8 +1324,8 @@ interface RecentRunSummary {
   applied: number;
   /** "blog" / "service+category" etc, comma/+-joined when multiple. */
   page_types: string | null;
-  /** "regen" (subprocess Generate run) or "upload" (operator drop). */
-  mode: "regen" | "upload";
+  /** Run mode — drives the type chip in the recent-runs table. */
+  mode: "regen" | "upload" | "upload-generate";
   /** Email decoded from the bearer JWT the operator used to start
    * the run. Null when the run was created without a token in the
    * Authorization header (legacy runs, or operator hadn't pasted
@@ -1207,7 +1378,10 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
         total,
         applied,
         page_types: typeof j.page_type === "string" ? j.page_type : Array.isArray(j.page_type) ? j.page_type.join("+") : null,
-        mode: j.mode === "upload" ? "upload" : "regen",
+        mode:
+          j.mode === "upload" ? "upload"
+          : j.mode === "upload-generate" ? "upload-generate"
+          : "regen",
         started_by_email: runId ? (await loadRunMeta(runId)).started_by_email : null,
         csv: csvPath,
         html: htmlPath,
@@ -1311,9 +1485,19 @@ async function homePage(res: ServerResponse) {
       const displayName = r.client_name ?? r.client;
       const nameInner = `${fav}<span>${esc(displayName)}</span>`;
       const pageTypeInner = r.page_types ? esc(r.page_types) : "—";
-      const typeLabel = r.mode === "upload" ? "Upload" : "Generate";
-      const typeIcon = r.mode === "upload" ? "↑" : "↻";
-      const typeChip = `<span class="run-type-chip run-type-${r.mode}" title="${r.mode === "upload" ? "Operator-uploaded replacement images" : "Replicate-generated images"}">${typeIcon} ${typeLabel}</span>`;
+      const typeLabel =
+        r.mode === "upload" ? "Upload"
+        : r.mode === "upload-generate" ? "Upload + Generate"
+        : "Generate";
+      const typeIcon =
+        r.mode === "upload" ? "↑"
+        : r.mode === "upload-generate" ? "↑↻"
+        : "↻";
+      const typeTooltip =
+        r.mode === "upload" ? "Operator-uploaded replacement images"
+        : r.mode === "upload-generate" ? "Operator-uploaded product image, composited into AI-generated background"
+        : "Replicate-generated images";
+      const typeChip = `<span class="run-type-chip run-type-${r.mode}" title="${typeTooltip}">${typeIcon} ${typeLabel}</span>`;
       // Render just the local-part of the email (before "@") in the
       // cell — full email lives in the title attribute on hover. Keeps
       // the column compact and readable. Falls back to "—" when no
@@ -2324,6 +2508,12 @@ async function saveToken(e) {
     </div>
     <div class="meta" style="flex:0 0 auto">Showing <strong id="visible-count">${clusters.length}</strong> / ${clusters.length}</div>
   </div>
+  <div id="asset-filter-row" class="asset-filter-row">
+    <span class="label" title="When you tick a cluster, only the asset types ticked here are auto-selected. Unticking an asset type also removes any of those already in your selection.">Auto-select asset types:</span>
+    <!-- Populated by renderAssetFilter() once the page JS runs so the
+         chip list always matches whatever asset types actually appear
+         in the current workspace view. -->
+  </div>
   <table class="cluster-list">
     <thead>
       <tr>
@@ -2369,7 +2559,38 @@ async function saveToken(e) {
   </div>
   <div class="right">
     <button id="bar-upload-btn" onclick="openUploadRun()" disabled title="Skip the generation step — operator drops client-supplied replacement images for each picked slot, then runs the same Apply pipeline.">↑ Upload replacements</button>
+    <button id="bar-upgen-btn" onclick="openUploadGenerate()" disabled title="Operator drops a product photo per slot. AI generates the surrounding scene/background; the product itself is composited in pixel-perfect — never AI-modified.">↑↻ Upload &amp; Generate</button>
     <button class="primary" id="bar-generate-btn" onclick="openGenerateConfirm()" disabled title="Review prompts before running the generation pipeline.">Generate →</button>
+  </div>
+</div>
+
+<!-- Upload & Generate modal — opens when the operator clicks
+     "↑↻ Upload & Generate". One drop zone per picked image_id. The
+     operator drops a product photo into each; the AI generates the
+     surrounding scene/background and the product itself is pixel-
+     composited on top after generation (never AI-modified).
+     Layout: fixed header + instructions + scrollable cluster zone
+     + fixed footer. Modal max-height clamped to 85vh via CSS. -->
+<div class="cmp-overlay" id="upgen-overlay" onclick="upgenBackdrop(event)">
+  <div class="cmp-modal" role="dialog" aria-modal="true" style="max-width:1040px">
+    <header class="cmp-head" style="flex-shrink:0">
+      <strong>Upload &amp; Generate</strong>
+      <span class="sub" id="upgen-summary" style="margin-left:auto"></span>
+      <button class="cmp-x" onclick="closeUploadGenerate()" aria-label="Close">×</button>
+    </header>
+    <div style="padding:14px 18px 10px 18px;flex-shrink:0">
+      <div class="sub" style="line-height:1.55">
+        Drop a product image into any slot — it auto-fills the other empty slots in the <strong>same page</strong> (cover + thumbnail typically share a product). Drop a different file into any individual slot to override. The AI generates the surrounding scene; your product image is composited in <strong>pixel-perfect</strong> — never AI-modified. PNG / JPEG / WebP up to 10 MB.
+      </div>
+    </div>
+    <div id="upgen-zones" style="padding:6px 18px 18px 18px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:24px;background:#f6f7f9">
+      <div class="sub">Preparing…</div>
+    </div>
+    <footer class="upgen-footer">
+      <span class="sub" id="upgen-progress" style="margin-right:auto;font-weight:500;color:var(--ink)"></span>
+      <button type="button" onclick="closeUploadGenerate()">Cancel</button>
+      <button type="button" class="primary" id="upgen-submit-btn" onclick="upgenSubmit()" disabled>Upload &amp; Generate →</button>
+    </footer>
   </div>
 </div>
 
@@ -2415,6 +2636,115 @@ function imageIdsOf(clusterId) {
 }
 function clusterById(id) { return CLUSTERS.find(c => c.id === id); }
 
+// ── Asset-type filter (add-on; defaults to "all ticked" so existing
+//    cluster-tick behaviour is byte-identical to before) ──────────
+//
+// allowedAssets holds the set of asset_type strings ("cover",
+// "thumbnail", "infographic", ...) that should be auto-selected
+// when the operator ticks a cluster row. Initialised below from
+// whatever asset types actually appear in the current workspace
+// view, all entries enabled. Persists for the lifetime of the
+// workspace page (a refresh resets it).
+//
+// Helper precomputes image_id -> asset_type so the cascade math
+// inside onAssetFilterChange doesn't have to scan CLUSTERS each
+// pass.
+const ALL_ASSET_TYPES_IN_VIEW = (function () {
+  const s = new Set();
+  for (const c of CLUSTERS) for (const img of (c.images || [])) {
+    if (img && img.asset) s.add(img.asset);
+  }
+  return [...s];
+})();
+const allowedAssets = new Set(ALL_ASSET_TYPES_IN_VIEW); // default: every visible asset type ticked
+const IMAGE_ASSET_MAP = (function () {
+  const m = new Map();
+  for (const c of CLUSTERS) for (const img of (c.images || [])) {
+    if (img && img.id && img.asset) m.set(img.id, img.asset);
+  }
+  return m;
+})();
+
+/**
+ * Same shape as imageIdsOf, but narrowed to image_ids whose
+ * asset_type is currently allowed by the filter. When every asset
+ * is allowed (default state), the return value is identical to
+ * imageIdsOf — that's how we keep the existing cluster-tick
+ * behaviour byte-identical when the operator doesn't touch the
+ * filter chips.
+ */
+function filteredImageIdsOf(clusterId) {
+  const c = CLUSTERS.find(x => x.id === clusterId);
+  if (!c) return [];
+  return c.images.filter(i => allowedAssets.has(i.asset)).map(i => i.id);
+}
+
+/** Render the filter chip row from ALL_ASSET_TYPES_IN_VIEW. Called
+ *  once on page load. Order matches the natural reading order used
+ *  elsewhere in the UI. */
+function renderAssetFilter() {
+  const row = document.getElementById('asset-filter-row');
+  if (!row) return;
+  const ORDER = ['cover', 'thumbnail', 'infographic', 'internal', 'external', 'generic', 'service_h1', 'service_body', 'category_industry'];
+  const present = ALL_ASSET_TYPES_IN_VIEW.slice().sort(
+    (a, b) => (ORDER.indexOf(a) === -1 ? 99 : ORDER.indexOf(a)) - (ORDER.indexOf(b) === -1 ? 99 : ORDER.indexOf(b)),
+  );
+  if (present.length === 0) { row.style.display = 'none'; return; }
+  // Per-asset count in the entire view (just a hint, not a live count).
+  const counts = {};
+  for (const c of CLUSTERS) for (const img of (c.images || [])) {
+    counts[img.asset] = (counts[img.asset] || 0) + 1;
+  }
+  const label = row.querySelector('.label');
+  const labelHtml = label ? label.outerHTML : '<span class="label">Auto-select asset types:</span>';
+  const chips = present.map(function (a) {
+    const checked = allowedAssets.has(a) ? 'checked' : '';
+    const cls = allowedAssets.has(a) ? 'asset-filter-chip on' : 'asset-filter-chip';
+    return '<label class="' + cls + '" data-asset="' + a + '">' +
+      '<input type="checkbox" data-asset="' + a + '" ' + checked + ' onchange="onAssetFilterChange(\\'' + a + '\\', this.checked)">' +
+      '<span>' + a + '</span>' +
+      '<span class="ct">' + (counts[a] || 0) + '</span>' +
+      '</label>';
+  }).join('');
+  row.innerHTML = labelHtml + chips;
+}
+
+/**
+ * Operator toggled an asset-type chip. b2 semantics: also rewrite the
+ * CURRENT selection.
+ *   on=true  → for every cluster currently in selection, add all
+ *              image_ids of this asset_type from that cluster.
+ *   on=false → for every cluster in selection, remove image_ids of
+ *              this asset_type. If a cluster's selected set goes
+ *              empty, drop it from selection entirely.
+ */
+function onAssetFilterChange(asset, on) {
+  if (on) allowedAssets.add(asset); else allowedAssets.delete(asset);
+  if (on) {
+    for (const cid of selection.keys()) {
+      const set = selection.get(cid);
+      const c = clusterById(cid);
+      if (!c) continue;
+      for (const img of c.images) if (img.asset === asset) set.add(img.id);
+    }
+  } else {
+    const toDelete = [];
+    for (const cid of selection.keys()) {
+      const set = selection.get(cid);
+      const c = clusterById(cid);
+      if (!c) continue;
+      for (const img of c.images) if (img.asset === asset) set.delete(img.id);
+      if (set.size === 0) toDelete.push(cid);
+    }
+    for (const cid of toDelete) selection.delete(cid);
+  }
+  // Visual state on the chip itself.
+  const chip = document.querySelector('.asset-filter-chip[data-asset="' + asset + '"]');
+  if (chip) chip.classList.toggle('on', on);
+  refreshTotals();
+  if (drawerClusterId) refreshDrawerIfOpen(drawerClusterId);
+}
+
 // Track the last-clicked cluster checkbox so shift-click extends a range.
 let lastClickedClusterId = null;
 function onClusterCheck(clusterId, on, ev) {
@@ -2428,7 +2758,11 @@ function onClusterCheck(clusterId, on, ev) {
       const [lo, hi] = a < b ? [a, b] : [b, a];
       for (let i = lo; i <= hi; i++) {
         const cid = visibleIds[i];
-        if (on) selection.set(cid, new Set(imageIdsOf(cid)));
+        // Use filteredImageIdsOf so the asset-type filter is honoured
+        // on shift-range select. When the filter is in its default
+        // state (every type ticked) this returns the same array as
+        // imageIdsOf — existing behaviour preserved.
+        if (on) selection.set(cid, new Set(filteredImageIdsOf(cid)));
         else selection.delete(cid);
       }
       refreshTotals();
@@ -2436,7 +2770,7 @@ function onClusterCheck(clusterId, on, ev) {
       return;
     }
   }
-  if (on) selection.set(clusterId, new Set(imageIdsOf(clusterId)));
+  if (on) selection.set(clusterId, new Set(filteredImageIdsOf(clusterId)));
   else selection.delete(clusterId);
   lastClickedClusterId = clusterId;
   refreshTotals();
@@ -2446,7 +2780,7 @@ function toggleAllClusters(on) {
   for (const tr of visibleRows()) {
     const cid = tr.dataset.clusterId;
     if (!cid) continue;
-    if (on) selection.set(cid, new Set(imageIdsOf(cid)));
+    if (on) selection.set(cid, new Set(filteredImageIdsOf(cid)));
     else selection.delete(cid);
   }
   refreshTotals();
@@ -2483,13 +2817,24 @@ function refreshTotals() {
   document.getElementById('bar-generate-btn').disabled = imgs === 0;
   const upBtn = document.getElementById('bar-upload-btn');
   if (upBtn) upBtn.disabled = imgs === 0;
+  const upgenBtn = document.getElementById('bar-upgen-btn');
+  if (upgenBtn) upgenBtn.disabled = imgs === 0;
   for (const tr of allRows()) {
     const cid = tr.dataset.clusterId;
     if (!cid) continue;
     const cb = tr.querySelector('input.cluster-select');
     if (!cb) continue;
     const set = selection.get(cid);
-    const total = imageIdsOf(cid).length;
+    // Compare against the FILTERED total — i.e. the number of images
+    // in this cluster whose asset_type is currently allowed by the
+    // chip filter. Using the raw imageIdsOf(cid).length here was the
+    // source of the "can't deselect after unticking a filter chip"
+    // bug: with infographic unticked, a cluster with 1 cover + 1
+    // thumb + 5 infographics had selected=2 but total=7, so the
+    // checkbox stayed indeterminate forever and clicks couldn't
+    // resolve it cleanly. Default filter state (every chip ticked)
+    // makes filtered === raw, so existing behaviour is preserved.
+    const total = filteredImageIdsOf(cid).length;
     if (!set || set.size === 0) { cb.checked = false; cb.indeterminate = false; }
     else if (set.size === total) { cb.checked = true; cb.indeterminate = false; }
     else { cb.checked = false; cb.indeterminate = true; }
@@ -2950,6 +3295,279 @@ async function openUploadRun() {
   }
 }
 
+// ── Upload & Generate ──
+// State is held inside the modal lifecycle: when the operator opens
+// the modal, we POST /upload-generate/start to allocate a run_id;
+// the modal owns the per-slot upload state until the operator
+// clicks Confirm (or Cancel). On Confirm we POST the run trigger
+// and redirect to /runs/<id>. On Cancel we just close the modal —
+// the server-side session expires implicitly (it never spawns
+// anything if /upload-generate/run isn't called).
+let UPGEN_STATE = null; // { runId, items: [{cluster_id, image_ids, topic, image_map}], dropped: Set, total }
+
+function asset_pill_html(asset) {
+  return '<span class="pill ' + asset + '" style="margin-right:6px">' + asset + '</span>';
+}
+
+async function openUploadGenerate() {
+  const items = [];
+  for (const [cid, set] of selection.entries()) {
+    if (!set || set.size === 0) continue;
+    items.push({ cluster_id: cid, image_ids: [...set] });
+  }
+  if (items.length === 0) return;
+  const total = items.reduce((n, it) => n + it.image_ids.length, 0);
+
+  document.getElementById('upgen-summary').textContent =
+    total + ' image' + (total === 1 ? '' : 's') + ' · ' + items.length + ' cluster' + (items.length === 1 ? '' : 's');
+  document.getElementById('upgen-overlay').classList.add('open');
+  const zones = document.getElementById('upgen-zones');
+  zones.innerHTML = '<div class="sub">Preparing run…</div>';
+  document.getElementById('upgen-submit-btn').disabled = true;
+  document.getElementById('upgen-progress').textContent = '';
+
+  let runId;
+  try {
+    const tok = (function(){ try { return sessionStorage.getItem('gw_repoint_bearer_v1') || ''; } catch (_e) { return ''; } })();
+    const headers = tok
+      ? { 'content-type': 'application/json', 'Authorization': 'Bearer ' + tok }
+      : { 'content-type': 'application/json' };
+    const r = await fetch('/upload-generate/start', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ client: SLUG, page_type: SELECTED_PAGE_TYPES, items }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
+    runId = j.run_id;
+  } catch (err) {
+    zones.innerHTML = '<div class="banner err">Failed to start session: ' + escapeHtmlBasic(err && err.message ? err.message : String(err)) + '</div>';
+    return;
+  }
+
+  // Build the per-CLUSTER section DOM. Each cluster becomes a card
+  // with the page topic as a header at the top and that cluster's
+  // dropzones in a grid inside. Visually grouping by cluster makes
+  // (a) it obvious which dropzones belong to the same published page,
+  // and (b) the auto-share-within-cluster behaviour readable at a
+  // glance (drop into one zone in a section → siblings in the same
+  // section fill in). Visual hierarchy: 16px section title, smaller
+  // muted UUID, "auto-fills all" pill on the right.
+  const sections = [];
+  for (const it of items) {
+    const c = clusterById(it.cluster_id);
+    const topic = c ? (c.topic || '(no topic)') : '(unknown cluster)';
+    const imgCount = it.image_ids.length;
+    const hintText = imgCount === 1
+      ? '1 image'
+      : imgCount + ' images · drop once auto-fills all';
+    const headerHtml =
+      '<div class="upgen-cluster-header">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div class="topic" title="' + escapeHtmlBasic(topic) + '">' +
+            escapeHtmlBasic(topic) +
+          '</div>' +
+          '<div class="cid">' + escapeHtmlBasic(it.cluster_id) + '</div>' +
+        '</div>' +
+        '<div class="hint">' + hintText + '</div>' +
+      '</div>';
+
+    // Per-image dropzones for this cluster. Each slot card identifies
+    // which SLOT (cover / thumbnail / etc.) it covers; the dropzone
+    // takes the rest of the card height (flex:1).
+    const cardRows = [];
+    for (const imgId of it.image_ids) {
+      const img = c ? c.images.find(x => x.id === imgId) : null;
+      const asset = img ? img.asset : 'generic';
+      cardRows.push(
+        '<div class="upgen-slot" data-image-id="' + escapeHtmlBasic(imgId) + '" data-cluster-id="' + escapeHtmlBasic(it.cluster_id) + '">' +
+          '<div class="upgen-slot-head">' +
+            asset_pill_html(asset) +
+            '<span style="font-size:11.5px;color:var(--ink-muted);font-weight:500">slot</span>' +
+          '</div>' +
+          '<div class="upgen-dropzone" data-image-id="' + escapeHtmlBasic(imgId) + '" data-cluster-id="' + escapeHtmlBasic(it.cluster_id) + '" style="flex:1">' +
+            '<div class="dz-icon">↑</div>' +
+            '<div class="dz-text">Drop image here</div>' +
+            '<div class="dz-browse-link">or click to browse</div>' +
+            '<div class="dz-sub" style="margin-top:6px">PNG · JPEG · WebP · ≤10 MB</div>' +
+          '</div>' +
+        '</div>'
+      );
+    }
+    const gridHtml = '<div class="upgen-slot-grid">' + cardRows.join('') + '</div>';
+
+    sections.push(
+      '<section class="upgen-cluster-section" data-cluster-id="' + escapeHtmlBasic(it.cluster_id) + '">' +
+        headerHtml +
+        gridHtml +
+      '</section>'
+    );
+  }
+  zones.innerHTML = sections.join('');
+
+  UPGEN_STATE = { runId, items, dropped: new Set(), total };
+  updateUpgenProgress();
+
+  // Bind per-zone interactions.
+  for (const dz of zones.querySelectorAll('.upgen-dropzone')) {
+    dz.addEventListener('click', upgenZoneClick);
+    dz.addEventListener('dragover', upgenDragOver);
+    dz.addEventListener('dragleave', upgenDragLeave);
+    dz.addEventListener('drop', upgenDrop);
+  }
+}
+
+function upgenBackdrop(ev) { if (ev.target === ev.currentTarget) closeUploadGenerate(); }
+function closeUploadGenerate() {
+  document.getElementById('upgen-overlay').classList.remove('open');
+  UPGEN_STATE = null;
+}
+
+function updateUpgenProgress() {
+  if (!UPGEN_STATE) return;
+  const n = UPGEN_STATE.dropped.size;
+  const t = UPGEN_STATE.total;
+  document.getElementById('upgen-progress').textContent = n + ' / ' + t + ' product image' + (t === 1 ? '' : 's') + ' uploaded';
+  document.getElementById('upgen-submit-btn').disabled = n !== t;
+}
+
+function upgenZoneClick(ev) {
+  const dz = ev.currentTarget;
+  const imgId = dz.getAttribute('data-image-id');
+  if (!imgId) return;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/png,image/jpeg,image/webp';
+  input.style.display = 'none';
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (file) await handleUpgenDrop(imgId, file, dz);
+    try { document.body.removeChild(input); } catch (_e) {}
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+function upgenDragOver(ev) { ev.preventDefault(); ev.stopPropagation(); ev.currentTarget.classList.add('dragover'); }
+function upgenDragLeave(ev) { ev.preventDefault(); ev.stopPropagation(); ev.currentTarget.classList.remove('dragover'); }
+async function upgenDrop(ev) {
+  ev.preventDefault(); ev.stopPropagation();
+  ev.currentTarget.classList.remove('dragover');
+  const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (!file) return;
+  const imgId = ev.currentTarget.getAttribute('data-image-id');
+  if (imgId) await handleUpgenDrop(imgId, file, ev.currentTarget);
+}
+
+async function handleUpgenDrop(imageId, file, dz, opts) {
+  if (!UPGEN_STATE) return;
+  opts = opts || {};
+  dz.classList.remove('error');
+  dz.classList.add('uploading');
+  dz.innerHTML =
+    '<div class="dz-icon">⏳</div>' +
+    '<div class="dz-text">Uploading…</div>' +
+    '<div class="dz-progress">' + escapeHtmlBasic(file.name || 'product') + '</div>';
+  try {
+    const url = '/runs/' + UPGEN_STATE.runId + '/product/' + encodeURIComponent(imageId);
+    const headers = { 'x-original-filename': encodeURIComponent(file.name || 'product') };
+    const r = await fetch(url, { method: 'POST', headers, body: file });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    UPGEN_STATE.dropped.add(imageId);
+    // Replace dropzone with thumbnail preview + replace/clear actions.
+    dz.classList.remove('uploading');
+    dz.classList.remove('error');
+    const sharedBadge = opts.skipCascade
+      ? '<span style="font-size:10px;color:var(--ink-faint);margin-left:6px">(shared from sibling)</span>'
+      : '';
+    dz.innerHTML =
+      '<img src="' + escapeHtmlBasic(j.preview_url) + '" style="max-width:100%;max-height:80px;object-fit:contain;border-radius:4px">' +
+      '<div class="dz-text" style="color:var(--ok);margin-top:4px">✓ ' + j.width + '×' + j.height + sharedBadge + '</div>' +
+      '<div style="display:flex;gap:6px;margin-top:4px"><button type="button" class="btn-replace" onclick="event.stopPropagation();upgenReplace(\\'' + imageId + '\\')">Replace</button>' +
+      '<button type="button" class="btn-clear" onclick="event.stopPropagation();upgenClear(\\'' + imageId + '\\')">Clear</button></div>';
+    updateUpgenProgress();
+  } catch (err) {
+    dz.classList.remove('uploading');
+    dz.classList.add('error');
+    dz.innerHTML =
+      '<div class="dz-icon">⚠️</div>' +
+      '<div class="dz-text">Upload failed</div>' +
+      '<div class="dz-err-msg">' + escapeHtmlBasic(err && err.message ? err.message : String(err)) + '</div>';
+    return;
+  }
+
+  // Auto-share within cluster: when the user directly drops a file
+  // into one slot, every OTHER slot in the same cluster that is
+  // still empty gets the same file. The operator can override any
+  // individual slot afterward by dropping a different file into it
+  // (clearing first if needed). We skip slots already filled to
+  // protect any manual customization the operator has done. The
+  // cascade is one-level — sibling uploads pass skipCascade=true so
+  // they don't recursively try to fan out again.
+  if (opts.skipCascade) return;
+  const clusterId = dz.getAttribute('data-cluster-id');
+  if (!clusterId) return;
+  const siblings = document.querySelectorAll(
+    '.upgen-dropzone[data-cluster-id="' + clusterId + '"]'
+  );
+  for (const sib of siblings) {
+    const sibImageId = sib.getAttribute('data-image-id');
+    if (!sibImageId || sibImageId === imageId) continue;
+    if (UPGEN_STATE.dropped.has(sibImageId)) continue;
+    // Fire-and-forget; each sibling updates its own zone independently.
+    handleUpgenDrop(sibImageId, file, sib, { skipCascade: true });
+  }
+}
+
+function upgenReplace(imageId) {
+  const dz = document.querySelector('.upgen-dropzone[data-image-id="' + imageId + '"]');
+  if (dz) { dz.click(); }
+}
+
+async function upgenClear(imageId) {
+  if (!UPGEN_STATE) return;
+  try {
+    await fetch('/runs/' + UPGEN_STATE.runId + '/product/' + encodeURIComponent(imageId), { method: 'DELETE' });
+  } catch (_e) { /* best-effort */ }
+  UPGEN_STATE.dropped.delete(imageId);
+  const dz = document.querySelector('.upgen-dropzone[data-image-id="' + imageId + '"]');
+  if (dz) {
+    dz.classList.remove('uploading', 'error');
+    dz.innerHTML =
+      '<div class="dz-icon">📁</div>' +
+      '<div class="dz-text">Drop product photo</div>' +
+      '<div class="dz-sub">PNG · JPEG · WebP (≤10 MB)</div>';
+  }
+  updateUpgenProgress();
+}
+
+async function upgenSubmit() {
+  if (!UPGEN_STATE) return;
+  const btn = document.getElementById('upgen-submit-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Starting…';
+  try {
+    const tok = (function(){ try { return sessionStorage.getItem('gw_repoint_bearer_v1') || ''; } catch (_e) { return ''; } })();
+    const headers = tok
+      ? { 'content-type': 'application/json', 'Authorization': 'Bearer ' + tok }
+      : { 'content-type': 'application/json' };
+    const r = await fetch('/runs/' + UPGEN_STATE.runId + '/upload-generate/run', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({}),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
+    window.location.href = j.url || ('/runs/' + UPGEN_STATE.runId);
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = 'Upload & Generate →';
+    alert('Failed to start generation: ' + (err && err.message ? err.message : err));
+  }
+}
+
+renderAssetFilter();
 refreshTotals();
 </script>`;
 
@@ -3574,29 +4192,73 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
 
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
   // We reuse the parent's client/page_type so the subprocess loads the
-  // identical graphic_token + project context.
-  const child = startRegen({
-    client: parent.client,
-    clusterIds: [clusterId],
-    imageIds: [imageId],
-    dryRun: false,
-    mock: false,
-    useSavedToken: true,
-    // Pass ALL page types. extractPageTypeFromArgs returned undefined
-    // for blog-only runs (the --page-type arg is omitted for blog) and
-    // for multi-type runs (the comma-joined value matched no single
-    // type), so a service/category card in a multi-type run would
-    // re-resolve against the blog cluster list, find nothing, and the
-    // subprocess would exit 0 with no CSV ("nothing to do"). The
-    // cluster_id + image_id filters in collectImageRecords already
-    // narrow precisely — handing it all three page types just means
-    // the cluster is always in the candidate set whatever its type.
-    pageType: "blog,service,category",
-    provider: extractProviderFromArgs(parent.args),
-    promptOverrideFile,
-    extraInstructionsFile,
-    // No resume — every Regenerate is a fresh Nano Banana generation.
-  });
+  // identical graphic_token + project context. Dispatch differs by
+  // mode: upload-generate runs need to re-composite the same product
+  // file the operator dropped originally, so we spawn the
+  // upload-generate CLI with a one-entry products manifest pointing
+  // at the persisted product file.
+  let child: RunState;
+  if (parent.mode === "upload-generate") {
+    // Locate the persisted product file for this image_id. The
+    // upload-generate session wrote it to
+    // <runOutDir>/runs/<parentRunId>/products/<safe-image-id>.<ext>.
+    // We find by prefix because we don't know the original ext here.
+    const productsDir = path.join(runOutDir(), "runs", parent.id, "products");
+    const safePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+    let productPath: string | null = null;
+    try {
+      const files = await fs.readdir(productsDir);
+      const hit = files.find((f) => f.startsWith(safePrefix));
+      if (hit) productPath = path.join(productsDir, hit);
+    } catch { /* dir gone — fail below */ }
+    if (!productPath) {
+      return sendJson(res, 410, {
+        error: `cannot regenerate ${imageId}: the original product file is no longer on disk at ${productsDir}. The retention sweep may have pruned it, or this run pre-dates the upload-generate feature.`,
+      });
+    }
+    const childRunId = randomUUID().replace(/-/g, "").slice(0, 16);
+    const tmpDir = runOutDir();
+    await fs.mkdir(tmpDir, { recursive: true });
+    const productsManifestPath = path.join(tmpDir, `products-${childRunId}.json`);
+    await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productPath }, null, 2), "utf8");
+    child = startUploadGenerate({
+      client: parent.client,
+      runId: childRunId,
+      pageType: "blog,service,category",
+      clusterIds: [clusterId],
+      imageIds: [imageId],
+      productsManifestPath,
+      provider: extractProviderFromArgs(parent.args),
+      extraInstructionsFile,
+      // No prompt-override-file for upload-generate child regen —
+      // the buildPrompt path always rebuilds (we don't carry the
+      // parent's empty-zone directive forward; it's re-applied
+      // automatically in processOne).
+    });
+  } else {
+    child = startRegen({
+      client: parent.client,
+      clusterIds: [clusterId],
+      imageIds: [imageId],
+      dryRun: false,
+      mock: false,
+      useSavedToken: true,
+      // Pass ALL page types. extractPageTypeFromArgs returned undefined
+      // for blog-only runs (the --page-type arg is omitted for blog) and
+      // for multi-type runs (the comma-joined value matched no single
+      // type), so a service/category card in a multi-type run would
+      // re-resolve against the blog cluster list, find nothing, and the
+      // subprocess would exit 0 with no CSV ("nothing to do"). The
+      // cluster_id + image_id filters in collectImageRecords already
+      // narrow precisely — handing it all three page types just means
+      // the cluster is always in the candidate set whatever its type.
+      pageType: "blog,service,category",
+      provider: extractProviderFromArgs(parent.args),
+      promptOverrideFile,
+      extraInstructionsFile,
+      // No resume — every Regenerate is a fresh Nano Banana generation.
+    });
+  }
 
   // Wait for the subprocess to finish, then read its CSV for the new URL.
   await new Promise<void>((resolve) => {
@@ -3629,16 +4291,30 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   if (!childRow) {
     return sendJson(res, 500, { error: `regen produced no CSV row for ${imageId}`, run_id: child.id });
   }
-  if (!childRow.image_url_new) {
+  // Success check has two valid shapes depending on the run mode:
+  //   regen           → image_url_new is the Replicate signed URL.
+  //                     image_local_path is the downloaded copy on disk.
+  //                     Either one being present means the row succeeded.
+  //   upload-generate → image_url_new is intentionally EMPTY (the
+  //                     composite never has a remote URL). Only
+  //                     image_local_path is populated — that's where
+  //                     the composited PNG lives. So we MUST accept
+  //                     a successful row that has only image_local_path.
+  //
+  // Before this fix, the !image_url_new check fired for every
+  // upload-generate regenerate even when the new composite was
+  // successfully written to disk — operators saw a misleading
+  // "image model returned no output" error after a fully-successful
+  // regenerate.
+  const childSucceeded =
+    childRow.status === "completed" &&
+    ((childRow.image_url_new || "").trim().length > 0
+      || (childRow.image_local_path || "").trim().length > 0);
+  if (!childSucceeded) {
     // The subprocess ran fine (exit 0) but THIS row's image
     // generation failed — regen.ts writes status=failed + the real
     // error into the CSV's `error` column and keeps going (the
-    // never-abort-mid-flight contract). The old handler threw that
-    // error away and returned a generic "no new image URL produced",
-    // leaving the operator with nothing actionable. Surface the
-    // actual cause. Replicate empty-output / timeout is transient
-    // (regen already retries empty output 3×) — a second Regenerate
-    // click usually succeeds, so say so.
+    // never-abort-mid-flight contract). Surface the actual cause.
     const why = (childRow.error || "").trim() || "the image model returned no output";
     return sendJson(res, 502, {
       error: `Regeneration failed for ${imageId}: ${why} — this is usually a transient image-model error (empty output or a slow Replicate prediction). Click Regenerate again to retry.`,
@@ -3681,7 +4357,16 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
-  sendJson(res, 200, { image_url_new: childRow.image_url_new, image_id: imageId, cluster_id: clusterId, run_id: child.id });
+  // Include image_local_path so upload-generate clients (where
+  // image_url_new is always empty) can see the regenerate succeeded
+  // — the client's preview cache-bust logic OR-checks both fields.
+  sendJson(res, 200, {
+    image_url_new: childRow.image_url_new,
+    image_local_path: childRow.image_local_path,
+    image_id: imageId,
+    cluster_id: clusterId,
+    run_id: child.id,
+  });
 }
 
 /**
@@ -4460,7 +5145,10 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
         htmlPath: htmlPath ?? undefined,
         proc: { kill() { /* no-op */ } } as unknown as ChildProcess,
         listeners: new Set(),
-        mode: j.mode === "upload" ? "upload" : "regen",
+        mode:
+          j.mode === "upload" ? "upload"
+          : j.mode === "upload-generate" ? "upload-generate"
+          : "regen",
       };
       RUNS.set(id, state);
       return state;
@@ -6943,6 +7631,382 @@ async function uploadRunImageDelete(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Upload-&-Generate pipeline. Strictly additive — never touches the
+// regen or upload paths. Per-image product files are dropped into
+// runs/<id>/products/, then the upload-generate CLI is spawned and
+// composites them into AI-generated backgrounds. The Apply pipeline
+// downstream is shared with regen/upload — no separate publish path.
+//
+// Endpoints:
+//   POST   /upload-generate/start        — body: { client, page_type,
+//                                          items[{cluster_id, image_ids}] }.
+//                                          Allocates run_id + products dir.
+//                                          Returns { run_id }.
+//   POST   /runs/<id>/product/<imgid>    — raw image bytes. Validates via
+//                                          sharp (reuses uploadRun helpers).
+//   DELETE /runs/<id>/product/<imgid>    — clears the dropped product file.
+//   POST   /runs/<id>/upload-generate/run— spawn the CLI now that all
+//                                          product files are in.
+// ────────────────────────────────────────────────────────────────────────
+
+interface UploadGenerateSession {
+  runId: string;
+  client: string;
+  pageTypes: ("blog" | "service" | "category")[];
+  items: Array<{ cluster_id: string; image_ids: string[] }>;
+  startedAt: string;
+  /** image_id → absolute path of the persisted product file. */
+  products: Map<string, string>;
+}
+/**
+ * Pre-spawn state for upload-generate runs. The skeleton exists between
+ * /upload-generate/start (when we mint the run_id + dirs) and
+ * /upload-generate/run (when we spawn the CLI). After spawn, the
+ * RunState in RUNS owns the lifecycle and this Map entry is cleared.
+ *
+ * Survives a server restart? No — the operator would have to start over
+ * if the container restarts mid-upload. That's acceptable because the
+ * upload-and-spawn window is seconds; if the container restarts in
+ * that window, the operator's drops are gone anyway (the product files
+ * land on the volume, but the manifest hasn't been written, so the run
+ * isn't reconstructable). We don't try to recover from that state.
+ */
+const UPGEN_SESSIONS = new Map<string, UploadGenerateSession>();
+
+function productsDirFor(runId: string): string {
+  return path.join(runOutDir(), "runs", runId, "products");
+}
+
+function safeProductFilename(imageId: string, ext: string): string {
+  return `${imageId.replace(/[^a-zA-Z0-9._-]+/g, "_")}.${ext}`;
+}
+
+async function uploadGenerateStartHandler(req: IncomingMessage, res: ServerResponse) {
+  type Body = {
+    client?: string;
+    page_type?: string;
+    items?: Array<{ cluster_id?: string; image_ids?: string[] }>;
+  };
+  const body = (await readApplyBody(req)) as Body | null;
+  if (!body || !body.client) return sendJson(res, 400, { error: "client required" });
+  if (!resolveClient(body.client)) return sendJson(res, 400, { error: "unknown client" });
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  const cleaned: Array<{ cluster_id: string; image_ids: string[] }> = [];
+  const allImageIds = new Set<string>();
+  for (const it of items) {
+    const cid = (it.cluster_id ?? "").trim();
+    const ids = Array.isArray(it.image_ids) ? it.image_ids.filter((s): s is string => typeof s === "string" && s.length > 0) : [];
+    if (!cid || ids.length === 0) continue;
+    cleaned.push({ cluster_id: cid, image_ids: ids });
+    for (const id of ids) allImageIds.add(id);
+  }
+  if (cleaned.length === 0) {
+    return sendJson(res, 400, { error: "items must include at least one cluster_id + image_id" });
+  }
+
+  const ptRaw = (body.page_type ?? "blog").split(",").map((s) => s.trim()).filter(Boolean);
+  const allowed = new Set<string>(["blog", "service", "category"]);
+  const pageTypes = ptRaw.filter((p) => allowed.has(p)) as ("blog" | "service" | "category")[];
+  if (pageTypes.length === 0) pageTypes.push("blog");
+
+  // 16 hex matches the existing upload-mode runId shape and the
+  // /^([a-f0-9]+)$/ matcher the route patterns already use.
+  const runId = randomUUID().replace(/-/g, "").slice(0, 16);
+  await fs.mkdir(productsDirFor(runId), { recursive: true });
+
+  UPGEN_SESSIONS.set(runId, {
+    runId,
+    client: body.client,
+    pageTypes,
+    items: cleaned,
+    startedAt: new Date().toISOString(),
+    products: new Map(),
+  });
+
+  // Stamp operator email so the recent-runs "Run by" column resolves
+  // even if the operator never reaches the CLI-spawn step (e.g.
+  // abandons the modal mid-upload). Best-effort.
+  void writeRunMeta(runId, {
+    started_by_email: readOperatorEmail(req),
+    started_by_set_at: new Date().toISOString(),
+  });
+
+  sendJson(res, 200, {
+    run_id: runId,
+    expected_image_ids: [...allImageIds],
+    product_upload_url_template: `/runs/${runId}/product/{image_id}`,
+  });
+}
+
+async function uploadGenerateProductPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) return sendJson(res, 404, { error: `no upload-generate session for run ${runId} (already spawned or never started)` });
+
+  // Verify image_id is in the session's picked set so a poisoned URL
+  // can't drop arbitrary files.
+  let known = false;
+  for (const it of session.items) {
+    if (it.image_ids.includes(imageId)) { known = true; break; }
+  }
+  if (!known) {
+    return sendJson(res, 400, { error: `image_id ${imageId} is not in the picked set for this session` });
+  }
+
+  // Same 10MB / Content-Length precheck as upload-mode.
+  const claimedLen = Number.parseInt(String(req.headers["content-length"] ?? "0"), 10);
+  if (Number.isFinite(claimedLen) && claimedLen > 10 * 1024 * 1024) {
+    return sendJson(res, 413, { error: `file too large (${(claimedLen / 1024 / 1024).toFixed(1)} MB; max 10 MB)` });
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let aborted = false;
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      total += buf.length;
+      if (total > 10 * 1024 * 1024) { aborted = true; break; }
+      chunks.push(buf);
+    }
+  } catch (err) {
+    return sendJson(res, 500, { error: `upload stream failed: ${(err as Error).message}` });
+  }
+  if (aborted) return sendJson(res, 413, { error: "file too large (>10 MB) — upload aborted mid-stream" });
+  if (total === 0) return sendJson(res, 400, { error: "empty upload (0 bytes)" });
+  const raw = Buffer.concat(chunks, total);
+
+  // Reuse the canonicalisation helper from upload-mode. Aspect
+  // mismatch is not a concern here (the product can be any shape —
+  // the compositor fit-inside resizes it into the slot's zone), so we
+  // pass `null` for expectedAspect.
+  const { validateAndCanonicalise } = await import("./uploadRun.js");
+  const v = await validateAndCanonicalise(raw, null);
+  if (!v.ok) return sendJson(res, v.status, { error: v.error });
+
+  // Wipe any previous product for this image_id (re-drops) so we
+  // never have two files for the same slot.
+  const dir = productsDirFor(runId);
+  try {
+    const existing = await fs.readdir(dir);
+    const prefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+    for (const f of existing) {
+      if (f.startsWith(prefix)) {
+        try { await fs.rm(path.join(dir, f), { force: true }); } catch { /* */ }
+      }
+    }
+  } catch { /* dir may not exist yet — recreate below */ }
+  await fs.mkdir(dir, { recursive: true });
+
+  const finalPath = path.join(dir, safeProductFilename(imageId, v.ext));
+  await fs.writeFile(finalPath, v.bytes);
+  session.products.set(imageId, finalPath);
+
+  sendJson(res, 200, {
+    ok: true,
+    image_id: imageId,
+    width: v.width,
+    height: v.height,
+    mime: v.mime,
+    size_bytes: v.bytes.length,
+    sha256: v.sha256,
+    preview_url: `/upload-generate/${runId}/product/${encodeURIComponent(imageId)}?t=${Date.now()}`,
+  });
+}
+
+async function uploadGenerateProductDelete(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) return sendJson(res, 404, { error: `no upload-generate session for run ${runId}` });
+  const dir = productsDirFor(runId);
+  try {
+    const existing = await fs.readdir(dir);
+    const prefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+    for (const f of existing) {
+      if (f.startsWith(prefix)) {
+        try { await fs.rm(path.join(dir, f), { force: true }); } catch { /* */ }
+      }
+    }
+  } catch { /* */ }
+  session.products.delete(imageId);
+  sendJson(res, 200, { ok: true });
+}
+
+/**
+ * Preview a dropped product file (the modal renders this as the
+ * thumbnail for each zone after a successful drop). Streams the
+ * actual file from the products dir.
+ */
+async function uploadGenerateProductPreview(
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) { send(res, 404, "text/plain", "no session"); return; }
+  const p = session.products.get(imageId);
+  if (!p) { send(res, 404, "text/plain", "no product yet"); return; }
+  try {
+    const stat = statSync(p);
+    if (!stat.isFile()) { send(res, 404, "text/plain", "not a file"); return; }
+    const ext = extOf(p);
+    res.writeHead(200, {
+      "content-type": IMAGE_CT[ext] ?? "application/octet-stream",
+      "content-length": String(stat.size),
+      "cache-control": "private, max-age=60",
+    });
+    createReadStream(p).pipe(res);
+  } catch {
+    send(res, 404, "text/plain", "not found");
+  }
+}
+
+function startUploadGenerate(opts: {
+  client: string;
+  runId: string;
+  pageType: string;
+  clusterIds: string[];
+  imageIds: string[];
+  productsManifestPath: string;
+  provider?: string;
+  extraInstructionsFile?: string;
+  promptOverridesFile?: string;
+}): RunState {
+  const args = [
+    "tsx", "src/cli.ts", "upload-generate",
+    "--client", opts.client,
+    "--run-id", opts.runId,
+    "--products-manifest", opts.productsManifestPath,
+  ];
+  if (opts.pageType && opts.pageType !== "blog") args.push("--page-type", opts.pageType);
+  if (opts.clusterIds.length) args.push("--cluster-ids", opts.clusterIds.join(","));
+  if (opts.imageIds.length) args.push("--image-ids", opts.imageIds.join(","));
+  if (opts.provider) args.push("--provider", opts.provider);
+  if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
+  if (opts.promptOverridesFile) args.push("--prompt-overrides-file", opts.promptOverridesFile);
+
+  const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
+
+  const state: RunState = {
+    id: opts.runId, client: opts.client, args, startedAt: new Date().toISOString(),
+    log: [], done: false, exitCode: null, proc, listeners: new Set(),
+    mode: "upload-generate",
+  };
+  RUNS.set(opts.runId, state);
+
+  const ondata = (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    state.log.push(text);
+    const csv = text.match(/upload-generate: csv=(.+?)\n/);
+    if (csv && csv[1]) state.csvPath = csv[1].trim();
+    const html = text.match(/upload-generate: html=(.+?)\n/);
+    if (html && html[1]) state.htmlPath = html[1].trim();
+    for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
+  };
+  proc.stdout?.on("data", ondata);
+  proc.stderr?.on("data", ondata);
+  proc.on("close", (code) => {
+    state.done = true;
+    state.exitCode = code;
+    for (const l of state.listeners) {
+      l.write(`event: end\ndata: ${JSON.stringify({ code, csvPath: state.csvPath, htmlPath: state.htmlPath })}\n\n`);
+      l.end();
+    }
+    state.listeners.clear();
+  });
+  return state;
+}
+
+async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerResponse, runId: string) {
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) return sendJson(res, 404, { error: `no upload-generate session for run ${runId}` });
+
+  // Every picked image_id must have a product file. Bail with a clear
+  // list of missing slots so the modal can highlight them.
+  const expected: string[] = [];
+  for (const it of session.items) for (const id of it.image_ids) expected.push(id);
+  const missing = expected.filter((id) => !session.products.has(id));
+  if (missing.length > 0) {
+    return sendJson(res, 422, {
+      error: `${missing.length} image(s) still need a product file dropped before generation can start`,
+      missing_image_ids: missing,
+    });
+  }
+
+  type Body = { extra_instructions?: string; prompt_overrides?: unknown; provider?: string };
+  let body: Body = {};
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (chunks.length > 0) body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch { /* tolerate empty body — common case */ }
+
+  // Persist the products manifest to disk so the subprocess can read it.
+  const tmpDir = runOutDir();
+  await fs.mkdir(tmpDir, { recursive: true });
+  const manifestPath = path.join(tmpDir, `products-${runId}.json`);
+  const productsObj: Record<string, string> = {};
+  for (const [id, p] of session.products.entries()) productsObj[id] = p;
+  await fs.writeFile(manifestPath, JSON.stringify(productsObj, null, 2), "utf8");
+
+  let extraInstructionsFile: string | undefined;
+  if (typeof body.extra_instructions === "string" && body.extra_instructions.trim().length > 0) {
+    extraInstructionsFile = path.join(tmpDir, `extra-upgen-${runId}-${Date.now()}.txt`);
+    await fs.writeFile(extraInstructionsFile, body.extra_instructions.trim(), "utf8");
+  }
+  let promptOverridesFile: string | undefined;
+  if (body.prompt_overrides && typeof body.prompt_overrides === "object") {
+    const allowed = new Set(["cover", "infographic", "page", "generic"]);
+    const cleaned: Record<string, { system?: string; user?: string }> = {};
+    for (const [k, v] of Object.entries(body.prompt_overrides as Record<string, unknown>)) {
+      if (!allowed.has(k) || !v || typeof v !== "object") continue;
+      const inner = v as Record<string, unknown>;
+      const entry: { system?: string; user?: string } = {};
+      if (typeof inner.system === "string" && inner.system.trim().length > 0) entry.system = inner.system;
+      if (typeof inner.user === "string" && inner.user.trim().length > 0) entry.user = inner.user;
+      if (Object.keys(entry).length > 0) cleaned[k] = entry;
+    }
+    if (Object.keys(cleaned).length > 0) {
+      promptOverridesFile = path.join(tmpDir, `prompt-overrides-upgen-${runId}.json`);
+      await fs.writeFile(promptOverridesFile, JSON.stringify(cleaned), "utf8");
+    }
+  }
+
+  const clusterIds = session.items.map((it) => it.cluster_id);
+  const imageIds = expected;
+  const pageTypeArg = session.pageTypes.join(",");
+
+  const state = startUploadGenerate({
+    client: session.client,
+    runId,
+    pageType: pageTypeArg,
+    clusterIds,
+    imageIds,
+    productsManifestPath: manifestPath,
+    provider: typeof body.provider === "string" ? body.provider : undefined,
+    extraInstructionsFile,
+    promptOverridesFile,
+  });
+
+  // Session has done its job — the spawn owns the run from here.
+  // Keep the session a moment longer for the run page's preview
+  // endpoint to keep working until the CLI's own composited images
+  // are ready; we delete on subprocess close.
+  state.proc.once("close", () => UPGEN_SESSIONS.delete(runId));
+
+  sendJson(res, 200, { run_id: runId, url: `/runs/${runId}` });
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Server bootstrap
 // ────────────────────────────────────────────────────────────────────────
 
@@ -7031,6 +8095,21 @@ export function startWebServer(port: number): void {
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
       // Upload-run pipeline. Strictly additive — never touches /regen.
       if (method === "POST" && p === "/upload-run/start") return await uploadRunStartHandler(req, res);
+      // Upload-&-Generate pipeline.
+      if (method === "POST" && p === "/upload-generate/start") return await uploadGenerateStartHandler(req, res);
+      const upgenProdMatch = /^\/runs\/([a-f0-9]+)\/product\/(.+)$/.exec(p);
+      if (upgenProdMatch && upgenProdMatch[1] && upgenProdMatch[2]) {
+        if (method === "POST")   return await uploadGenerateProductPost(req, res, upgenProdMatch[1], decodeURIComponent(upgenProdMatch[2]));
+        if (method === "DELETE") return await uploadGenerateProductDelete(req, res, upgenProdMatch[1], decodeURIComponent(upgenProdMatch[2]));
+      }
+      const upgenProdPreviewMatch = /^\/upload-generate\/([a-f0-9]+)\/product\/(.+)$/.exec(p);
+      if (method === "GET" && upgenProdPreviewMatch && upgenProdPreviewMatch[1] && upgenProdPreviewMatch[2]) {
+        return await uploadGenerateProductPreview(res, upgenProdPreviewMatch[1], decodeURIComponent(upgenProdPreviewMatch[2]));
+      }
+      const upgenRunMatch = /^\/runs\/([a-f0-9]+)\/upload-generate\/run$/.exec(p);
+      if (method === "POST" && upgenRunMatch && upgenRunMatch[1]) {
+        return await uploadGenerateRunHandler(req, res, upgenRunMatch[1]);
+      }
       const uploadMatch = /^\/runs\/([a-f0-9]+)\/upload\/(.+)$/.exec(p);
       if (uploadMatch && uploadMatch[1] && uploadMatch[2]) {
         if (method === "POST")   return await uploadRunImagePost(req, res, uploadMatch[1], decodeURIComponent(uploadMatch[2]));
