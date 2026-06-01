@@ -78,7 +78,7 @@ export interface UploadValidationResult {
   aspect: string;
   sha256: string;
   /** Filled when the dropped file's aspect doesn't match the slot's
-   * expected aspect (within 5%). Non-fatal — UI surfaces it as a
+   * expected aspect (within 20%). Non-fatal — UI surfaces it as a
    * yellow banner but accepts the upload. */
   aspect_warning?: string;
 }
@@ -192,16 +192,12 @@ export async function validateAndCanonicalise(
     const actual = finalW / finalH;
     if (Number.isFinite(target)) {
       const delta = Math.abs(actual - target) / target;
-      // Tiered handling:
-      //   0%-8%    silent accept (e.g. 1920x1080 → 16:9).
-      //   8%-40%   warn (yellow banner) but ACCEPT. This band covers
-      //            every reasonable landscape-to-landscape crop the
-      //            operator might supply — 16:9 into a 3:2 thumbnail
-      //            slot is 18.5%, 4:3 into 16:9 is 25%, 1:1 into 3:2
-      //            is 33%. The downstream renderer fits/covers these;
-      //            blocking them just stops legitimate uploads (the
-      //            old 15% ceiling rejected the very common 16:9→3:2
-      //            thumbnail case and made uploads "not work").
+      // Tiered handling (relaxed to a 20% silent band):
+      //   0%-20%   silent accept. Covers every reasonable
+      //            landscape-to-landscape crop an operator supplies
+      //            (16:9 into 3:2 is 18.5%) without nagging them.
+      //   20%-40%  warn (yellow banner) but ACCEPT — the renderer
+      //            fits/covers these (4:3→16:9 is 25%, 1:1→3:2 is 33%).
       //   >40%     REJECT. Only genuinely-wrong shapes land here —
       //            a square or portrait image dropped into a wide
       //            slot (1:1→16:9 is 44%, 9:16 portrait is far worse).
@@ -213,7 +209,7 @@ export async function validateAndCanonicalise(
           error: `aspect mismatch too large — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). That's not a crop, it's the wrong shape (a square or portrait image into a wide slot). Re-export landscape to match before re-dropping.`,
         };
       }
-      if (delta > 0.08) {
+      if (delta > 0.20) {
         aspectWarning = `aspect mismatch — slot expects ${expectedAspect}, you uploaded ${finalW}×${finalH} (~${aspectStr}, ${(delta * 100).toFixed(0)}% off). Accepted; the live page will fit/cover the difference.`;
       }
     }
