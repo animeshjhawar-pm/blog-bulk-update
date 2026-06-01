@@ -62,6 +62,20 @@ export class ReplicateGenerationError extends Error {
   }
 }
 
+/**
+ * Replicate has several wordings for the same transient "the model
+ * came back without any image bytes" failure — sometimes it surfaces
+ * as a succeeded prediction with no output URL, sometimes as a 200
+ * response with `error: "No image content found in response"`, and
+ * sometimes as a failed prediction whose error text reads the same.
+ * All three are retry-on-fresh-prediction territory; collapse them
+ * into one predicate so the retry loop catches every variant.
+ */
+function isTransientEmptyOutputMessage(msg: string | null | undefined): boolean {
+  if (!msg) return false;
+  return /no image content found in response|output was empty/i.test(msg);
+}
+
 // Polling budget. Historically this was 280s — tuned to fit inside
 // Vercel's 300s function cap. Railway has no such constraint and
 // nano-banana-pro can spike past 280s under Replicate load; failing
@@ -298,7 +312,7 @@ export async function generateImage(params: GenerateImageParams): Promise<Replic
     } catch (err) {
       const isEmpty =
         err instanceof ReplicateGenerationError &&
-        /output was empty/.test(err.message);
+        isTransientEmptyOutputMessage(err.message);
       if (!isEmpty) throw err;
       lastEmptyError = err;
       process.stderr.write(
@@ -356,7 +370,20 @@ async function runSinglePrediction(
         output?: string | string[];
         error?: string;
       };
-      if (json.error) throw new Error(`Replicate error: ${json.error}`);
+      if (json.error) {
+        // "No image content found in response" is Replicate's wording
+        // for the same transient empty-output failure mode we already
+        // retry on the succeeded-with-no-URL path. Re-classify it as
+        // a ReplicateGenerationError so the outer retry loop picks it
+        // up instead of bubbling it straight to the operator.
+        if (isTransientEmptyOutputMessage(json.error)) {
+          throw new ReplicateGenerationError(
+            `Replicate: ${json.error} (output was empty)`,
+            json.id,
+          );
+        }
+        throw new Error(`Replicate error: ${json.error}`);
+      }
       if (!json.id)   throw new Error("Replicate returned no prediction ID");
       // Happy path: `Prefer: wait` held the connection until the prediction
       // completed — no polling needed.
@@ -423,8 +450,19 @@ async function runSinglePrediction(
     }
 
     if (status.status === "failed" || status.status === "canceled") {
+      // Same re-classification as the create-prediction path — a
+      // failed prediction whose error reads as "No image content
+      // found in response" is the transient empty-output mode, not a
+      // real refusal, and should be retried via the outer loop.
+      const msg = status.error ?? "no error message";
+      if (isTransientEmptyOutputMessage(msg)) {
+        throw new ReplicateGenerationError(
+          `Replicate prediction ${status.status}: ${msg} (output was empty)`,
+          predictionId,
+        );
+      }
       throw new ReplicateGenerationError(
-        `Replicate prediction ${status.status}: ${status.error ?? "no error message"}`,
+        `Replicate prediction ${status.status}: ${msg}`,
         predictionId,
       );
     }
