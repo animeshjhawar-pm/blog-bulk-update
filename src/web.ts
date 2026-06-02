@@ -7674,7 +7674,11 @@ interface UploadGenerateSession {
 const UPGEN_SESSIONS = new Map<string, UploadGenerateSession>();
 
 function productsDirFor(runId: string): string {
-  return path.join(runOutDir(), "runs", runId, "products");
+  // Flatter than `runs/<id>/products` — keeps the path one level above
+  // the volume root so a single mkdir(recursive) is all that's needed,
+  // and the products dir doesn't depend on `runs/<id>/` existing
+  // (which other code paths may or may not have created yet).
+  return path.join(runOutDir(), `products-${runId}`);
 }
 
 function safeProductFilename(imageId: string, ext: string): string {
@@ -7713,22 +7717,47 @@ async function uploadGenerateStartHandler(req: IncomingMessage, res: ServerRespo
   // 16 hex matches the existing upload-mode runId shape and the
   // /^([a-f0-9]+)$/ matcher the route patterns already use.
   const runId = randomUUID().replace(/-/g, "").slice(0, 16);
-  try {
-    // mkdir parents first so an ENOENT/EACCES on the volume root
-    // (e.g. /data not mounted yet after a redeploy) surfaces a
-    // targeted message that names the path, instead of an opaque
-    // ENOENT bubbling up through the outer error handler.
-    await fs.mkdir(runOutDir(), { recursive: true });
-    await fs.mkdir(productsDirFor(runId), { recursive: true });
-  } catch (err) {
-    const msg = (err as Error).message;
-    process.stderr.write(`upload-generate/start: mkdir failed (${msg})\n`);
-    return sendJson(res, 500, {
-      error:
-        `Couldn't create products directory under ${productsDirFor(runId)}: ${msg}. ` +
-        `Most likely the runtime volume (RUN_OUT_DIR=${process.env.RUN_OUT_DIR ?? "(unset)"}) ` +
-        `is not mounted or not writable. Check the Railway volume on this deploy.`,
-    });
+
+  // Step-by-step mkdir with stat diagnostics. Recursive mkdir was
+  // failing with ENOENT on a path it should have been able to create
+  // (the volume's mid-tier dirs in a fresh container), and the opaque
+  // recursive error didn't tell us which level. Walking it manually
+  // lets us name the exact failure point and inspect what's actually
+  // on disk.
+  const rootDir = runOutDir();
+  const productsDir = productsDirFor(runId);
+  const diag: string[] = [];
+  for (const dir of [rootDir, productsDir]) {
+    try {
+      const st = await fs.stat(dir).catch(() => null);
+      if (st && !st.isDirectory()) {
+        return sendJson(res, 500, {
+          error:
+            `${dir} exists but is not a directory (mode=${st.mode.toString(8)}, type=${
+              st.isFile() ? "file" : "other"
+            }). Cannot proceed. Remove the file or fix the volume mount.`,
+        });
+      }
+      if (!st) {
+        await fs.mkdir(dir, { recursive: true });
+        diag.push(`created ${dir}`);
+      } else {
+        diag.push(`exists ${dir}`);
+      }
+    } catch (err) {
+      const msg = (err as Error).message;
+      process.stderr.write(
+        `upload-generate/start: mkdir step failed at ${dir} (${msg}); diag so far: ${diag.join(" | ")}\n`,
+      );
+      return sendJson(res, 500, {
+        error:
+          `Couldn't create ${dir}: ${msg}. ` +
+          `Diagnostic: ${diag.join(" | ") || "(no prior step)"}. ` +
+          `RUN_OUT_DIR=${process.env.RUN_OUT_DIR ?? "(unset)"}. ` +
+          `Likely cause: the Railway volume isn't mounted at the expected path on this deploy, ` +
+          `or the mount is read-only. Check the volume settings on the service.`,
+      });
+    }
   }
 
   UPGEN_SESSIONS.set(runId, {
