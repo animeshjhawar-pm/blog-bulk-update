@@ -7713,7 +7713,23 @@ async function uploadGenerateStartHandler(req: IncomingMessage, res: ServerRespo
   // 16 hex matches the existing upload-mode runId shape and the
   // /^([a-f0-9]+)$/ matcher the route patterns already use.
   const runId = randomUUID().replace(/-/g, "").slice(0, 16);
-  await fs.mkdir(productsDirFor(runId), { recursive: true });
+  try {
+    // mkdir parents first so an ENOENT/EACCES on the volume root
+    // (e.g. /data not mounted yet after a redeploy) surfaces a
+    // targeted message that names the path, instead of an opaque
+    // ENOENT bubbling up through the outer error handler.
+    await fs.mkdir(runOutDir(), { recursive: true });
+    await fs.mkdir(productsDirFor(runId), { recursive: true });
+  } catch (err) {
+    const msg = (err as Error).message;
+    process.stderr.write(`upload-generate/start: mkdir failed (${msg})\n`);
+    return sendJson(res, 500, {
+      error:
+        `Couldn't create products directory under ${productsDirFor(runId)}: ${msg}. ` +
+        `Most likely the runtime volume (RUN_OUT_DIR=${process.env.RUN_OUT_DIR ?? "(unset)"}) ` +
+        `is not mounted or not writable. Check the Railway volume on this deploy.`,
+    });
+  }
 
   UPGEN_SESSIONS.set(runId, {
     runId,
@@ -8216,7 +8232,12 @@ export function startWebServer(port: number): void {
       if (res.headersSent) {
         try { res.destroy(); } catch { /* */ }
       } else {
-        send(res, 500, "text/plain", `error: ${msg}`);
+        // Return JSON, not text. Every fetch() caller in this app does
+        // r.json() on the response; a text/plain body produced a
+        // confusing "Unexpected token … is not valid JSON" client-side
+        // error that masked the real backend message. Now the modal
+        // banners can surface the actual error verbatim.
+        send(res, 500, "application/json", JSON.stringify({ error: msg }));
       }
     }
   });
