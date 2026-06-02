@@ -269,6 +269,30 @@ export async function sweepRunRetention(
     }
   } catch { /* runsRoot may not exist yet */ }
 
+  // ── 2b. Upload-&-Generate `products-<runId>/` dirs ────────────────
+  // The new Upload & Generate flow drops operator product photos under
+  // <outDir>/products-<runId>/. They're typically a few MB each and
+  // accumulate fast on an active deploy. If the run's manifest is no
+  // longer around (fully evicted, or the operator abandoned the modal
+  // before /upload-generate/run spawned), the products dir is unowned
+  // and reclaimable. We DON'T age-prune the dirs that still have a
+  // live manifest — they're tied to a viewable run.
+  try {
+    const all = await fs.readdir(outDir, { withFileTypes: true });
+    for (const d of all) {
+      if (!d.isDirectory()) continue;
+      const m = /^products-([a-f0-9]+)$/.exec(d.name);
+      if (!m) continue;
+      const runId = m[1]!;
+      if (remainingRunIds.has(runId)) continue;
+      const p = path.join(outDir, d.name);
+      const sz = await dirSize(p);
+      await rmrfIfExists(p);
+      result.orphanRunsDeleted++;
+      result.bytesFreed += sz;
+    }
+  } catch { /* outDir may not exist yet */ }
+
   // ── 3. Legacy out/images/<slug>/<file> cleanup ────────────────────
   // Files written by older versions (and any future CLI runs that
   // don't pass --run-id) live here. Build the set of paths currently

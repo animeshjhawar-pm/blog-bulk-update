@@ -7685,6 +7685,108 @@ function safeProductFilename(imageId: string, ext: string): string {
   return `${imageId.replace(/[^a-zA-Z0-9._-]+/g, "_")}.${ext}`;
 }
 
+/**
+ * GET /admin/disk — report what the volume currently holds. Tiny
+ * non-mutating helper so the operator can see why the disk is full
+ * before deciding what to prune. Lists the top-level directories
+ * under runOutDir() with their sizes and counts.
+ */
+async function adminDiskHandler(_req: IncomingMessage, res: ServerResponse) {
+  const root = runOutDir();
+  const out: Array<{ name: string; bytes: number; kind: string }> = [];
+  let totalBytes = 0;
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(root);
+  } catch (err) {
+    return sendJson(res, 500, { error: `cannot read ${root}: ${(err as Error).message}` });
+  }
+  for (const name of entries) {
+    const full = path.join(root, name);
+    try {
+      const st = await fs.stat(full);
+      let bytes = 0;
+      let kind = "file";
+      if (st.isDirectory()) {
+        kind = "dir";
+        const walk = async (p: string): Promise<number> => {
+          let total = 0;
+          const items = await fs.readdir(p, { withFileTypes: true }).catch(() => []);
+          for (const it of items) {
+            const cp = path.join(p, it.name);
+            if (it.isDirectory()) total += await walk(cp);
+            else total += await fs.stat(cp).then((s) => s.size).catch(() => 0);
+          }
+          return total;
+        };
+        bytes = await walk(full);
+      } else {
+        bytes = st.size;
+      }
+      out.push({ name, bytes, kind });
+      totalBytes += bytes;
+    } catch { /* skip unreadable */ }
+  }
+  out.sort((a, b) => b.bytes - a.bytes);
+  sendJson(res, 200, {
+    root,
+    total_bytes: totalBytes,
+    total_mb: +(totalBytes / 1024 / 1024).toFixed(1),
+    entries: out.slice(0, 50).map((e) => ({
+      name: e.name,
+      kind: e.kind,
+      bytes: e.bytes,
+      mb: +(e.bytes / 1024 / 1024).toFixed(2),
+    })),
+    truncated: out.length > 50,
+    config: loadRetentionConfig(),
+  });
+}
+
+/**
+ * POST /admin/sweep — run a retention pass NOW with optional
+ * one-off tighter caps in the body. Useful to bring the disk down
+ * fast without waiting 30 minutes for the scheduled tick, and
+ * without redeploying with new env defaults.
+ *
+ *   body: { image_max_runs?: number, image_retention_hours?: number,
+ *           max_runs?: number, retention_hours?: number }
+ *   any field omitted falls back to loadRetentionConfig()'s value.
+ */
+async function adminSweepHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as {
+    image_max_runs?: unknown;
+    image_retention_hours?: unknown;
+    max_runs?: unknown;
+    retention_hours?: unknown;
+  } | null;
+  const base = loadRetentionConfig();
+  const numOr = (v: unknown, fallback: number): number => {
+    const n = typeof v === "number" ? v : typeof v === "string" ? Number.parseFloat(v) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  const cfg = {
+    ...base,
+    maxRunsKept: numOr(body?.max_runs, base.maxRunsKept),
+    retentionHours: numOr(body?.retention_hours, base.retentionHours),
+    imageMaxRunsKept: numOr(body?.image_max_runs, base.imageMaxRunsKept),
+    imageRetentionHours: numOr(body?.image_retention_hours, base.imageRetentionHours),
+  };
+  try {
+    const r = await sweepRunRetention(cfg);
+    sendJson(res, 200, {
+      ok: true,
+      cfg_used: cfg,
+      result: {
+        ...r,
+        bytes_freed_mb: +(r.bytesFreed / 1024 / 1024).toFixed(1),
+      },
+    });
+  } catch (err) {
+    sendJson(res, 500, { error: (err as Error).message });
+  }
+}
+
 async function uploadGenerateStartHandler(req: IncomingMessage, res: ServerResponse) {
   type Body = {
     client?: string;
@@ -8171,6 +8273,8 @@ export function startWebServer(port: number): void {
         return await applyRunHandler(req, res);
       if (method === "POST" && p === "/api/revert/cluster") return await revertClusterHandler(req, res);
       if (method === "POST" && p === "/api/revert/run")     return await revertRunHandler(req, res);
+      if (method === "POST" && p === "/admin/sweep")     return await adminSweepHandler(req, res);
+      if (method === "GET"  && p === "/admin/disk")      return await adminDiskHandler(req, res);
       if (method === "POST" && p === "/api/token")        return await tokenSetHandler(req, res);
       if (method === "POST" && p === "/api/token/clear")  return await tokenClearHandler(req, res);
       if (method === "GET"  && p === "/api/token/status") return sendJson(res, 200, { status: tokenStatusFromHeader(req) });
