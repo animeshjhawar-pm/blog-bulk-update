@@ -1,6 +1,6 @@
 import { scrapeClientSite } from "./firecrawl.js";
 import { callPortkey } from "./portkey.js";
-import { loadToken, saveToken, type GraphicToken } from "./tokens.js";
+import { loadToken, loadOperatorToken, saveToken, type GraphicToken } from "./tokens.js";
 import { lookupProjectGraphicToken } from "./db.js";
 import { interpolate } from "./interpolate.js";
 import {
@@ -72,7 +72,7 @@ export async function runExtractTokenCli(params: {
   return { token, tokenPath: target };
 }
 
-export type TokenSource = "live" | "saved" | "db";
+export type TokenSource = "live" | "saved" | "db" | "operator";
 
 export interface ResolveTokenParams {
   slug: string;
@@ -83,25 +83,49 @@ export interface ResolveTokenParams {
 }
 
 /**
- * Resolution order (DB-first, with the legacy paths kept as fallbacks):
+ * Resolution order (runtime override beats everything; DB beats bundled
+ * defaults; live extract is the last resort):
  *
- *   1. `projects.graphic_token` JSONB. This is the schema's source of
- *      truth — it's populated by the upstream content pipeline and
- *      kept in sync per project. Preferred for every run.
+ *   1. OPERATOR layer — `<OPERATOR_DIR>/<slug>.json`. The workspace
+ *      dashboard's "Save token" writes here. If the operator edited
+ *      the graphic_token mid-run, this is what they want used —
+ *      otherwise their dashboard change does nothing.
  *
- *   2. (only when --use-saved-token) the on-disk file
- *      `graphic-tokens/<slug>.json`. Kept so the PM-iteration mode
- *      still works against pinned files.
+ *   2. `projects.graphic_token` JSONB in the DB. The schema's source
+ *      of truth, populated by the upstream content pipeline.
  *
- *   3. live Firecrawl + Portkey extraction. The original Mode A path,
- *      now only reached when the DB has no graphic_token AND the run
- *      didn't request a saved file. Existence-of-this-fallback is the
- *      reason we did NOT delete extractToken altogether.
+ *   3. BUNDLED layer — `graphic-tokens/<slug>.json` committed to the
+ *      repo. The 5 pinned clients (sentinel/specgas/...) ship with
+ *      these as a fallback for when DB hasn't been backfilled.
+ *      (`loadToken` reads operator-then-bundled; since (1) already
+ *      checked operator, this call effectively reaches bundled only.)
+ *
+ *   4. Live Firecrawl + Portkey extraction. Last resort.
+ *
+ * Mode B (`--use-saved-token`, CLI flag) still requires SOMETHING
+ * concrete to exist — operator/DB/bundled — and errors before
+ * falling back to a live extract, preserving the "don't silently
+ * scrape when I asked for the saved one" semantics.
  */
 export async function resolveGraphicToken(
   params: ResolveTokenParams,
 ): Promise<{ token: GraphicToken; source: TokenSource }> {
-  // 1. DB first — same for both modes.
+  // 1. Operator runtime override always wins.
+  try {
+    const fromOperator = await loadOperatorToken(params.slug);
+    if (fromOperator) {
+      process.stderr.write(
+        `regen: graphic_token=operator (runtime override saved via the workspace UI)\n`,
+      );
+      return { token: fromOperator, source: "operator" };
+    }
+  } catch (err) {
+    process.stderr.write(
+      `regen: operator graphic_token read failed (${(err as Error).message}) — falling through\n`,
+    );
+  }
+
+  // 2. DB.
   try {
     const fromDb = await lookupProjectGraphicToken(params.projectId);
     if (fromDb) {
@@ -116,25 +140,27 @@ export async function resolveGraphicToken(
     );
   }
 
-  // 2. Mode B: saved file is REQUIRED — error out rather than silently
-  // scraping live (this preserves the original strict semantics of
-  // --use-saved-token, which exists so PM-tuned files don't get
-  // accidentally bypassed by a live extract).
-  if (params.useSavedToken) {
-    const saved = await loadToken(params.slug);
-    if (!saved) {
-      throw new Error(
-        `--use-saved-token set, projects.graphic_token is empty, and graphic-tokens/${params.slug}.json is missing. ` +
-          `Either backfill projects.graphic_token for this project, or run: npm run extract-token -- --client ${params.slug}`,
-      );
-    }
+  // 3. Bundled (and, on local dev where there's no operator layer,
+  // also any locally-saved token). loadToken does operator-then-bundled
+  // — operator was already checked above, so in production this only
+  // reaches bundled.
+  const fromBundled = await loadToken(params.slug);
+  if (fromBundled) {
     process.stderr.write(`regen: graphic_token=saved (graphic-tokens/${params.slug}.json)\n`);
-    return { token: saved, source: "saved" };
+    return { token: fromBundled, source: "saved" };
   }
 
-  // 3. Final fallback — live extract.
+  // Mode B fail-fast.
+  if (params.useSavedToken) {
+    throw new Error(
+      `--use-saved-token set, but no graphic_token found in operator dir, projects.graphic_token, or graphic-tokens/${params.slug}.json. ` +
+        `Backfill projects.graphic_token, save an override via the workspace UI, or run: npm run extract-token -- --client ${params.slug}`,
+    );
+  }
+
+  // 4. Final fallback — live extract.
   process.stderr.write(
-    `regen: graphic_token not in DB — falling back to live Firecrawl + Portkey extract\n`,
+    `regen: graphic_token not in operator/DB/bundled — falling back to live Firecrawl + Portkey extract\n`,
   );
   const token = await liveExtract({
     slug: params.slug,

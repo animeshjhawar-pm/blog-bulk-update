@@ -82,6 +82,28 @@ export async function loadToken(slug: string): Promise<GraphicToken | null> {
   return JSON.parse(raw) as GraphicToken;
 }
 
+/**
+ * Read ONLY the operator-writable layer (no fallback to the bundled
+ * copy). Used by the resolver so a runtime dashboard edit can be
+ * detected and given priority over both the DB row and the bundled
+ * defaults; in production OPERATOR_DIR is a separate volume path, so
+ * this distinguishes "operator edited at runtime" from "this is just
+ * a committed default". On local dev where OPERATOR_DIR === BUNDLED_DIR
+ * there is no separate layer to read from, so this returns null —
+ * which is the correct behaviour: locally, edits land in the same
+ * place as the bundled files and there's no "override" concept to honour.
+ */
+export async function loadOperatorToken(slug: string): Promise<GraphicToken | null> {
+  if (OPERATOR_DIR === BUNDLED_DIR) return null;
+  try {
+    const raw = await fs.readFile(operatorPath(`${slug}.json`), "utf8");
+    return JSON.parse(raw) as GraphicToken;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
 export async function saveToken(slug: string, token: GraphicToken): Promise<string> {
   return writeOperator(`${slug}.json`, JSON.stringify(token, null, 2) + "\n");
 }
