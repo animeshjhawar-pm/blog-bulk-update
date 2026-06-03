@@ -3901,6 +3901,23 @@ async function runRepointPipeline(
       .filter(Boolean);
     if (appliedIds.length > 0) void recordAppliedImages(runId, appliedIds);
   }
+  // Build a useful top-level `reason` even when results.length > 1.
+  // /api/apply/image scopes by image_id, but if the run CSV has
+  // multiple rows for the same image_id (e.g. the same id appears in
+  // two asset_types or two clusters) the scope expands to >1 row and
+  // the per-row spread below doesn't fire. Without an explicit
+  // top-level reason the client falls back to the literal string
+  // "unknown" — which is what the operator was seeing.
+  const failedRows = results.filter((r) => !r.ok && !r.superseded);
+  const topReason = failedRows.length === 0
+    ? ""
+    : failedRows.length === 1
+      ? (failedRows[0]!.reason || "")
+      : (() => {
+          const first = failedRows[0]!.reason || "(no message)";
+          const extra = failedRows.length - 1;
+          return `${failedRows.length} row(s) failed for this image_id (the CSV has duplicate rows for it). First: ${first}${extra > 0 ? ` (+${extra} more)` : ""}`;
+        })();
   const payload = {
     // A run is "ok" if every row either applied or was superseded
     // (already-applied is a success outcome, not a failure).
@@ -3913,8 +3930,11 @@ async function runRepointPipeline(
       superseded: supersededN,
       failed: results.length - okN - supersededN,
     },
+    reason: topReason,
     results,
     // Single-scope (one image) clients read these top-level fields.
+    // Spread per-row last so a single-row scope still gets every
+    // result field (steps, image_id_old/new, etc.) at the top.
     ...(results.length === 1 ? results[0] : {}),
   };
   return sendJson(res, 200, payload);
