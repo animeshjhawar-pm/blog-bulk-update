@@ -6687,7 +6687,7 @@ function openShareModal(imageId) {
     );
   }).join('');
   body.innerHTML =
-    '<div style="margin-bottom:10px;color:#374151;">This <code>image_id</code> is referenced by <strong>' + cards.length + '</strong> clusters in this run. The replacement will be uploaded <strong>once</strong>; every checked cluster\'s <code>page_info</code> is then repointed to that same new media row.</div>'
+    '<div style="margin-bottom:10px;color:#374151;">This <code>image_id</code> is referenced by <strong>' + cards.length + '</strong> clusters in this run. The replacement will be uploaded <strong>once</strong>; every checked cluster&#39;s <code>page_info</code> is then repointed to that same new media row.</div>'
     + '<div style="font-size:11px;color:#6b7280;margin-bottom:6px;">image_id: <code style="background:#f3f4f6;padding:1px 4px;border-radius:3px;">' + escapeHtml(imageId) + '</code></div>'
     + list;
   foot.innerHTML =
