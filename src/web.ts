@@ -3981,14 +3981,33 @@ async function loadAppliedCount(runId: string): Promise<number> {
 
 /**
  * POST /api/repoint/image (alias /api/apply/image) — upload ONE image
- * via the Gushwork media API, then repoint page_info. Body:
- * { run_id, image_id, dry_run }. dry_run still uploads.
+ * via the Gushwork media API, then repoint page_info.
+ *
+ * Body: { run_id, image_id, cluster_id?, dry_run }
+ *
+ * Why cluster_id matters: Stormbreaker often reuses the same media
+ * UUID across many service pages (e.g. one stock image used as
+ * service_h1 on 9 different clusters). Without cluster_id the scope
+ * filter expands to every row matching the image_id, which makes one
+ * card click cascade into N apply attempts — and any one cluster's
+ * post-swap state makes the next retry of OTHER clusters fail "stale
+ * mapping" through gate 2. Passing cluster_id from the card narrows
+ * the scope to exactly the slot the operator clicked.
+ *
+ * cluster_id is optional for backwards compatibility — clients that
+ * don't send it still get the legacy multi-row behaviour.
  */
 async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
-  const body = (await readApplyBody(req)) as { run_id?: string; image_id?: string; dry_run?: boolean } | null;
+  const body = (await readApplyBody(req)) as {
+    run_id?: string;
+    image_id?: string;
+    cluster_id?: string;
+    dry_run?: boolean;
+  } | null;
   if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
   const runId = body.run_id ?? "";
   const imageId = body.image_id ?? "";
+  const clusterId = (body.cluster_id ?? "").trim();
   const dryRun = body.dry_run === true;
   if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
   const tk = requireApiToken(req);
@@ -3996,7 +4015,9 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
 
   const r = await resolveRunRows(runId);
   if ("error" in r) return sendJson(res, r.code, { error: r.error });
-  const scope = r.rows.filter((x) => x.image_id === imageId);
+  const scope = clusterId
+    ? r.rows.filter((x) => x.image_id === imageId && x.cluster_id === clusterId)
+    : r.rows.filter((x) => x.image_id === imageId);
   if (scope.length === 0) {
     // Distinguish "CSV present but row missing" from "CSV had zero
     // rows (parsed empty or wrong shape)" so the operator can tell
@@ -5733,7 +5754,16 @@ let onLogStream = null;
 const stateOf = new Map(); // image_id → 'pending' | 'applying' | 'applied' | 'failed'
 
 function paintCard(imageId, opts) {
-  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
+  // When the caller knows the cluster, target THAT specific card —
+  // upstream content sometimes reuses the same image_id on multiple
+  // service clusters, so a plain [data-image-id="X"] selector would
+  // match more cards than intended and update only the first. With
+  // both ids we target exactly one card.
+  const clusterId = opts && opts.clusterId;
+  const sel = clusterId
+    ? '.result-card[data-image-id="' + CSS.escape(imageId) + '"][data-cluster-id="' + CSS.escape(clusterId) + '"]'
+    : '.result-card[data-image-id="' + CSS.escape(imageId) + '"]';
+  const card = document.querySelector(sel);
   if (!card) return;
   const s = stateOf.get(imageId) ?? 'pending';
   card.dataset.state = s;
@@ -5997,16 +6027,27 @@ function showApplySummaryModal(scopeLabel, results) {
 
 async function applyOne(imageId, opts) {
   opts = opts || {};
+  // Resolve which card and which cluster this apply is for. The
+  // caller can pass opts.card (the exact DOM card) or opts.clusterId
+  // (the slot identifier). Without either, we fall back to the first
+  // card with the matching image_id (legacy behaviour for non-shared
+  // image_ids; for shared image_ids the caller MUST pass one of them
+  // or all sibling cards will share state).
+  const card = opts.card
+    || (opts.clusterId
+        ? document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"][data-cluster-id="' + CSS.escape(opts.clusterId) + '"]')
+        : document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]'));
+  if (!card) return;
+  const clusterId = card.dataset.clusterId || '';
+  const paintOpts = { clusterId };
   const cur = stateOf.get(imageId) ?? 'pending';
   if (cur === 'applying') return;
-  const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
-  if (!card) return;
   // Only truly synthetic non-cover/thumbnail ids have no resolvable
   // page_info reference site; the server flags these too, but we
   // short-circuit so the card fails instantly with a clear reason.
   if (card.dataset.applyUnsupported === '1') {
     stateOf.set(imageId, 'failed');
-    paintCard(imageId, { error: 'No resolvable page_info reference for this synthetic id.' });
+    paintCard(imageId, Object.assign({}, paintOpts, { error: 'No resolvable page_info reference for this synthetic id.' }));
     refreshTotals();
     return;
   }
@@ -6021,12 +6062,17 @@ async function applyOne(imageId, opts) {
   // opts.bulk=true to bypass this re-check.
   if (!opts.bulk && applyBusyGuard()) return;
   if (!opts.bulk) setApplyBusy(true);
-  stateOf.set(imageId, 'applying'); paintCard(imageId);
+  stateOf.set(imageId, 'applying'); paintCard(imageId, paintOpts);
   try {
     const r = await fetch('/api/apply/image', {
       method: 'POST',
       headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
-      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, dry_run: APPLY_DRY_RUN })
+      // Always pass cluster_id — narrows the server-side scope to
+      // exactly the slot this card represents. Without it, a card
+      // whose image_id is reused across other clusters would expand
+      // to N apply attempts (one per cluster), each of which can
+      // affect the next retry's "stale mapping" gate.
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_id: clusterId, dry_run: APPLY_DRY_RUN })
     });
     const j = await r.json();
     if (!r.ok && !j.steps) throw new Error(j.reason || j.error || ('HTTP ' + r.status));
@@ -6039,20 +6085,20 @@ async function applyOne(imageId, opts) {
       // earlier apply — the live page is already updated. Not a
       // failure; paint it 'applied' so the card reads as done.
       stateOf.set(imageId, 'applied');
-      paintCard(imageId);
+      paintCard(imageId, paintOpts);
     } else if (j.ok && !j.dry_run) {
-      stateOf.set(imageId, 'applied'); paintCard(imageId);
+      stateOf.set(imageId, 'applied'); paintCard(imageId, paintOpts);
     } else if (j.ok && j.dry_run) {
       // Dry run passed — leave card in its prior state ('pending').
       stateOf.set(imageId, cur === 'applied' ? 'applied' : 'pending');
-      paintCard(imageId);
+      paintCard(imageId, paintOpts);
     } else {
       stateOf.set(imageId, 'failed');
-      paintCard(imageId, { error: 'apply failed: ' + (j.reason || 'unknown') });
+      paintCard(imageId, Object.assign({}, paintOpts, { error: 'apply failed: ' + (j.reason || 'unknown') }));
     }
   } catch (err) {
     stateOf.set(imageId, 'failed');
-    paintCard(imageId, { error: 'apply failed: ' + err.message });
+    paintCard(imageId, Object.assign({}, paintOpts, { error: 'apply failed: ' + err.message }));
   } finally {
     if (!opts.bulk) setApplyBusy(false);
   }
@@ -6333,28 +6379,23 @@ async function applyAllPicked() {
   if (!(await confirmBulkApply(counts.total + ' selected', counts))) return;
   setApplyBusy(true);
   try {
-    const ids = pickedCards
+    // Iterate CARDS (not just image_ids) so each card's
+    // cluster_id rides along. Shared image_ids across clusters used
+    // to dedupe down to one id here, which caused one card click to
+    // cascade into N apply attempts on the server. Now each card
+    // becomes its own narrowly-scoped apply.
+    const cards = pickedCards
       .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
-      // Upload-mode cards without a dropped file would hit the
-      // applyOne client-side alert("Drop a replacement file first")
-      // for every row — skip them here so bulk apply only runs
-      // against rows the server can actually process.
       .filter((c) => !(c.dataset.upload === '1' && c.dataset.needsFile === '1'))
-      .map((c) => c.dataset.imageId)
-      .filter((id) => {
-        const s = stateOf.get(id) ?? 'pending';
+      .filter((c) => {
+        const s = stateOf.get(c.dataset.imageId) ?? 'pending';
         return s !== 'applied' && s !== 'applying';
       });
-    // Each picked card hits /api/apply/image individually (re-using
-    // the single-card endpoint) so the trace fan-out is identical
-    // to clicking each card. opts.bulk=true means applyOne won't
-    // try to acquire the mutex (we already hold it).
-    const settled = await Promise.allSettled(ids.map((id) => applyOne(id, { bulk: true })));
-    // No aggregated trace modal here — each card already opened its
-    // own trace modal in sequence. Just surface a short toast-style
-    // summary so the operator knows the bulk finished.
+    const settled = await Promise.allSettled(
+      cards.map((c) => applyOne(c.dataset.imageId, { bulk: true, card: c })),
+    );
     const failed = settled.filter((s) => s.status === 'rejected').length;
-    if (failed > 0) alert(failed + ' of ' + ids.length + ' picked applies failed. Check the failed cards for details.');
+    if (failed > 0) alert(failed + ' of ' + cards.length + ' picked applies failed. Check the failed cards for details.');
   } finally {
     setApplyBusy(false);
   }
