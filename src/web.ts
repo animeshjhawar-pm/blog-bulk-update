@@ -4031,6 +4031,191 @@ async function applyImageHandler(req: IncomingMessage, res: ServerResponse) {
 }
 
 /**
+ * POST /api/apply/image-multi — upload ONE replacement file once,
+ * then repoint EVERY selected cluster that shares the same image_id
+ * so they all reference the same new media row.
+ *
+ * Body: { run_id, image_id, cluster_ids: string[], dry_run }
+ *
+ * Use case: Stormbreaker reuses one UUID across several service
+ * pages. The operator wants the same product photo to replace it on
+ * all of them. The legacy /api/apply/image path uploads N times
+ * (one new media row per cluster) — wasteful and means each page
+ * now points at a different (but visually identical) media row.
+ * This path uploads ONCE, then PUTs each cluster's page_info to
+ * point at the same new id.
+ *
+ * Implementation: take the FIRST matching scope row, run it through
+ * uploadRows alone. Take the resulting MappingRow's new_image_id /
+ * key / cdn_urls and synthesize MappingRows for the other selected
+ * clusters, copying those fields. Hand the full mapping to
+ * repointMappingRows. Each cluster's repoint is independent (same
+ * existing gates) — only the upload step is shared.
+ */
+async function applyImageMultiHandler(req: IncomingMessage, res: ServerResponse) {
+  const body = (await readApplyBody(req)) as {
+    run_id?: string;
+    image_id?: string;
+    cluster_ids?: unknown;
+    dry_run?: boolean;
+  } | null;
+  if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
+  const runId = body.run_id ?? "";
+  const imageId = body.image_id ?? "";
+  const dryRun = body.dry_run === true;
+  const clusterIds = Array.isArray(body.cluster_ids)
+    ? body.cluster_ids.filter((x): x is string => typeof x === "string" && x.length > 0)
+    : [];
+  if (!runId || !imageId) return sendJson(res, 400, { error: "run_id and image_id required" });
+  if (clusterIds.length === 0) return sendJson(res, 400, { error: "cluster_ids must be a non-empty array" });
+  const tk = requireApiToken(req);
+  if (!tk.ok) return sendJson(res, 400, { error: tk.error });
+
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+
+  // One scope row per cluster (the first row matching image_id +
+  // cluster_id). If two CSV rows in the same cluster point at the
+  // same image_id, only one repoint is needed — take row #1.
+  const allowed = new Set(clusterIds);
+  const perCluster = new Map<string, typeof r.rows[number]>();
+  for (const row of r.rows) {
+    if (row.image_id !== imageId) continue;
+    const cid = row.cluster_id ?? "";
+    if (!allowed.has(cid)) continue;
+    if (!perCluster.has(cid)) perCluster.set(cid, row);
+  }
+  if (perCluster.size === 0) {
+    return sendJson(res, 404, {
+      error: `image_id "${imageId}" not present in any of the selected clusters within run ${runId}. The CSV may have been pruned or the cluster_ids don't match.`,
+    });
+  }
+
+  // Upload ONCE — use the first cluster's row as the upload source.
+  const scopeRows = [...perCluster.values()];
+  const primary = scopeRows[0]!;
+  const up = await uploadRows([primary], {
+    csvPath: "",
+    token: tk.token,
+    refine: true,
+    concurrency: 1,
+    failFast: false,
+  });
+  const primaryMap = up.mapping[0];
+  if (!primaryMap || primaryMap.upload_status !== "uploaded") {
+    return sendJson(res, 502, {
+      ok: false,
+      reason: `upload step failed for the shared image (${primaryMap?.upload_status ?? "no result"}): ${
+        primaryMap?.upload_error || "see server logs"
+      }`,
+      summary: { total: scopeRows.length, applied: 0, superseded: 0, failed: scopeRows.length },
+      results: [],
+    });
+  }
+
+  // Synthesize a MappingRow per cluster, all pointing at the same
+  // new media row. asset_type / cluster_id come from each cluster's
+  // own scope row so repointCluster routes correctly.
+  const mapping: MapRow[] = scopeRows.map((row) => ({
+    old_image_id: imageId,
+    asset_type: row.asset_type ?? "",
+    cluster_id: row.cluster_id ?? "",
+    client_slug: row.client_slug ?? primaryMap.client_slug,
+    project_id: row.project_id ?? primaryMap.project_id,
+    page_topic: row.page_topic ?? "",
+    new_image_id: primaryMap.new_image_id,
+    new_refined_key: primaryMap.new_refined_key,
+    new_cdn_url_1080: primaryMap.new_cdn_url_1080,
+    new_cdn_url_720: primaryMap.new_cdn_url_720,
+    new_cdn_url_360: primaryMap.new_cdn_url_360,
+    new_cdn_url_default: primaryMap.new_cdn_url_default,
+    upload_status: "uploaded",
+  }));
+
+  const rep = await repointMappingRows(mapping, {
+    token: tk.token,
+    apply: !dryRun,
+    concurrency: 4,
+    failFast: false,
+  });
+
+  // Shape the response to mirror runRepointPipeline so the client's
+  // applyServerResults handler works unchanged. One result per
+  // cluster.
+  const ocByCluster = new Map(rep.outcomes.map((o) => [o.cluster_id, o]));
+  const results = mapping.map((m) => {
+    const oc = ocByCluster.get(m.cluster_id);
+    const repOk = oc ? oc.status === "applied" || oc.status === "dry-run" : false;
+    const superseded = oc?.status === "superseded";
+    const ok = repOk;
+    const reason = ok
+      ? ""
+      : superseded
+        ? (oc?.reason ?? "")
+        : (oc?.reason || `repoint produced no outcome for cluster ${m.cluster_id}`);
+    return {
+      ok,
+      superseded,
+      dry_run: dryRun,
+      image_id_old: m.old_image_id,
+      image_id_new: m.new_image_id,
+      key_prefix: m.new_refined_key,
+      reason,
+      asset_type: m.asset_type,
+      cluster_id: m.cluster_id,
+      steps: [
+        {
+          n: 1,
+          name: "upload image → Gushwork media API (shared)",
+          status: "ok",
+          detail: `new image_id=${primaryMap.new_image_id} key=${primaryMap.new_refined_key} (single upload reused across ${scopeRows.length} cluster${scopeRows.length === 1 ? "" : "s"})`,
+        },
+        {
+          n: 2,
+          name: dryRun ? "repoint page_info (DRY-RUN — no write)" : "repoint page_info (PUT)",
+          status: repOk ? "ok" : superseded ? "skipped" : "error",
+          detail: oc?.reason ?? "no cluster outcome",
+        },
+      ],
+    };
+  });
+
+  const okN = results.filter((x) => x.ok).length;
+  const supersededN = results.filter((x) => x.superseded).length;
+  if (runId) {
+    void recordAppliedImages(runId, [m_safe(imageId)]);
+  }
+  const failedRows = results.filter((x) => !x.ok && !x.superseded);
+  const topReason = failedRows.length === 0
+    ? ""
+    : failedRows.length === 1
+      ? failedRows[0]!.reason
+      : `${failedRows.length} cluster(s) failed to repoint. First: ${failedRows[0]!.reason}`;
+  sendJson(res, 200, {
+    ok: results.every((x) => x.ok || x.superseded),
+    dry_run: dryRun,
+    scope: `image ${imageId} across ${scopeRows.length} cluster${scopeRows.length === 1 ? "" : "s"}`,
+    summary: {
+      total: results.length,
+      applied: okN,
+      superseded: supersededN,
+      failed: results.length - okN - supersededN,
+    },
+    reason: topReason,
+    shared_upload: {
+      new_image_id: primaryMap.new_image_id,
+      new_refined_key: primaryMap.new_refined_key,
+    },
+    results,
+  });
+}
+
+// Safety: pass-through helper used only inside applyImageMultiHandler
+// so the existing recordAppliedImages signature is honoured without
+// a type cast.
+function m_safe(s: string): string { return s; }
+
+/**
  * POST /api/repoint/cluster (alias /api/apply/cluster) — upload every
  * image in ONE cluster, then repoint that cluster's page_info in a
  * single atomic PUT. Body: { run_id, cluster_id, dry_run }.
@@ -5249,6 +5434,10 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
   // (per-image Apply + Regenerate). Bulk "Apply all pending" lives
   // in the sticky publish action bar at the bottom of the page.
   let resultsHtml = "";
+  // Built inside the rendered-results block so the script-tag template
+  // below can reference it without needing the inner-scope vars
+  // (grouped, publishedUrlOf) at template-eval time.
+  let runClustersForJs: Record<string, { topic: string; url: string }> = {};
   if (state.done && state.csvPath) {
     const rows = await readRunCsvOrEmpty(state.csvPath);
     if (rows.length > 0) {
@@ -5290,6 +5479,15 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
         if (!m || !m.slug || !projectForRun) return null;
         return buildPublishedUrl(projectForRun, m.page_type, m.slug);
       };
+      // Hand the cluster meta out to the rendered script so the
+      // "apply to all instances" modal can show live URLs + topics
+      // without an API round-trip.
+      runClustersForJs = Object.fromEntries(
+        [...grouped.entries()].map(([clusterId, g]) => [
+          clusterId,
+          { topic: g.topic || "", url: publishedUrlOf(clusterId) || "" },
+        ]),
+      );
       const oldUrlOf = (imageId: string): string | null => {
         // Primary source: the CSV column we now write at run start.
         const fromCsv = csvOldUrls.get(imageId);
@@ -5625,6 +5823,12 @@ const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
 // build kept tripping on it. window.* is initialised the moment
 // this line is parsed, no ordering hazard.
 window.RUN_STAGE = ${JSON.stringify(stage)};
+// Cluster metadata for the modal that confirms a multi-cluster
+// apply. The "apply to all instances" button needs to show the
+// operator the live page URL + topic for every cluster that shares
+// an image_id, so it ships here once at page load instead of N
+// per-card API calls.
+window.RUN_CLUSTERS = ${JSON.stringify(runClustersForJs)};
 let onLogStream = null;
 (function () {
   const heroEl = document.getElementById('running-hero');
@@ -6400,6 +6604,170 @@ async function applyAllPicked() {
     setApplyBusy(false);
   }
 }
+// ───────────────────────────────────────────────────────────────────
+// Shared-image-id flow (apply to all instances)
+//
+// When Stormbreaker authored the project, the same media UUID can
+// land in several clusters' page_info. Each appears as its own card
+// here. Without help the operator would have to click N cards (one
+// per cluster); this code adds a second action on every card whose
+// image_id is shared: "↗ Apply to all N instances".
+//
+// At load we scan cards to find image_ids used by >1 cluster. For
+// each, we inject the extra button. Clicking it opens a modal that
+// lists every (cluster topic, live URL) and lets the operator
+// uncheck any cluster they don't want updated. Confirming POSTs
+// /api/apply/image-multi with the surviving cluster_ids — one
+// upload, N repoints to the SAME new media id.
+// ───────────────────────────────────────────────────────────────────
+function indexSharedImageIds() {
+  const byId = new Map(); // image_id → [card, ...]
+  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    let arr = byId.get(id);
+    if (!arr) { arr = []; byId.set(id, arr); }
+    arr.push(card);
+  }
+  for (const [id, cards] of byId.entries()) {
+    if (cards.length < 2) continue;
+    for (const card of cards) {
+      card.dataset.sharedCount = String(cards.length);
+      // Render the extra button alongside the existing Upload +
+      // Repoint button. Skip if we already injected (idempotent —
+      // a future re-render shouldn't double-inject).
+      if (card.querySelector('[data-apply-multi]')) continue;
+      const applyBtn = card.querySelector('[data-apply]');
+      if (!applyBtn) continue;
+      const multi = document.createElement('button');
+      multi.type = 'button';
+      multi.setAttribute('data-apply-multi', '');
+      multi.className = 'btn';
+      multi.style.cssText = 'margin-left:6px;font-size:12px;';
+      multi.textContent = '↗ Apply to all ' + cards.length + ' instances';
+      multi.title = 'This image_id is shared across ' + cards.length + ' clusters in this run. Upload once, repoint every page that references it.';
+      multi.onclick = (e) => { e.stopPropagation(); openShareModal(id); };
+      applyBtn.parentNode.insertBefore(multi, applyBtn.nextSibling);
+      // Reword the per-cluster button so the distinction is clear.
+      if (applyBtn.textContent === 'Upload + Repoint') applyBtn.textContent = 'Apply to this cluster only';
+    }
+  }
+}
+
+function openShareModal(imageId) {
+  const cards = [...document.querySelectorAll('.result-card[data-image-id="' + CSS.escape(imageId) + '"]')];
+  if (cards.length < 2) return;
+  const meta = (window.RUN_CLUSTERS || {});
+  let overlay = document.getElementById('share-modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'share-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:none;align-items:center;justify-content:center;z-index:10000;';
+    overlay.innerHTML = '<div id="share-modal" style="background:#fff;color:#111;max-width:720px;width:92%;max-height:86vh;border-radius:8px;box-shadow:0 18px 48px rgba(0,0,0,0.32);display:flex;flex-direction:column;overflow:hidden;font:13px/1.45 ui-sans-serif,system-ui,sans-serif;"><div id="share-modal-head" style="padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:12px;"><div style="font-weight:600;font-size:14px;">Apply replacement to all instances</div><button id="share-modal-close" style="background:none;border:0;font-size:22px;cursor:pointer;color:#555;line-height:1;">&times;</button></div><div id="share-modal-body" style="padding:14px 18px;overflow:auto;flex:1;"></div><div id="share-modal-foot" style="padding:12px 18px;border-top:1px solid #e5e7eb;background:#fafafa;display:flex;justify-content:space-between;gap:12px;align-items:center;"></div></div>';
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
+    overlay.querySelector('#share-modal-close').addEventListener('click', () => { overlay.style.display = 'none'; });
+  }
+  const body = overlay.querySelector('#share-modal-body');
+  const foot = overlay.querySelector('#share-modal-foot');
+  const list = cards.map((card) => {
+    const cid = card.dataset.clusterId || '';
+    const m = meta[cid] || {};
+    const topic = m.topic || '(no topic)';
+    const url = m.url || '';
+    const asset = (card.querySelector('.pill') && card.querySelector('.pill').textContent) || '';
+    return (
+      '<label style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed #eee;">'
+      + '<input type="checkbox" class="share-pick" data-cluster-id="' + escapeHtml(cid) + '" checked style="margin-top:3px;">'
+      + '<div style="flex:1;min-width:0;">'
+      + '<div style="font-weight:600;">' + escapeHtml(topic) + '</div>'
+      + '<div style="font-size:12px;color:#555;">' + escapeHtml(asset) + ' · <code style="background:#f3f4f6;padding:1px 4px;border-radius:3px;">' + escapeHtml(cid) + '</code></div>'
+      + (url ? '<div style="font-size:12px;margin-top:2px;"><a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" style="color:#4338ca;">' + escapeHtml(url) + '</a></div>' : '<div style="font-size:12px;color:#9ca3af;margin-top:2px;">(no live URL — slug not published)</div>')
+      + '</div></label>'
+    );
+  }).join('');
+  body.innerHTML =
+    '<div style="margin-bottom:10px;color:#374151;">This <code>image_id</code> is referenced by <strong>' + cards.length + '</strong> clusters in this run. The replacement will be uploaded <strong>once</strong>; every checked cluster\'s <code>page_info</code> is then repointed to that same new media row.</div>'
+    + '<div style="font-size:11px;color:#6b7280;margin-bottom:6px;">image_id: <code style="background:#f3f4f6;padding:1px 4px;border-radius:3px;">' + escapeHtml(imageId) + '</code></div>'
+    + list;
+  foot.innerHTML =
+    '<div style="font-size:12px;color:#6b7280;">Uncheck any cluster you do NOT want updated.</div>'
+    + '<div style="display:flex;gap:8px;">'
+    + '<button type="button" id="share-cancel" class="btn" style="background:#fff;border:1px solid #e5e7eb;color:#111;">Cancel</button>'
+    + '<button type="button" id="share-confirm" class="btn primary">Apply to all checked</button>'
+    + '</div>';
+  overlay.querySelector('#share-cancel').onclick = () => { overlay.style.display = 'none'; };
+  overlay.querySelector('#share-confirm').onclick = () => { confirmShareApply(imageId, cards); };
+  overlay.style.display = 'flex';
+}
+
+async function confirmShareApply(imageId, cards) {
+  const overlay = document.getElementById('share-modal-overlay');
+  const picked = [...document.querySelectorAll('#share-modal-body .share-pick:checked')]
+    .map((cb) => cb.dataset.clusterId)
+    .filter(Boolean);
+  if (picked.length === 0) {
+    alert('Pick at least one cluster, or click Cancel to exit.');
+    return;
+  }
+  if (applyBusyGuard()) return;
+  setApplyBusy(true);
+  // Paint every targeted card as 'applying' before the request fires.
+  const targeted = cards.filter((c) => picked.indexOf(c.dataset.clusterId) !== -1);
+  for (const card of targeted) {
+    stateOf.set(imageId, 'applying');
+    paintCard(imageId, { clusterId: card.dataset.clusterId });
+  }
+  overlay.style.display = 'none';
+  try {
+    const r = await fetch('/api/apply/image-multi', {
+      method: 'POST',
+      headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
+      body: JSON.stringify({ run_id: RUN_ID, image_id: imageId, cluster_ids: picked, dry_run: APPLY_DRY_RUN }),
+    });
+    const j = await r.json();
+    if (!r.ok && !j.results) throw new Error(j.reason || j.error || ('HTTP ' + r.status));
+    // Map each result back to its specific card via cluster_id.
+    for (const result of (j.results || [])) {
+      const cid = result.cluster_id;
+      const card = targeted.find((c) => c.dataset.clusterId === cid);
+      if (!card) continue;
+      const opt = { clusterId: cid };
+      if (result.superseded) {
+        stateOf.set(imageId, 'applied');
+        paintCard(imageId, opt);
+      } else if (result.ok && !result.dry_run) {
+        stateOf.set(imageId, 'applied');
+        paintCard(imageId, opt);
+      } else {
+        stateOf.set(imageId, 'failed');
+        paintCard(imageId, Object.assign({}, opt, { error: 'apply failed: ' + (result.reason || 'unknown') }));
+      }
+    }
+    // Top-level toast.
+    const ok = (j.summary && j.summary.applied) || 0;
+    const sup = (j.summary && j.summary.superseded) || 0;
+    const fail = (j.summary && j.summary.failed) || 0;
+    alert('Apply to all instances finished — ' + ok + ' applied, ' + sup + ' already-applied, ' + fail + ' failed.');
+  } catch (err) {
+    for (const card of targeted) {
+      stateOf.set(imageId, 'failed');
+      paintCard(imageId, { clusterId: card.dataset.clusterId, error: 'apply failed: ' + err.message });
+    }
+  } finally {
+    setApplyBusy(false);
+    refreshTotals();
+  }
+}
+
+// Run after the cards are in the DOM. The script tag is at the end
+// of body, so DOM is ready by the time this executes.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', indexSharedImageIds);
+} else {
+  indexSharedImageIds();
+}
+
 async function regenAllPicked() {
   const picked = [];
   for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
@@ -8396,6 +8764,8 @@ export function startWebServer(port: number): void {
       // Pipeline endpoints. /api/apply/* kept as back-compat aliases
       // for the existing client JS; /api/repoint/* are the canonical
       // names. All run the upload→repoint pipeline now.
+      if (method === "POST" && p === "/api/apply/image-multi")
+        return await applyImageMultiHandler(req, res);
       if (method === "POST" && (p === "/api/apply-one" || p === "/api/apply/image" || p === "/api/repoint/image"))
         return await applyImageHandler(req, res);
       if (method === "POST" && (p === "/api/apply/cluster" || p === "/api/repoint/cluster"))
