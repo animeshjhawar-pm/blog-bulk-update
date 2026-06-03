@@ -5576,16 +5576,31 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
             // (set on first drop). Compare still needs an oldUrl from
             // the live page_info to show what we're replacing.
             const canCompare = !!oldUrl && (!!r.image_url_new || (isUpload && !!r.image_local_path));
-            // The upload→repoint pipeline DOES handle cover &
-            // thumbnail (cover = 1st <Image> UUID; thumbnail = the
-            // live page_info.thumbnail URL string). Only truly
-            // synthetic non-cover/thumbnail ids (e.g. blog-images/<id>
-            // placeholders) have no resolvable reference site.
-            const applyUnsupported =
-              synthetic && r.asset_type !== "cover" && r.asset_type !== "thumbnail";
-            const applyDisabledReason = applyUnsupported
-              ? "No resolvable page_info reference for this synthetic id — regenerate from a real cluster image"
-              : "";
+            // The "synthetic" flag (image_id contains "/") used to
+            // disable the card for any non-cover/thumbnail asset
+            // type, on the theory that such ids had no resolvable
+            // page_info reference. But pageInfo.ts ONLY synthesises
+            // placeholder ids for cover/thumbnail; every other asset
+            // type's image_id comes straight out of page_info — even
+            // when upstream stored something odd in that field (e.g.
+            // an S3 key with a leading space, observed on cluster
+            // 77dbbcd6-… service_description). The string IS present
+            // in the serialized page_info, so repoint's substring-
+            // swap will find and replace it cleanly — turning a
+            // corrupted upstream value into a proper new UUID.
+            //
+            // For cover/thumbnail synthetic placeholders, the apply
+            // pipeline has its own dedicated path (thumbnail URL
+            // string in page_info; cover's first MDX <Image> UUID),
+            // so those don't need a special block either.
+            //
+            // Net: never disable a card on the "synthetic" signal
+            // alone. If the value really isn't in page_info, gate 2
+            // in repoint will surface a clear, specific failure when
+            // apply runs — much more useful than a silently-disabled
+            // checkbox.
+            const applyUnsupported = false;
+            const applyDisabledReason = "";
             return `
 <div class="result-card${isUpload ? ' upload-mode' : ''}" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${isUpload ? ' data-upload="1"' : ''}${isUpload && !hasUploadedFile ? ' data-needs-file="1"' : ''}${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${applyUnsupported ? esc(applyDisabledReason) : "Include in bulk actions (Apply / Regenerate)"}">
