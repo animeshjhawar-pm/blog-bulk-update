@@ -7706,6 +7706,76 @@ function safeProductFilename(imageId: string, ext: string): string {
 }
 
 /**
+ * GET /admin/diagnose-run?id=<runId> — read-only audit of a run CSV.
+ * Surfaces the two structural issues that cause "apply failed:
+ * unknown / mapping stale" cascades:
+ *
+ *   1. Duplicate rows per image_id. The run CSV legitimately ends up
+ *      with the same image_id under several rows when a cluster's
+ *      page_info references that id in more than one slot (e.g. both
+ *      service_h1 and a cover thumb, or shared across two clusters).
+ *      The apply pipeline tries to repoint each of those rows, and
+ *      gate 2 only finds the id in the slot the resolver picked, so
+ *      the rest fail "stale mapping" even though one of them is
+ *      legitimate.
+ *
+ *   2. Cluster_ids in the run whose live page_info no longer contains
+ *      any of the run's recorded image_ids — i.e. the run is older
+ *      than the upstream content's last re-render and is now stale.
+ *
+ * Output is small JSON the operator can paste into a ticket. No
+ * writes; no token required (matches the rest of /admin).
+ */
+async function adminDiagnoseRunHandler(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x"}`);
+  const runId = url.searchParams.get("id") ?? "";
+  if (!runId) return sendJson(res, 400, { error: "id query param required" });
+  const r = await resolveRunRows(runId);
+  if ("error" in r) return sendJson(res, r.code, { error: r.error });
+  const rows = r.rows;
+  type Row = (typeof rows)[number];
+  const byId = new Map<string, Row[]>();
+  for (const row of rows) {
+    const id = row.image_id ?? "";
+    if (!id) continue;
+    let arr = byId.get(id);
+    if (!arr) { arr = []; byId.set(id, arr); }
+    arr.push(row);
+  }
+  const duplicates = [...byId.entries()]
+    .filter(([, arr]) => arr.length > 1)
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, 30)
+    .map(([id, arr]) => ({
+      image_id: id,
+      count: arr.length,
+      rows: arr.map((row) => ({
+        cluster_id: row.cluster_id ?? "",
+        asset_type: row.asset_type ?? "",
+        status: row.status ?? "",
+        page_topic: (row.page_topic ?? "").slice(0, 80),
+      })),
+    }));
+  const byCluster = new Map<string, number>();
+  for (const row of rows) {
+    const cid = row.cluster_id ?? "";
+    if (!cid) continue;
+    byCluster.set(cid, (byCluster.get(cid) ?? 0) + 1);
+  }
+  sendJson(res, 200, {
+    run_id: runId,
+    total_rows: rows.length,
+    unique_image_ids: byId.size,
+    unique_clusters: byCluster.size,
+    duplicate_image_ids: duplicates.length,
+    duplicates,
+    advice: duplicates.length > 0
+      ? "Each image_id with count>1 will trigger N apply calls for that one card click. Gate 2 only finds the id in the slot pageInfo.ts picked, so the rest fail 'stale mapping'. To fix: re-import the cluster (re-run upload-run/start) — collectImageRecords dedupes per (cluster, asset, image_id)."
+      : "No duplicate image_ids — apply failures are not from duplicates.",
+  });
+}
+
+/**
  * GET /admin/disk — report what the volume currently holds. Tiny
  * non-mutating helper so the operator can see why the disk is full
  * before deciding what to prune. Lists the top-level directories
@@ -8293,8 +8363,9 @@ export function startWebServer(port: number): void {
         return await applyRunHandler(req, res);
       if (method === "POST" && p === "/api/revert/cluster") return await revertClusterHandler(req, res);
       if (method === "POST" && p === "/api/revert/run")     return await revertRunHandler(req, res);
-      if (method === "POST" && p === "/admin/sweep")     return await adminSweepHandler(req, res);
-      if (method === "GET"  && p === "/admin/disk")      return await adminDiskHandler(req, res);
+      if (method === "POST" && p === "/admin/sweep")          return await adminSweepHandler(req, res);
+      if (method === "GET"  && p === "/admin/disk")           return await adminDiskHandler(req, res);
+      if (method === "GET"  && p === "/admin/diagnose-run")   return await adminDiagnoseRunHandler(req, res);
       if (method === "POST" && p === "/api/token")        return await tokenSetHandler(req, res);
       if (method === "POST" && p === "/api/token/clear")  return await tokenClearHandler(req, res);
       if (method === "GET"  && p === "/api/token/status") return sendJson(res, 200, { status: tokenStatusFromHeader(req) });
