@@ -79,7 +79,30 @@ export function tokenPath(slug: string): string {
 export async function loadToken(slug: string): Promise<GraphicToken | null> {
   const raw = await readLayered(`${slug}.json`);
   if (raw == null) return null;
-  return JSON.parse(raw) as GraphicToken;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Corrupt JSON on disk — treat as missing so the resolver falls
+    // back to the DB / live extract rather than crashing the
+    // workspace render with a parse error.
+    return null;
+  }
+  // Treat an empty-object file ({}) as "no token". A half-finished
+  // extract that wrote a stub file used to leave loadToken returning
+  // {} — non-null but useless — which fooled "has the operator
+  // already extracted?" checks across the workspace UI and the
+  // /token/status endpoint, producing a perpetual extract-and-
+  // reload loop (banner shows because Object.keys({}).length===0;
+  // poll says has_token because != null; reload; repeat).
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || (Array.isArray(parsed) ? parsed.length === 0 : Object.keys(parsed as object).length === 0)
+  ) {
+    return null;
+  }
+  return parsed as GraphicToken;
 }
 
 /**
@@ -95,13 +118,27 @@ export async function loadToken(slug: string): Promise<GraphicToken | null> {
  */
 export async function loadOperatorToken(slug: string): Promise<GraphicToken | null> {
   if (OPERATOR_DIR === BUNDLED_DIR) return null;
+  let raw: string;
   try {
-    const raw = await fs.readFile(operatorPath(`${slug}.json`), "utf8");
-    return JSON.parse(raw) as GraphicToken;
+    raw = await fs.readFile(operatorPath(`${slug}.json`), "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || (Array.isArray(parsed) ? parsed.length === 0 : Object.keys(parsed as object).length === 0)
+  ) {
+    return null;
+  }
+  return parsed as GraphicToken;
 }
 
 export async function saveToken(slug: string, token: GraphicToken): Promise<string> {
