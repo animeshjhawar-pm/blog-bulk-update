@@ -16,6 +16,7 @@ import {
   lookupImageUrls,
   publishedClusterCountsByPageType,
   lookupProjectById,
+  lookupProjectGraphicToken,
   searchProjects,
   type ClusterRow,
   type ProjectRow,
@@ -2105,7 +2106,15 @@ async function workspacePage(
   }
 
   const brand = (await loadBrandGuidelines(slug)) ?? "";
-  const savedToken = await loadToken(slug);
+  // savedToken decides whether the workspace shows the "extracting
+  // graphic_token…" banner with its 4-second auto-poll. We have to
+  // check EVERY source the generation pipeline accepts as a real
+  // token — otherwise projects whose token lives in projects.graphic_token
+  // (the new default) render the banner perpetually and the poll
+  // never satisfies, since the disk check never finds anything.
+  const savedToken =
+    (await loadToken(slug))
+    ?? (entry ? await lookupProjectGraphicToken(entry.projectId).catch(() => null) : null);
   const overrides = await loadProjectOverrides(slug);
 
   // If AWS creds aren't set on this deployment we can't fetch the
@@ -4827,7 +4836,15 @@ async function extractTokenHandler(res: ServerResponse, slug: string) {
 async function tokenStatusHandler(res: ServerResponse, slug: string) {
   const entry = resolveClient(slug);
   if (!entry) return sendJson(res, 400, { error: "unknown client" });
-  const has = (await loadToken(slug)) != null;
+  // Mirror the workspace render: count "has_token" if EITHER the
+  // disk layer has it OR projects.graphic_token does. Otherwise
+  // projects whose token lives only in the DB stay stuck polling
+  // forever (banner spins, page never resolves).
+  let has = (await loadToken(slug)) != null;
+  if (!has) {
+    const fromDb = await lookupProjectGraphicToken(entry.projectId).catch(() => null);
+    if (fromDb) has = true;
+  }
   const inFlight = EXTRACTING_TOKENS.has(slug);
   const recentError = consumeRecentExtractError(slug);
   sendJson(res, 200, {
