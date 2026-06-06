@@ -28,7 +28,7 @@ import {
 } from "./pageInfo.js";
 import { findClient } from "./clients.js";
 import { pickLogoUrl } from "./regen.js";
-import { compositeProduct, emptyZoneDirective, extractRunBackgroundColor } from "./composite.js";
+import { compositeProduct, emptyZoneDirective, productReferenceDirective } from "./composite.js";
 
 /**
  * Upload-&-Generate pipeline.
@@ -85,6 +85,26 @@ export interface UploadGenerateOptions {
   promptOverrides?: PromptOverrides;
   /** Free-text addendum, same shape as regen's. */
   extraInstructions?: string;
+  /**
+   * Operator-supplied structural reference images for this run. When
+   * present they REPLACE the default WIREFRAME_URLS lookup for the
+   * matching asset type. Used as image_input[1] on the Replicate call.
+   * URLs must be publicly fetchable from Replicate's side (so http(s)
+   * URLs the operator pasted, OR the web server's wireframe-serve
+   * route when running on a public host like Railway).
+   */
+  customWireframes?: { cover?: string; thumbnail?: string };
+  /**
+   * Public base URL the CLI prepends to per-image product paths when
+   * service/category asset rows need to pass the operator's uploaded
+   * product image to Replicate as a reference image (the AI then
+   * generates a new scene using it as a visual anchor, rather than
+   * us sharp-compositing a flat paste). When unset, service/category
+   * rows fall back to the legacy compositing behaviour — useful for
+   * local development where Replicate cannot fetch from localhost.
+   * The web server populates this from publicBaseUrlFromReq().
+   */
+  productBaseUrl?: string;
 }
 
 function utcStamp(): string {
@@ -142,9 +162,9 @@ async function processOne(args: {
     previous_image_url: record.previewUrl ?? "",
   };
 
-  const productPath = options.products[record.imageId];
-  if (!productPath) {
-    const msg = `no product file supplied for image_id ${record.imageId} — Upload & Generate requires one product per picked image`;
+  const productEntry = options.products[record.imageId];
+  if (!productEntry) {
+    const msg = `no product supplied for image_id ${record.imageId} — Upload & Generate requires one product (dropped file or pasted URL) per picked image`;
     process.stderr.write(`[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
@@ -152,17 +172,33 @@ async function processOne(args: {
     };
   }
 
-  // Read product bytes once. We need them both for composite AND we
-  // pass the same file to Replicate as a reference image so the
-  // model can color/lighting-match the background to the product.
-  // The reference role does NOT relax the empty-zone directive — that
-  // text still pins the model away from rendering a product inside
-  // the zone; the reference is purely for tonal coherence.
+  // Each entry is either a local path (dropped file) or a public
+  // http(s) URL (operator paste). The URL form lets the operator
+  // bypass the localhost-reachability constraint for service/
+  // category by hosting their own product image elsewhere.
+  const isProductUrl = /^https?:\/\//i.test(productEntry);
+  const productUrlFromEntry = isProductUrl ? productEntry : null;
+  const productPathFromEntry = isProductUrl ? null : productEntry;
+
+  // Load bytes when needed. Composite path (blog assets) always
+  // needs bytes; the service/category AI-reference path may not need
+  // them when the URL is passed directly.
   let productBytes: Buffer;
   try {
-    productBytes = await fs.readFile(productPath);
+    if (productPathFromEntry) {
+      productBytes = await fs.readFile(productPathFromEntry);
+    } else {
+      // URL entry — fetch bytes so the composite fallback (blog
+      // assets, or service/category when no productUrl-supplying
+      // path) still works. The download is short (~MB) and Replicate
+      // fetches the URL independently for AI reference, so this
+      // doesn't double the network cost for the AI-reference path.
+      const r = await fetch(productUrlFromEntry!);
+      if (!r.ok) throw new Error(`HTTP ${r.status} fetching product URL`);
+      productBytes = Buffer.from(await r.arrayBuffer());
+    }
   } catch (err) {
-    const msg = `cannot read product file at ${productPath}: ${(err as Error).message}`;
+    const msg = `cannot load product (${productPathFromEntry ?? productUrlFromEntry}): ${(err as Error).message}`;
     process.stderr.write(`[${rowNum}/${totalRows}] id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
@@ -176,18 +212,124 @@ async function processOne(args: {
   //   empty-zone directive (always — drives the post-composite contract)
   const savedDirectives = extractAdditionalInstructions(graphicToken);
   const extras = (options.extraInstructions ?? "").trim();
-  // Pin a single background colour for the whole run so cover and
-  // thumbnail across every cluster share the same left-half look.
-  // If the graphic_token has no usable colour, the directive falls
-  // back to solid white inside emptyZoneDirective.
-  const runBgColor = extractRunBackgroundColor(graphicToken);
-  const zoneDirective = emptyZoneDirective(record.asset, runBgColor);
-  const mergedDirectives = [savedDirectives, extras, zoneDirective]
+  // Asset-aware directive policy:
+  //
+  //   cover/thumbnail → use the cover.ts prompt + add ONLY the
+  //     FLAT SEAM rule. Everything else (logo, pill, title, subtitle,
+  //     brand styling) is driven by the cover.ts template and the
+  //     wireframe reference image — same as the Generate flow.
+  //     The FLAT SEAM rule alone is necessary because product
+  //     compositing pastes a real photograph over the right half;
+  //     any shadow/depth treatment the AI draws at the vertical
+  //     midpoint would then sit between the AI's text column and
+  //     the operator's product photo, looking like an awkward
+  //     separator. Removing just that one element keeps the rest of
+  //     the cover prompt's output intact.
+  //
+  //   everything else (infographic, internal, external, generic,
+  //     service_h1, service_body, category_industry) → still emit the
+  //     central-zone directive. These asset templates have NO wireframe
+  //     reference image, so the AI needs explicit guidance about
+  //     keeping the centre clear for the product composite.
+  const FLAT_SEAM_CLAUSE =
+    "FLAT SEAM — HARD CONSTRAINT: the LEFT HALF and RIGHT HALF of this image MUST sit flat against each other at the vertical midpoint. " +
+    "Do NOT render any drop shadow, inner shadow, soft shadow, dark edge, vignette, gradient fade, bevel, glow, depth effect, " +
+    "separator line, layered-card appearance, or floating-element treatment at or near the vertical midpoint or the left edge of the right half. " +
+    "The two halves are coplanar, not stacked — a product photograph will be composited over the right half after generation, and any seam treatment would read as an awkward divider between the text column and the product.";
+  const usesWireframeLayout = record.asset === "cover" || record.asset === "thumbnail";
+  // Determine whether we'll be passing the product to Replicate as a
+  // reference image_input. The directive selection below picks the
+  // PRODUCT REFERENCE preservation directive in that case (instead of
+  // the central-zone one), so the AI knows the reference must be kept.
+  const usesProductReference =
+    record.asset === "service_h1" ||
+    record.asset === "service_body" ||
+    record.asset === "category_industry";
+  const willPassProductUrl =
+    usesProductReference &&
+    !!(productUrlFromEntry
+      ?? (options.productBaseUrl
+        ? `${options.productBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(record.imageId)}`
+        : null));
+  const seamDirective = usesWireframeLayout ? FLAT_SEAM_CLAUSE : "";
+  // For service/category WITH a product URL we add the preservation
+  // directive (forces the AI to treat image_input[1] as a fixed asset
+  // and only regenerate background/scene). For everything else
+  // non-wireframe we add the central-zone directive (which assumes
+  // sharp will composite the product into the central zone post-gen).
+  const zoneDirective = usesWireframeLayout
+    ? ""
+    : (willPassProductUrl
+      ? productReferenceDirective(record.asset)
+      : emptyZoneDirective(record.asset, null));
+  const mergedDirectives = [savedDirectives, extras, seamDirective, zoneDirective]
     .filter((s): s is string => !!s && s.length > 0)
     .join("\n\n");
 
   let promptUsed = "";
   try {
+    // ── Service / category with product URL → SIMPLE prompt path ──
+    //
+    // page.ts (the prompt Claude builds from) was written for the
+    // Generate flow which has no product reference — it instructs the
+    // AI to invent the product from the description text. Layering our
+    // "preserve image_input[1]" directive on top of that fights the
+    // base prompt and the description-driven generation wins (product
+    // gets re-interpreted, original is lost).
+    //
+    // For this code path we BYPASS Claude / page.ts entirely and build
+    // a small, focused prompt directly: "image_input[1] is the product,
+    // generate the SCENE around it based on this description." That
+    // way nothing in the prompt asks the AI to render a product —
+    // there's only one source of the product (the reference image).
+    //
+    // The Generate flow's use of page.ts stays untouched.
+    if (willPassProductUrl) {
+      // Operator may have edited the "Page" group in the Review Prompts
+      // modal; if so, use their text verbatim. Otherwise use the
+      // service-flow default prompt verbatim. Nothing else is appended.
+      const operatorPageOverride =
+        typeof options.promptOverrides?.page?.system === "string"
+          && options.promptOverrides.page.system.trim().length > 0
+          ? options.promptOverrides.page.system
+          : null;
+
+      const defaultServicePrompt =
+        `You are an expert image editor. You will receive one or more reference images containing a subject and its branded/product elements. Your task is to generate a NEW image that preserves the subject's identity and all branded elements EXACTLY while completely changing the background, environment, lighting, and surrounding context.\n\n` +
+        `WHAT MUST BE PRESERVED (100% IDENTICAL — DO NOT ALTER):\n\n` +
+        `The subject's face, features, skin tone, hair, and expression (if a person is present)\n` +
+        `All clothing, accessories, and worn items exactly as shown\n` +
+        `Any product, vehicle, or object the subject is using or holding — its exact shape, color, design, panels, and proportions\n` +
+        `Every logo, brand mark, badge, label, and text — including exact colors, fonts, placement, size, and orientation\n` +
+        `The subject's pose, posture, and the camera angle/viewpoint of the subject\n\n` +
+        `WHAT TO CHANGE (FULL CREATIVE FREEDOM):\n\n` +
+        `The entire background and environment\n` +
+        `Surrounding objects, vehicles, people, structures, and scenery\n` +
+        `Time of day, lighting conditions, weather, and atmospheric mood\n` +
+        `Background depth-of-field, blur, and motion as appropriate\n\n` +
+        `TECHNICAL & STYLE REQUIREMENTS:\n\n` +
+        `Photorealistic, high-resolution, professional commercial photography quality\n` +
+        `Lighting on the subject must realistically match the NEW environment — consistent shadows, reflections, highlights, and color temperature\n` +
+        `Natural integration: the subject must look genuinely photographed in the new location, never pasted or composited\n` +
+        `Keep the subject in sharp focus; apply natural, context-appropriate background blur or motion\n` +
+        `Match perspective and scale so the subject sits believably within the new scene\n\n` +
+        `NEGATIVE CONSTRAINTS (AVOID):\n\n` +
+        `Do NOT alter, distort, recolor, relocate, or duplicate any logo, badge, or text\n` +
+        `Do NOT change the subject's identity, face, clothing, or any product/object design or color\n` +
+        `No warped or illegible branding, no text artifacts, no extra or missing limbs, no distorted proportions\n` +
+        `No change to the subject itself — only the world around it changes`;
+
+      promptUsed = operatorPageOverride ? operatorPageOverride : defaultServicePrompt;
+
+      process.stderr.write(
+        `[${rowNum}/${totalRows}] id=${record.imageId} prompt=product-reference (` +
+        (operatorPageOverride ? "operator-edited page prompt" : "default constructed") +
+        `; image_input[1] is the product)\n`,
+      );
+    } else {
+      // Original path — Claude builds the prompt from the asset's
+      // template (cover.ts / page.ts / etc.). Used by blog assets and
+      // by service/category WITHOUT a product URL (composite fallback).
     const built = await buildImagePrompt({
       asset: record.asset,
       imageDescription: record.description,
@@ -200,29 +342,50 @@ async function processOne(args: {
       blogTopic: record.cluster.topic ?? "",
       aspectRatio: record.aspectRatio,
     });
-    // Re-apply the directives so the empty-zone block is at the top
-    // alongside saved + extras. buildImagePrompt already prepended
-    // only the saved set; we need the merged set instead.
-    promptUsed = applyAdditionalInstructions(
-      stripAdditionalInstructions(built.finalPrompt),
-      mergedDirectives,
-    );
+    // buildImagePrompt already prepended a directives block with
+    // savedDirectives (from graphic_token.additional_instructions).
+    // For cover/thumbnail we add ONLY the FLAT SEAM rule on top of
+    // that; for other assets we add the central-zone directive.
+    // Either way we strip the existing block and re-apply with the
+    // merged set so saved + extras + seam (or zone) live together.
+    // When mergedDirectives is empty (no savedDirectives, no extras,
+    // not a wireframe asset, no central-zone needed) we pass through
+    // unchanged — matches Generate exactly in that edge case.
+    if (mergedDirectives.length > 0) {
+      promptUsed = applyAdditionalInstructions(
+        stripAdditionalInstructions(built.finalPrompt),
+        mergedDirectives,
+      );
+    } else {
+      promptUsed = built.finalPrompt;
+    }
+    } // end of else branch (non-product-reference path through buildImagePrompt)
 
-    // Reference images sent to Replicate, in this order:
+    // Asset-aware routing — service/category use the product as an AI
+    // reference (image_input[1]) when a URL is available; everything
+    // else (and service/category WITHOUT a URL) goes through sharp
+    // compositing. The directive at the top of the prompt was already
+    // selected accordingly above (productReferenceDirective vs
+    // emptyZoneDirective vs FLAT SEAM clause for cover/thumbnail).
+    const productUrl = usesProductReference
+      ? (productUrlFromEntry
+        ?? (options.productBaseUrl
+          ? `${options.productBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(record.imageId)}`
+          : null))
+      : null;
+
+    // Reference images sent to Replicate, in order:
     //   [0] brand logo (if available)
-    //   [1] layout wireframe for cover/thumbnail (matches regen.ts)
-    //   [2] product image (URL = file://… won't work — Replicate fetches
-    //       over HTTPS only. We'd need to host the product somewhere
-    //       Replicate can reach. For v1 we DO NOT pass the product as
-    //       a reference; the empty-zone directive is what drives the
-    //       background. The product is pasted post-generation; the AI
-    //       never sees it. This keeps "must NOT be AI-modified" 100%
-    //       guaranteed — there is no path by which AI even observes
-    //       the product pixels.)
+    //   [1] cover/thumbnail wireframe OR operator product (service/category)
     const imageInput: string[] = [];
     if (logoUrl) imageInput.push(logoUrl);
-    const wireframe = WIREFRAME_URLS[record.asset];
+    const customWireframeUrl =
+      record.asset === "cover" ? options.customWireframes?.cover :
+      record.asset === "thumbnail" ? options.customWireframes?.thumbnail :
+      undefined;
+    const wireframe = customWireframeUrl ?? WIREFRAME_URLS[record.asset];
     if (wireframe) imageInput.push(wireframe);
+    if (productUrl) imageInput.push(productUrl);
 
     const gen = await generate({
       prompt: promptUsed,
@@ -231,37 +394,45 @@ async function processOne(args: {
       provider: options.provider,
     });
 
-    // Download the background bytes for compositing. Replicate signed
-    // URLs are good for ~1h; we fetch immediately so the bytes land
-    // before the URL can expire.
+    // Download the AI output bytes.
     const bgResp = await fetch(gen.imageUrl);
     if (!bgResp.ok) {
       throw new Error(`replicate output fetch HTTP ${bgResp.status}`);
     }
     const bgBytes = Buffer.from(await bgResp.arrayBuffer());
 
-    // Composite product into the zone. Output is PNG so the product
-    // pixels are byte-exact (no JPEG/WebP ringing at edges).
-    // leftHalfTargetColor enforces the same background colour across
-    // every cover and thumbnail in this run — the AI's choice is
-    // overridden in pixel-space inside compositeProduct.
-    const composed = await compositeProduct({
-      background: bgBytes,
-      product: productBytes,
-      asset: record.asset,
-      leftHalfTargetColor: runBgColor,
-    });
-
     await fs.mkdir(outImagesDir, { recursive: true });
     const outPath = path.join(outImagesDir, `${safeBasename(record.imageId)}.png`);
-    await fs.writeFile(outPath, composed.bytes);
+    let finalBytes: Buffer;
+    let summary: string;
+
+    if (usesProductReference && productUrl) {
+      // AI generated the final image using the product as a reference.
+      // Just persist the AI output directly — no composite pass.
+      finalBytes = bgBytes;
+      summary = `ai-reference (no composite) pred=${gen.predictionId ?? ""}`;
+    } else {
+      // Blog asset OR service/category without a public productBaseUrl
+      // (local dev fallback). Composite product onto AI scene via sharp.
+      const composed = await compositeProduct({
+        background: bgBytes,
+        product: productBytes,
+        asset: record.asset,
+      });
+      finalBytes = composed.bytes;
+      summary =
+        `composite bg=${composed.width}x${composed.height} ` +
+        `zone=${composed.zone.width}x${composed.zone.height}@${composed.zone.left},${composed.zone.top} ` +
+        `product=${composed.productRendered.width}x${composed.productRendered.height} ` +
+        `pred=${gen.predictionId ?? ""}`;
+      if (usesProductReference && !productUrl) {
+        summary += " (NOTE: no productBaseUrl available — fell back to composite; service/category prefer AI reference path)";
+      }
+    }
+    await fs.writeFile(outPath, finalBytes);
 
     process.stderr.write(
-      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} ` +
-      `status=completed bg=${composed.width}x${composed.height} ` +
-      `zone=${composed.zone.width}x${composed.zone.height}@${composed.zone.left},${composed.zone.top} ` +
-      `product=${composed.productRendered.width}x${composed.productRendered.height} ` +
-      `pred=${gen.predictionId ?? ""}\n`,
+      `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=completed ${summary}\n`,
     );
 
     return {
@@ -352,13 +523,13 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     process.exit(3);
   }
 
-  // Surface the run-wide pinned background colour at startup so it
-  // shows in the live log on the run page. Helps the operator
-  // verify (or debug) why cover/thumbnail came back in a given
-  // colour — and confirms the uniformity guarantee is wired up.
-  const runBgPreview = extractRunBackgroundColor(graphicToken);
+  // Left-half pixel recolor is disabled — the AI's rendering of the
+  // left half (logo, pill, title, subtitle, brand styling) is kept
+  // exactly as Replicate produced it. Run-wide visual consistency
+  // comes from the operator-supplied wireframe reference (when
+  // provided), which gives Replicate a visual blueprint to copy.
   process.stderr.write(
-    `upload-generate: pinned left-half background = ${runBgPreview ?? "(fallback) #FFFFFF"}\n`,
+    `upload-generate: left half = AI rendering as-is (no pixel recolor); right half = product fit:cover edge-to-edge\n`,
   );
 
   const pageTypeOpt: PageType | PageType[] = options.pageType ?? "blog";
@@ -414,6 +585,12 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     html_basename: path.basename(htmlPath),
     total_rows: records.length,
     products_count: Object.keys(options.products).length,
+    // Persist the operator-supplied custom wireframes so per-image
+    // Regenerate (which spawns a fresh CLI subprocess) can pick them
+    // up from the manifest and reuse the same references — keeping
+    // single-image regenerates visually consistent with the rest of
+    // the run.
+    custom_wireframes: options.customWireframes ?? null,
   };
   await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
 
