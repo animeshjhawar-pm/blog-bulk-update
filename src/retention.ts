@@ -269,25 +269,37 @@ export async function sweepRunRetention(
     }
   } catch { /* runsRoot may not exist yet */ }
 
-  // ── 2b. Upload-&-Generate `products-<runId>/` dirs ────────────────
-  // The new Upload & Generate flow drops operator product photos under
-  // <outDir>/products-<runId>/. They're typically a few MB each and
-  // accumulate fast on an active deploy. If the run's manifest is no
-  // longer around (fully evicted, or the operator abandoned the modal
-  // before /upload-generate/run spawned), the products dir is unowned
-  // and reclaimable. We DON'T age-prune the dirs that still have a
-  // live manifest — they're tied to a viewable run.
+  // ── 2b. Upload-&-Generate sidecar artefacts ───────────────────────
+  // The Upload & Generate flow drops three runId-scoped artefacts in
+  // outDir:
+  //
+  //   <outDir>/products-<runId>/         — operator product photos
+  //   <outDir>/products-<runId>.json     — manifest of paths/URLs the
+  //                                        operator supplied (kept so
+  //                                        per-image Regenerate can
+  //                                        re-spawn the CLI)
+  //   <outDir>/wireframes-<runId>/       — operator-supplied custom
+  //                                        wireframes for cover/thumb
+  //
+  // If the run's manifest is gone (fully evicted, or operator
+  // abandoned the modal before /upload-generate/run spawned) all three
+  // are unowned and reclaimable. Without this sweep step they pile up
+  // forever — products dirs are a few MB each, wireframes are larger,
+  // and the .json files are tiny but visible as clutter in /admin/disk.
   try {
     const all = await fs.readdir(outDir, { withFileTypes: true });
     for (const d of all) {
-      if (!d.isDirectory()) continue;
-      const m = /^products-([a-f0-9]+)$/.exec(d.name);
-      if (!m) continue;
-      const runId = m[1]!;
+      const dirMatchProducts = d.isDirectory() ? /^products-([a-f0-9]+)$/.exec(d.name) : null;
+      const dirMatchWireframes = d.isDirectory() ? /^wireframes-([a-f0-9]+)$/.exec(d.name) : null;
+      const fileMatchManifest = d.isFile() ? /^products-([a-f0-9]+)\.json$/.exec(d.name) : null;
+      const match = dirMatchProducts ?? dirMatchWireframes ?? fileMatchManifest;
+      if (!match) continue;
+      const runId = match[1]!;
       if (remainingRunIds.has(runId)) continue;
       const p = path.join(outDir, d.name);
-      const sz = await dirSize(p);
-      await rmrfIfExists(p);
+      const sz = d.isDirectory() ? await dirSize(p) : await fs.stat(p).then((s) => s.size).catch(() => 0);
+      if (d.isDirectory()) await rmrfIfExists(p);
+      else await rmIfExists(p);
       result.orphanRunsDeleted++;
       result.bytesFreed += sz;
     }

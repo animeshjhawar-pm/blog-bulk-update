@@ -29,6 +29,7 @@ import {
 import { findClient } from "./clients.js";
 import { pickLogoUrl } from "./regen.js";
 import { compositeProduct, emptyZoneDirective, productReferenceDirective } from "./composite.js";
+import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
 
 /**
  * Upload-&-Generate pipeline.
@@ -294,32 +295,9 @@ async function processOne(args: {
           ? options.promptOverrides.page.system
           : null;
 
-      const defaultServicePrompt =
-        `You are an expert image editor. You will receive one or more reference images containing a subject and its branded/product elements. Your task is to generate a NEW image that preserves the subject's identity and all branded elements EXACTLY while completely changing the background, environment, lighting, and surrounding context.\n\n` +
-        `WHAT MUST BE PRESERVED (100% IDENTICAL — DO NOT ALTER):\n\n` +
-        `The subject's face, features, skin tone, hair, and expression (if a person is present)\n` +
-        `All clothing, accessories, and worn items exactly as shown\n` +
-        `Any product, vehicle, or object the subject is using or holding — its exact shape, color, design, panels, and proportions\n` +
-        `Every logo, brand mark, badge, label, and text — including exact colors, fonts, placement, size, and orientation\n` +
-        `The subject's pose, posture, and the camera angle/viewpoint of the subject\n\n` +
-        `WHAT TO CHANGE (FULL CREATIVE FREEDOM):\n\n` +
-        `The entire background and environment\n` +
-        `Surrounding objects, vehicles, people, structures, and scenery\n` +
-        `Time of day, lighting conditions, weather, and atmospheric mood\n` +
-        `Background depth-of-field, blur, and motion as appropriate\n\n` +
-        `TECHNICAL & STYLE REQUIREMENTS:\n\n` +
-        `Photorealistic, high-resolution, professional commercial photography quality\n` +
-        `Lighting on the subject must realistically match the NEW environment — consistent shadows, reflections, highlights, and color temperature\n` +
-        `Natural integration: the subject must look genuinely photographed in the new location, never pasted or composited\n` +
-        `Keep the subject in sharp focus; apply natural, context-appropriate background blur or motion\n` +
-        `Match perspective and scale so the subject sits believably within the new scene\n\n` +
-        `NEGATIVE CONSTRAINTS (AVOID):\n\n` +
-        `Do NOT alter, distort, recolor, relocate, or duplicate any logo, badge, or text\n` +
-        `Do NOT change the subject's identity, face, clothing, or any product/object design or color\n` +
-        `No warped or illegible branding, no text artifacts, no extra or missing limbs, no distorted proportions\n` +
-        `No change to the subject itself — only the world around it changes`;
-
-      promptUsed = operatorPageOverride ? operatorPageOverride : defaultServicePrompt;
+      // Default prompt body is imported from src/prompts/upgen.ts so
+      // it stays byte-identical with the modal preview (web.ts).
+      promptUsed = operatorPageOverride ? operatorPageOverride : UPGEN_SERVICE_DEFAULT_PROMPT;
 
       process.stderr.write(
         `[${rowNum}/${totalRows}] id=${record.imageId} prompt=product-reference (` +

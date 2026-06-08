@@ -56,47 +56,14 @@ import {
   expiryForRun,
   type RetentionConfig,
 } from "./retention.js";
+import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
 
-// Default system prompt shown in the Upload & Generate "Review prompts"
-// modal for the "page" group (service H1 / service body / category).
-// Replaces the page.ts default in this flow only — keep in sync with
-// the inline default in src/uploadGenerate.ts.
-const UPGEN_SERVICE_DEFAULT_PROMPT = [
-  `You are an expert image editor. You will receive one or more reference images containing a subject and its branded/product elements. Your task is to generate a NEW image that preserves the subject's identity and all branded elements EXACTLY while completely changing the background, environment, lighting, and surrounding context.`,
-  ``,
-  `WHAT MUST BE PRESERVED (100% IDENTICAL — DO NOT ALTER):`,
-  ``,
-  `The subject's face, features, skin tone, hair, and expression (if a person is present)`,
-  `All clothing, accessories, and worn items exactly as shown`,
-  `Any product, vehicle, or object the subject is using or holding — its exact shape, color, design, panels, and proportions`,
-  `Every logo, brand mark, badge, label, and text — including exact colors, fonts, placement, size, and orientation`,
-  `The subject's pose, posture, and the camera angle/viewpoint of the subject`,
-  ``,
-  `WHAT TO CHANGE (FULL CREATIVE FREEDOM):`,
-  ``,
-  `The entire background and environment`,
-  `Surrounding objects, vehicles, people, structures, and scenery`,
-  `Time of day, lighting conditions, weather, and atmospheric mood`,
-  `Background depth-of-field, blur, and motion as appropriate`,
-  ``,
-  `TECHNICAL & STYLE REQUIREMENTS:`,
-  ``,
-  `Photorealistic, high-resolution, professional commercial photography quality`,
-  `Lighting on the subject must realistically match the NEW environment — consistent shadows, reflections, highlights, and color temperature`,
-  `Natural integration: the subject must look genuinely photographed in the new location, never pasted or composited`,
-  `Keep the subject in sharp focus; apply natural, context-appropriate background blur or motion`,
-  `Match perspective and scale so the subject sits believably within the new scene`,
-  ``,
-  `NEGATIVE CONSTRAINTS (AVOID):`,
-  ``,
-  `Do NOT alter, distort, recolor, relocate, or duplicate any logo, badge, or text`,
-  `Do NOT change the subject's identity, face, clothing, or any product/object design or color`,
-  `No warped or illegible branding, no text artifacts, no extra or missing limbs, no distorted proportions`,
-  `No change to the subject itself — only the world around it changes`,
-].join("\n");
+// UPGEN_SERVICE_DEFAULT_PROMPT lives in src/prompts/upgen.ts so the
+// modal preview (here) and the runtime path (uploadGenerate.ts) read
+// from a single source and cannot drift apart.
 
 // Inline-SVG favicon — purple gradient circle with a refresh-arrow
 // over a stylised image frame. Encoded as a data URI so we don't ship
