@@ -60,6 +60,44 @@ import {
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
 
+// Default system prompt shown in the Upload & Generate "Review prompts"
+// modal for the "page" group (service H1 / service body / category).
+// Replaces the page.ts default in this flow only — keep in sync with
+// the inline default in src/uploadGenerate.ts.
+const UPGEN_SERVICE_DEFAULT_PROMPT = [
+  `You are an expert image editor. You will receive one or more reference images containing a subject and its branded/product elements. Your task is to generate a NEW image that preserves the subject's identity and all branded elements EXACTLY while completely changing the background, environment, lighting, and surrounding context.`,
+  ``,
+  `WHAT MUST BE PRESERVED (100% IDENTICAL — DO NOT ALTER):`,
+  ``,
+  `The subject's face, features, skin tone, hair, and expression (if a person is present)`,
+  `All clothing, accessories, and worn items exactly as shown`,
+  `Any product, vehicle, or object the subject is using or holding — its exact shape, color, design, panels, and proportions`,
+  `Every logo, brand mark, badge, label, and text — including exact colors, fonts, placement, size, and orientation`,
+  `The subject's pose, posture, and the camera angle/viewpoint of the subject`,
+  ``,
+  `WHAT TO CHANGE (FULL CREATIVE FREEDOM):`,
+  ``,
+  `The entire background and environment`,
+  `Surrounding objects, vehicles, people, structures, and scenery`,
+  `Time of day, lighting conditions, weather, and atmospheric mood`,
+  `Background depth-of-field, blur, and motion as appropriate`,
+  ``,
+  `TECHNICAL & STYLE REQUIREMENTS:`,
+  ``,
+  `Photorealistic, high-resolution, professional commercial photography quality`,
+  `Lighting on the subject must realistically match the NEW environment — consistent shadows, reflections, highlights, and color temperature`,
+  `Natural integration: the subject must look genuinely photographed in the new location, never pasted or composited`,
+  `Keep the subject in sharp focus; apply natural, context-appropriate background blur or motion`,
+  `Match perspective and scale so the subject sits believably within the new scene`,
+  ``,
+  `NEGATIVE CONSTRAINTS (AVOID):`,
+  ``,
+  `Do NOT alter, distort, recolor, relocate, or duplicate any logo, badge, or text`,
+  `Do NOT change the subject's identity, face, clothing, or any product/object design or color`,
+  `No warped or illegible branding, no text artifacts, no extra or missing limbs, no distorted proportions`,
+  `No change to the subject itself — only the world around it changes`,
+].join("\n");
+
 // Inline-SVG favicon — purple gradient circle with a refresh-arrow
 // over a stylised image frame. Encoded as a data URI so we don't ship
 // a separate file.
@@ -116,6 +154,22 @@ interface RunState {
    *                     downstream is identical for all three.
    */
   mode?: "regen" | "upload" | "upload-generate";
+  /**
+   * For upload-generate runs only — wireframes the operator dropped
+   * (or pasted URLs for) at the original Generate-time. Stored here so
+   * per-image Regenerate can re-spawn the CLI with the same references
+   * and stay visually consistent with the rest of the run.
+   * Populated by startUploadGenerate from caller-supplied URLs, and by
+   * tryReconstructRunFromDisk from the manifest's `custom_wireframes`
+   * field so the references survive a server restart.
+   */
+  customWireframes?: { cover?: string; thumbnail?: string };
+  /**
+   * Product-store base URL the CLI uses for service/category asset
+   * reference images. Persisted so per-image Regenerate can pass it
+   * to the child subprocess. Format: <publicBase>/products-store/<runId>.
+   */
+  productBaseUrl?: string;
 }
 
 const RUNS = new Map<string, RunState>();
@@ -1707,9 +1761,14 @@ ${recent.length > 0 ? `
     <button class="ghost" onclick="hidePtModal()">×</button>
   </header>
   <div class="body" style="padding:18px 20px">
-    <div class="sub" style="margin-bottom:12px">Only published pages are loaded. Pick the types you want to work on; you can change this later.</div>
+    <div class="sub" style="margin-bottom:12px">Only published pages are loaded. Pick <strong>one page type</strong> to work on — you can switch later from the workspace tabs.</div>
     <div id="pt-loading" class="pt-loading"><span class="spinner"></span> Counting published pages…</div>
-    <div id="pt-grid" class="pt-grid" style="display:none"></div>
+    <div id="pt-grid" style="display:none">
+      <label for="pt-select" style="font-size:12px;color:var(--ink-muted);margin-bottom:4px;display:block">Page type</label>
+      <select id="pt-select" onchange="ptUpdate()" style="width:100%;font-size:14px;padding:10px 12px;border:1px solid var(--border-strong);border-radius:8px;background:#fff;color:var(--ink)">
+        <option value="" disabled selected>Select a page type…</option>
+      </select>
+    </div>
   </div>
   <footer style="padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center">
     <span class="sub" id="pt-warn" style="color:var(--err);flex:1"></span>
@@ -1909,37 +1968,48 @@ async function openPtModal(slug, projectId, name) {
     if (j && j.counts) counts = j.counts;
   } catch {}
   const grid = document.getElementById('pt-grid');
-  const cards = [
+  const select = document.getElementById('pt-select');
+  const opts = [
     { pt: 'blog',     label: 'Blog pages' },
     { pt: 'service',  label: 'Service pages' },
     { pt: 'category', label: 'Category pages' },
-  ].map(({ pt, label }) => {
+  ];
+  // Pre-pick the first page type that has content so Continue is
+  // active immediately without forcing the operator to manually
+  // pick the only available choice. Falls back to "" (no auto-pick)
+  // when every type is empty — the select stays at "Select a page
+  // type…" placeholder and Continue is disabled.
+  let firstAvailable = '';
+  let optHtml = '<option value="" disabled' + (firstAvailable ? '' : ' selected') + '>Select a page type…</option>';
+  for (const { pt, label } of opts) {
     const n = counts[pt] || 0;
-    return '<label class="pt-row' + (n === 0 ? ' disabled' : '') + '">' +
-      '<input type="checkbox" name="pt" value="' + pt + '" ' + (n > 0 ? 'checked' : 'disabled') + ' onchange="ptUpdate()">' +
-      '<div class="pt-meta"><div class="pt-label">' + label + '</div>' +
-      '<div class="pt-count">' + n + ' published</div></div>' +
-    '</label>';
-  }).join('');
-  grid.innerHTML = cards;
+    const disabled = n === 0 ? ' disabled' : '';
+    if (!firstAvailable && n > 0) firstAvailable = pt;
+    const isSel = (firstAvailable === pt) ? ' selected' : '';
+    optHtml += '<option value="' + pt + '"' + disabled + isSel + '>' +
+      label + ' · ' + n + ' published' + (n === 0 ? ' (none)' : '') +
+      '</option>';
+  }
+  select.innerHTML = optHtml;
   grid.dataset.slug = slug;
   document.getElementById('pt-loading').style.display = 'none';
-  grid.style.display = 'grid';
+  grid.style.display = 'block';
   ptUpdate();
 }
 function ptUpdate() {
-  const checks = document.querySelectorAll('#pt-grid input[name=pt]:checked');
-  document.getElementById('pt-continue').disabled = checks.length === 0;
+  const select = document.getElementById('pt-select');
+  const v = select ? select.value : '';
+  document.getElementById('pt-continue').disabled = !v;
 }
 function ptContinue() {
-  const checks = Array.from(document.querySelectorAll('#pt-grid input[name=pt]:checked')).map((c) => c.value);
-  if (checks.length === 0) { document.getElementById('pt-warn').textContent = 'pick at least one'; return; }
+  const select = document.getElementById('pt-select');
+  const v = select ? select.value : '';
+  if (!v) { document.getElementById('pt-warn').textContent = 'pick a page type'; return; }
   const slug = document.getElementById('pt-grid').dataset.slug;
-  // Workspace is multi-page-type now: ALL chosen types go into
-  // ?selected= as a CSV. The workspace shows the union and the pills
-  // act as toggles.
+  // Single-select now. Workspace tabs let the operator switch types
+  // later if they want — they don't multi-select here.
   const params = new URLSearchParams();
-  params.set('selected', checks.join(','));
+  params.set('selected', v);
   window.location.href = '/workspace/' + encodeURIComponent(slug) + '?' + params.toString();
 }
 function closePtModal(ev) { if (ev.target === ev.currentTarget) hidePtModal(); }
@@ -2066,6 +2136,7 @@ async function workspacePage(
   slug: string,
   pageType: PageType = "blog",
   selectedPageTypes?: Set<PageType>,
+  sortBy: "created" | "modified" = "created",
 ) {
   const entry = resolveClient(slug);
   if (!entry) {
@@ -2097,7 +2168,7 @@ async function workspacePage(
       ? [...selectedPageTypes]
       : [pageType];
     [clusters, pageTypeCounts] = await Promise.all([
-      listPublishedClusters(entry.projectId, queryTypes),
+      listPublishedClusters(entry.projectId, queryTypes, sortBy),
       publishedClusterCountsByPageType(entry.projectId),
     ]);
   } catch (err) {
@@ -2279,27 +2350,24 @@ async function workspacePage(
 
   const effectiveLogo = overrides.logo_url || primaryLogo || "";
   const allPageTypes: PageType[] = ["blog", "service", "category"];
-  const currentSelected = selectedPageTypes && selectedPageTypes.size > 0
-    ? new Set(allPageTypes.filter((pt) => selectedPageTypes.has(pt)))
-    : new Set<PageType>(allPageTypes);
+  // SINGLE-SELECT page type. Blog and service/category have diverged
+  // (service uses AI-with-reference; blog uses sharp-composite), so
+  // mixing them in one workspace is misleading. Picking a pill makes
+  // it the ACTIVE selection and deselects the others. Defaults to
+  // blog when the URL doesn't pin one.
+  const activePageType: PageType =
+    selectedPageTypes && selectedPageTypes.size > 0
+      ? (allPageTypes.find((pt) => selectedPageTypes.has(pt)) ?? "blog")
+      : "blog";
+  const currentSelected = new Set<PageType>([activePageType]);
 
-  // Pure toggle pills — no "active" concept. The cluster table shows
-  // the union of every pill that's currently selected (a per-row
-  // page_type pill keeps things distinguishable). Clicking a selected
-  // pill removes it (unless it's the last one); clicking an
-  // unselected pill adds it.
+  // Single-select page-type tabs. Clicking switches to that type;
+  // clicking the current one is a no-op (it's already active).
   const tabBtn = (pt: PageType, label: string) => {
-    const isSelected = currentSelected.has(pt);
-    let nextSelected: PageType[];
-    if (isSelected) {
-      const others = [...currentSelected].filter((t) => t !== pt) as PageType[];
-      nextSelected = others.length > 0 ? others : [pt]; // last pill is pinned
-    } else {
-      nextSelected = [...currentSelected, pt] as PageType[];
-    }
-    const href = `/workspace/${esc(slug)}?selected=${nextSelected.join(",")}`;
-    const stateClass = isSelected ? "active" : "unselected";
-    return `<a class="page-tab ${stateClass}" href="${href}" title="${isSelected ? "click to remove" : "click to add"}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
+    const isActive = pt === activePageType;
+    const href = `/workspace/${esc(slug)}?selected=${pt}`;
+    const stateClass = isActive ? "active" : "unselected";
+    return `<a class="page-tab ${stateClass}" href="${href}" title="${isActive ? "currently selected" : "click to switch to " + label}">${label} <span class="ct">${pageTypeCounts[pt]}</span></a>`;
   };
 
   const body = `
@@ -2515,6 +2583,13 @@ async function saveToken(e) {
       <input type="checkbox" id="all-clusters" onchange="toggleAllClusters(this.checked)">
       <label for="all-clusters">Select all (visible)</label>
     </div>
+    <div class="check-row" style="flex:0 0 auto;gap:6px">
+      <label for="cluster-sort" style="font-size:12px;color:var(--muted)">Sort:</label>
+      <select id="cluster-sort" onchange="onSortChange(this.value)" style="padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg-1);color:var(--fg)">
+        <option value="created"${sortBy === "created" ? " selected" : ""}>Created date (newest first)</option>
+        <option value="modified"${sortBy === "modified" ? " selected" : ""}>Last modified (newest first)</option>
+      </select>
+    </div>
     <div class="meta" style="flex:0 0 auto">Showing <strong id="visible-count">${clusters.length}</strong> / ${clusters.length}</div>
   </div>
   <div id="asset-filter-row" class="asset-filter-row">
@@ -2598,7 +2673,83 @@ async function saveToken(e) {
     <footer class="upgen-footer">
       <span class="sub" id="upgen-progress" style="margin-right:auto;font-weight:500;color:var(--ink)"></span>
       <button type="button" onclick="closeUploadGenerate()">Cancel</button>
-      <button type="button" class="primary" id="upgen-submit-btn" onclick="upgenSubmit()" disabled>Upload &amp; Generate →</button>
+      <button type="button" class="primary" id="upgen-submit-btn" onclick="upgenSubmit()" disabled>Review prompts →</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Upload & Generate — prompt review modal. Opens AFTER the operator
+     has dropped product files and clicked "Review prompts →" on the
+     upload modal. Lets them preview (and optionally edit, per-run only)
+     the system prompt for each prompt group that will actually run for
+     this selection. Mirrors the Generate flow's confirm modal exactly
+     so operators see the same review pattern in both flows. Edits are
+     scoped to this one run — the repo prompts/*.ts files are never
+     touched. -->
+<div class="cmp-overlay" id="upgen-prompts-overlay" onclick="upgenPromptsBackdrop(event)">
+  <div class="cmp-modal" role="dialog" aria-modal="true" style="max-width:900px">
+    <header class="cmp-head">
+      <strong>Review prompts for Upload &amp; Generate</strong>
+      <span class="sub" id="upgen-prompts-summary" style="margin-left:auto"></span>
+      <button class="cmp-x" onclick="closeUpgenPromptsConfirm()" aria-label="Close">×</button>
+    </header>
+    <div style="padding:14px 18px 6px 18px">
+      <div class="sub" id="upgen-prompts-help">
+        Each prompt below is collapsed by default. Expand to view; edit if you want a one-off tweak just for this run. Edits are <strong>not</strong> saved back to the repo — they only apply to the images you're about to generate. The "PRODUCT COMPOSITE ZONE" hard-constraint block is appended automatically on top of whatever you put here, so the empty-zone behaviour is preserved no matter what you edit.
+      </div>
+    </div>
+    <!-- Wireframe references (optional, per run). Drop a structural
+         reference image or paste a public URL. The image gets passed
+         to Replicate as image_input[1] for every cover/thumbnail in
+         this run — keeping layouts uniform across the run. Leave
+         empty to use the default wireframes. -->
+    <div style="padding:0 18px 8px 18px;flex-shrink:0">
+      <details class="gen-group" id="upgen-wireframes-details">
+        <summary>
+          <strong>Wireframe references (optional)</strong>
+          <span class="sub" style="margin-left:6px">— drop one cover &amp; one thumbnail to enforce structure on this run</span>
+          <span class="sub upgen-wireframes-edit-flag" style="margin-left:8px;display:none;color:var(--brand)">2 wireframes set</span>
+        </summary>
+        <div style="padding:10px 12px 12px;display:grid;grid-template-columns:1fr 1fr;gap:14px">
+          <div data-asset="cover" class="upgen-wf-slot" style="border:1px solid var(--border);border-radius:8px;padding:10px;background:#fff;display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="pill cover" style="padding:2px 8px;font-size:11px">cover</span>
+              <span style="font-size:11.5px;color:var(--ink-muted);font-weight:500">structural reference (16:9)</span>
+            </div>
+            <div class="upgen-wf-zone upgen-dropzone" data-asset="cover" style="flex:1;min-height:120px;cursor:pointer">
+              <div class="dz-icon">↑</div>
+              <div class="dz-text">Drop wireframe</div>
+              <div class="dz-sub">or paste URL below · PNG · JPEG · WebP · ≤10 MB</div>
+            </div>
+            <input type="url" class="upgen-wf-url" data-asset="cover" placeholder="…or paste a public image URL" oninput="upgenWfUrlInput(this)" style="font-size:11.5px;padding:6px 8px">
+            <div class="sub upgen-wf-status" style="font-size:11px;color:var(--ink-faint);min-height:14px"></div>
+          </div>
+          <div data-asset="thumbnail" class="upgen-wf-slot" style="border:1px solid var(--border);border-radius:8px;padding:10px;background:#fff;display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="pill thumbnail" style="padding:2px 8px;font-size:11px">thumbnail</span>
+              <span style="font-size:11.5px;color:var(--ink-muted);font-weight:500">structural reference (3:2)</span>
+            </div>
+            <div class="upgen-wf-zone upgen-dropzone" data-asset="thumbnail" style="flex:1;min-height:120px;cursor:pointer">
+              <div class="dz-icon">↑</div>
+              <div class="dz-text">Drop wireframe</div>
+              <div class="dz-sub">or paste URL below · PNG · JPEG · WebP · ≤10 MB</div>
+            </div>
+            <input type="url" class="upgen-wf-url" data-asset="thumbnail" placeholder="…or paste a public image URL" oninput="upgenWfUrlInput(this)" style="font-size:11.5px;padding:6px 8px">
+            <div class="sub upgen-wf-status" style="font-size:11px;color:var(--ink-faint);min-height:14px"></div>
+          </div>
+        </div>
+        <div class="sub" style="padding:0 12px 10px 12px;line-height:1.5">
+          When you drop a file, it&apos;s uploaded to the server and the public URL is filled into the URL field automatically. When running locally, prefer the URL field with an already-public link — Replicate can&apos;t reach <code>localhost</code>. If you skip both, the default wireframe is used.
+        </div>
+      </details>
+    </div>
+    <div id="upgen-prompts" style="padding:0 18px 6px 18px;overflow-y:auto;flex:1">
+      <div class="sub">Loading prompts…</div>
+    </div>
+    <footer style="padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end;align-items:center">
+      <span class="sub" id="upgen-prompts-overrides-count" style="margin-right:auto"></span>
+      <button type="button" onclick="upgenPromptsBack()">← Back to uploads</button>
+      <button type="button" class="primary" id="upgen-prompts-submit-btn" onclick="upgenPromptsSubmit()">Generate →</button>
     </footer>
   </div>
 </div>
@@ -2815,6 +2966,25 @@ function applyFilters() {
   document.getElementById('all-clusters').checked = false;
 }
 function filterClusters() { applyFilters(); }
+
+function onSortChange(val) {
+  const v = (val === 'modified') ? 'modified' : 'created';
+  try { sessionStorage.setItem('gw_cluster_sort_v1', v); } catch (_e) {}
+  const u = new URL(window.location.href);
+  u.searchParams.set('sort', v);
+  window.location.href = u.toString();
+}
+(function restoreSortPref(){
+  try {
+    const u = new URL(window.location.href);
+    if (u.searchParams.has('sort')) return;
+    const saved = sessionStorage.getItem('gw_cluster_sort_v1');
+    if (saved && saved !== 'created') {
+      u.searchParams.set('sort', saved);
+      window.location.replace(u.toString());
+    }
+  } catch (_e) {}
+})();
 
 function refreshTotals() {
   let imgs = 0, cls = 0;
@@ -3400,6 +3570,13 @@ async function openUploadGenerate() {
             '<div class="dz-browse-link">or click to browse</div>' +
             '<div class="dz-sub" style="margin-top:6px">PNG · JPEG · WebP · ≤10 MB</div>' +
           '</div>' +
+          // Per-card URL paste (alternative to drop). Service/category
+          // assets use the URL directly as a Replicate reference; blog
+          // assets fetch the URL bytes server-side for composite. Use
+          // a publicly-reachable URL (Imgur, GitHub raw, Dropbox
+          // sharing link) — localhost URLs are rejected.
+          '<input type="url" class="upgen-product-url" data-image-id="' + escapeHtmlBasic(imgId) + '" data-cluster-id="' + escapeHtmlBasic(it.cluster_id) + '" placeholder="…or paste a public image URL" oninput="upgenProductUrlInput(this)" style="font-size:11.5px;padding:6px 8px;width:100%;box-sizing:border-box">' +
+          '<div class="sub upgen-product-status" data-image-id="' + escapeHtmlBasic(imgId) + '" style="font-size:11px;color:var(--ink-faint);min-height:14px"></div>' +
         '</div>'
       );
     }
@@ -3506,17 +3683,22 @@ async function handleUpgenDrop(imageId, file, dz, opts) {
     return;
   }
 
-  // Auto-share within cluster: when the user directly drops a file
-  // into one slot, every OTHER slot in the same cluster that is
-  // still empty gets the same file. The operator can override any
-  // individual slot afterward by dropping a different file into it
-  // (clearing first if needed). We skip slots already filled to
-  // protect any manual customization the operator has done. The
-  // cascade is one-level — sibling uploads pass skipCascade=true so
-  // they don't recursively try to fan out again.
+  // Auto-share within cluster: ONLY for blog clusters (where cover +
+  // thumbnail of one page legitimately share the same product photo,
+  // the 90% case the cascade was built for). Service and category
+  // clusters have multiple slots that represent DIFFERENT services /
+  // industries / sections — auto-sharing the same image across them
+  // would silently fill every card with the same picture, which is
+  // never what the operator wants. So we look up the cluster's
+  // page_type and skip the cascade for non-blog.
+  //
+  // The cascade is also one-level — sibling uploads pass
+  // skipCascade=true so they don't recursively fan out again.
   if (opts.skipCascade) return;
   const clusterId = dz.getAttribute('data-cluster-id');
   if (!clusterId) return;
+  const clusterMeta = clusterById(clusterId);
+  if (!clusterMeta || clusterMeta.page_type !== 'blog') return;
   const siblings = document.querySelectorAll(
     '.upgen-dropzone[data-cluster-id="' + clusterId + '"]'
   );
@@ -3532,6 +3714,67 @@ async function handleUpgenDrop(imageId, file, dz, opts) {
 function upgenReplace(imageId) {
   const dz = document.querySelector('.upgen-dropzone[data-image-id="' + imageId + '"]');
   if (dz) { dz.click(); }
+}
+
+// Per-card URL paste handler. Same shape as the wireframe URL handler:
+// validate, send to server, mark slot as "dropped" so the submit
+// button enables. Rejects localhost URLs (Replicate can't fetch from
+// there). Empty input clears the slot.
+async function upgenProductUrlInput(inp) {
+  if (!UPGEN_STATE) return;
+  const imageId = inp.getAttribute('data-image-id');
+  if (!imageId) return;
+  const raw = (inp.value || '').trim();
+  const statusEl = document.querySelector('.upgen-product-status[data-image-id="' + imageId + '"]');
+  if (!raw) {
+    // Cleared — drop the URL from selection. If a previously-dropped
+    // file is still there, the slot stays "dropped" via the file
+    // path; if not, it goes back to "needs upload".
+    if (statusEl) statusEl.textContent = '';
+    return;
+  }
+  if (!/^https?:\\/\\/[^\\s]+/i.test(raw)) {
+    if (statusEl) statusEl.textContent = 'Not a valid http(s) URL';
+    return;
+  }
+  // Localhost check on the client too — saves the server roundtrip.
+  if (/localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0/.test(raw)) {
+    if (statusEl) {
+      statusEl.style.color = 'var(--err)';
+      statusEl.textContent = 'localhost URL — Replicate cannot fetch this. Paste a publicly-hosted URL.';
+    }
+    return;
+  }
+  try {
+    if (statusEl) { statusEl.style.color = ''; statusEl.textContent = 'Saving URL…'; }
+    const r = await fetch('/upload-generate/' + UPGEN_STATE.runId + '/product-url/' + encodeURIComponent(imageId), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: raw }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    UPGEN_STATE.dropped.add(imageId);
+    // Update the dropzone visually to indicate the URL is in use.
+    const dz = document.querySelector('.upgen-dropzone[data-image-id="' + imageId + '"]');
+    if (dz) {
+      dz.classList.remove('uploading', 'error');
+      dz.innerHTML =
+        '<div class="dz-icon" style="color:var(--ok)">✓</div>' +
+        '<div class="dz-text" style="color:var(--ok)">URL set</div>' +
+        '<div class="dz-sub">Drop a file to replace</div>';
+    }
+    if (statusEl) {
+      statusEl.style.color = '';
+      statusEl.textContent = 'OK: ' + raw.slice(0, 80);
+    }
+    updateUpgenProgress();
+  } catch (err) {
+    if (statusEl) {
+      statusEl.style.color = 'var(--err)';
+      statusEl.textContent = 'Failed: ' + (err && err.message ? err.message : err);
+    }
+  }
 }
 
 async function upgenClear(imageId) {
@@ -3551,27 +3794,346 @@ async function upgenClear(imageId) {
   updateUpgenProgress();
 }
 
+// Drop modal's submit button no longer kicks off generation directly.
+// Instead it transitions to the prompt-review modal — mirrors the
+// Generate flow's "click Generate → review prompts → confirm" pattern.
+// The actual POST to /upload-generate/run lives in upgenPromptsSubmit.
 async function upgenSubmit() {
   if (!UPGEN_STATE) return;
+  // Visually close the drop modal, open the prompt modal. We keep
+  // UPGEN_STATE alive so upgenPromptsSubmit (or "Back to uploads")
+  // still has the run id and selection on hand.
+  document.getElementById('upgen-overlay').classList.remove('open');
+  await openUpgenPromptsConfirm();
+}
+
+// ── Upload-&-Generate prompt-review modal ──────────────────────────
+// Defaults cache, mirrors the Generate-modal's GENERATE_DEFAULTS so the
+// /api/prompts round-trip only fires once per workspace page.
+let UPGEN_PROMPTS_DEFAULTS = null;
+
+// Which prompt groups are actually used by the current selection.
+// Same helper Generate uses; the upgen modal cares about the same set
+// since the underlying prompt templates are shared per asset_type.
+function summariseUpgenSelection() {
+  let imgs = 0, cls = 0;
+  const groupsSeen = new Set();
+  for (const [cid, set] of selection.entries()) {
+    if (!set || set.size === 0) continue;
+    cls++;
+    imgs += set.size;
+    const cluster = clusterById(cid);
+    if (!cluster) continue;
+    for (const img of cluster.images) {
+      if (!set.has(img.id)) continue;
+      groupsSeen.add(promptGroupForAsset(img.asset));
+    }
+  }
+  return { imgs, cls, groups: [...groupsSeen] };
+}
+
+// Operator-supplied wireframe URLs for the current prompt-modal
+// session. Reset each time openUpgenPromptsConfirm runs so fresh
+// uploads don't carry over from a previous modal open.
+let UPGEN_WF_URLS = { cover: '', thumbnail: '' };
+
+async function openUpgenPromptsConfirm() {
+  const { imgs, cls, groups } = summariseUpgenSelection();
+  document.getElementById('upgen-prompts-summary').textContent =
+    imgs + ' image' + (imgs === 1 ? '' : 's') +
+    ' across ' + cls + ' cluster' + (cls === 1 ? '' : 's');
+
+  const overlay = document.getElementById('upgen-prompts-overlay');
+  overlay.classList.add('open');
+
+  // Reset wireframe slots each open (per spec: fresh upload per run).
+  UPGEN_WF_URLS = { cover: '', thumbnail: '' };
+  for (const inp of document.querySelectorAll('.upgen-wf-url')) inp.value = '';
+  for (const st of document.querySelectorAll('.upgen-wf-status')) st.textContent = '';
+  for (const dz of document.querySelectorAll('.upgen-wf-zone')) {
+    dz.classList.remove('uploading', 'error');
+    dz.innerHTML =
+      '<div class="dz-icon">↑</div>' +
+      '<div class="dz-text">Drop wireframe</div>' +
+      '<div class="dz-sub">or paste URL below · PNG · JPEG · WebP · ≤10 MB</div>';
+  }
+  // Bind the wireframe drop zones (idempotent — fires only on first
+  // open since the listeners are kept). Using a flag to avoid
+  // multiple bindings if the operator opens the modal twice in a
+  // session.
+  if (!window.__upgenWfBound) {
+    for (const dz of document.querySelectorAll('.upgen-wf-zone')) {
+      dz.addEventListener('click', upgenWfClick);
+      dz.addEventListener('dragover', upgenDragOver);
+      dz.addEventListener('dragleave', upgenDragLeave);
+      dz.addEventListener('drop', upgenWfDrop);
+    }
+    window.__upgenWfBound = true;
+  }
+
+  const host = document.getElementById('upgen-prompts');
+  if (!UPGEN_PROMPTS_DEFAULTS) {
+    host.innerHTML = '<div class="sub"><span class="spinner"></span> Loading prompts…</div>';
+    try {
+      const r = await fetch('/api/prompts?flow=upgen');
+      const j = await r.json();
+      UPGEN_PROMPTS_DEFAULTS = (j && j.groups) || [];
+    } catch (err) {
+      host.innerHTML = '<div class="banner err">Failed to load prompts: ' + (err && err.message ? err.message : String(err)) + '</div>';
+      return;
+    }
+  }
+  renderUpgenPrompts(groups);
+}
+
+function upgenPromptsBackdrop(ev) {
+  if (ev.target === ev.currentTarget) closeUpgenPromptsConfirm();
+}
+function closeUpgenPromptsConfirm() {
+  document.getElementById('upgen-prompts-overlay').classList.remove('open');
+}
+// "Back to uploads" — hide the prompt modal and reopen the drop modal
+// so the operator can replace files or add missing ones.
+function upgenPromptsBack() {
+  document.getElementById('upgen-prompts-overlay').classList.remove('open');
+  document.getElementById('upgen-overlay').classList.add('open');
+  // Reset submit-button label/state in case the user came back after
+  // the spinner was on.
   const btn = document.getElementById('upgen-submit-btn');
+  if (btn) { btn.disabled = false; btn.textContent = 'Review prompts →'; }
+}
+
+// Render the prompt groups into the upgen modal. The HTML shape and
+// CSS classes (.gen-group, .gen-edit-flag, .gen-system, .json-edit)
+// are deliberately the SAME as the Generate modal — the existing
+// styles cover both modals and the operator sees a consistent UI.
+function renderUpgenPrompts(usedGroups) {
+  const host = document.getElementById('upgen-prompts');
+  const used = new Set(usedGroups);
+  const sorted = UPGEN_PROMPTS_DEFAULTS.slice().sort((a, b) => {
+    const au = used.has(a.group), bu = used.has(b.group);
+    return (bu ? 1 : 0) - (au ? 1 : 0);
+  });
+  host.innerHTML = sorted.map((p) => {
+    const isUsed = used.has(p.group);
+    return ''
+      + '<details class="gen-group" data-group="' + p.group + '">'
+      + '  <summary>'
+      + '    <strong>' + escapeHtmlBasic(p.label) + '</strong>'
+      + (isUsed ? ' <span class="pill internal" style="font-size:10px;margin-left:6px">used by this run</span>'
+                : ' <span class="sub" style="margin-left:6px">(not used by this run)</span>')
+      + '    <span class="sub upgen-prompts-edit-flag" style="margin-left:8px;display:none;color:var(--brand)">edited</span>'
+      + '  </summary>'
+      + '  <div style="padding:10px 12px 12px">'
+      + '    <label style="font-size:11.5px;color:var(--ink-muted)">System prompt</label>'
+      + '    <textarea class="gen-system json-edit" data-default="' + escapeHtmlBasic(p.system) + '" oninput="upgenPromptsFlagEdit(this)">' + escapeHtmlBasic(p.system) + '</textarea>'
+      + '    <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+      + '      <button type="button" class="ghost" onclick="upgenPromptsResetSystem(this)">Reset to default</button>'
+      + '      <span class="sub upgen-prompts-status"></span>'
+      + '    </div>'
+      + '  </div>'
+      + '</details>';
+  }).join('');
+  recountUpgenPromptsOverrides();
+}
+function upgenPromptsFlagEdit(ta) {
+  const det = ta.closest('details');
+  if (!det) return;
+  const flag = det.querySelector('.upgen-prompts-edit-flag');
+  const dirty = ta.value !== ta.dataset.default;
+  if (flag) flag.style.display = dirty ? 'inline' : 'none';
+  recountUpgenPromptsOverrides();
+}
+function upgenPromptsResetSystem(btn) {
+  const det = btn.closest('details');
+  if (!det) return;
+  const ta = det.querySelector('.gen-system');
+  if (!ta) return;
+  const decoder = document.createElement('div');
+  decoder.innerHTML = ta.dataset.default;
+  ta.value = decoder.textContent || '';
+  upgenPromptsFlagEdit(ta);
+}
+function recountUpgenPromptsOverrides() {
+  let n = 0;
+  for (const ta of document.querySelectorAll('#upgen-prompts .gen-system')) {
+    const decoder = document.createElement('div');
+    decoder.innerHTML = ta.dataset.default;
+    const def = decoder.textContent || '';
+    if (ta.value !== def) n++;
+  }
+  const lbl = document.getElementById('upgen-prompts-overrides-count');
+  lbl.textContent = n === 0 ? '' : n + ' prompt' + (n === 1 ? '' : 's') + ' overridden for this run';
+}
+
+// ── Wireframe upload helpers (used by the Review-prompts modal) ──
+//
+// Two ways to set a wireframe URL for cover or thumbnail:
+//   (a) Drop a file → upload to server → server returns an absolute
+//       URL (or relative path the client prepends with origin). The
+//       URL field auto-fills.
+//   (b) Paste a public URL directly into the URL field. No upload.
+//
+// Either way the URL ends up in UPGEN_WF_URLS, which upgenPromptsSubmit
+// includes in the /upload-generate/run body as custom_wireframes.
+function upgenWfClick(ev) {
+  const dz = ev.currentTarget;
+  const asset = dz.getAttribute('data-asset');
+  if (!asset) return;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/png,image/jpeg,image/webp';
+  input.style.display = 'none';
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (file) await handleWireframeFile(asset, file, dz);
+    try { document.body.removeChild(input); } catch (_e) {}
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+async function upgenWfDrop(ev) {
+  ev.preventDefault(); ev.stopPropagation();
+  ev.currentTarget.classList.remove('dragover');
+  const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (!file) return;
+  const asset = ev.currentTarget.getAttribute('data-asset');
+  if (asset) await handleWireframeFile(asset, file, ev.currentTarget);
+}
+async function handleWireframeFile(asset, file, dz) {
+  if (!UPGEN_STATE) return;
+  const statusEl = dz.parentElement.querySelector('.upgen-wf-status');
+  dz.classList.remove('error');
+  dz.classList.add('uploading');
+  dz.innerHTML =
+    '<div class="dz-icon">⏳</div>' +
+    '<div class="dz-text">Uploading…</div>' +
+    '<div class="dz-progress">' + escapeHtmlBasic(file.name || 'wireframe') + '</div>';
+  if (statusEl) statusEl.textContent = '';
+  try {
+    const url = '/upload-generate/' + UPGEN_STATE.runId + '/wireframe/' + asset;
+    const r = await fetch(url, { method: 'POST', body: file });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    // Server may return an absolute URL (production, where it can
+    // detect the public host) or a relative path (localhost). For the
+    // relative case, prepend window.location.origin — this only helps
+    // if THIS browser's origin is reachable from Replicate, which it
+    // typically isn't on localhost. Surface that in the status hint.
+    // Double-escape the regex slashes because this string lives inside
+    // a server-side TS template literal — \/ collapses to /, which would
+    // close the regex literal early in the rendered browser JS.
+    const absolute = /^https?:\\/\\//i.test(j.url) ? j.url : (window.location.origin + j.url);
+    UPGEN_WF_URLS[asset] = absolute;
+    const urlInput = dz.parentElement.querySelector('.upgen-wf-url');
+    if (urlInput) urlInput.value = absolute;
+    dz.classList.remove('uploading', 'error');
+    dz.innerHTML =
+      '<div class="dz-icon" style="color:var(--ok)">✓</div>' +
+      '<div class="dz-text" style="color:var(--ok)">Uploaded · ' + j.width + '×' + j.height + '</div>' +
+      '<div class="dz-sub">Drop or click again to replace</div>';
+    if (statusEl) {
+      const isLocal = /localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0/.test(absolute);
+      if (isLocal) {
+        statusEl.style.color = 'var(--err)';
+        statusEl.textContent = 'localhost URL — Replicate cannot fetch this. Run will fall back to default wireframe. For local testing, paste a publicly-hosted URL in the URL field below instead.';
+        // Don't set UPGEN_WF_URLS[asset] so the run-submit doesn't
+        // forward the bad URL. The status line + auto-filled URL
+        // field stay so the operator sees what was uploaded; they
+        // just have to paste a public URL to actually use it.
+        UPGEN_WF_URLS[asset] = '';
+      } else {
+        statusEl.style.color = '';
+        statusEl.textContent = 'OK: ' + absolute.slice(0, 80);
+      }
+    }
+    upgenWfFlagEdit();
+  } catch (err) {
+    dz.classList.remove('uploading');
+    dz.classList.add('error');
+    dz.innerHTML =
+      '<div class="dz-icon">⚠️</div>' +
+      '<div class="dz-text">Upload failed</div>' +
+      '<div class="dz-err-msg">' + escapeHtmlBasic(err && err.message ? err.message : String(err)) + '</div>';
+    if (statusEl) statusEl.textContent = '';
+  }
+}
+function upgenWfUrlInput(inp) {
+  const asset = inp.getAttribute('data-asset');
+  if (!asset) return;
+  const raw = (inp.value || '').trim();
+  // Accept only well-formed http(s) URLs. Empty clears the slot.
+  // Same double-escape trick — \/ → / and \s → s would otherwise break
+  // the regex literal when the template literal renders the script.
+  if (raw && /^https?:\\/\\/[^\\s]+/i.test(raw)) {
+    UPGEN_WF_URLS[asset] = raw;
+    const statusEl = inp.parentElement.querySelector('.upgen-wf-status');
+    if (statusEl) statusEl.textContent = 'Using URL';
+  } else {
+    UPGEN_WF_URLS[asset] = '';
+    const statusEl = inp.parentElement.querySelector('.upgen-wf-status');
+    if (statusEl) statusEl.textContent = raw ? 'Not a valid http(s) URL' : '';
+  }
+  upgenWfFlagEdit();
+}
+function upgenWfFlagEdit() {
+  const n = (UPGEN_WF_URLS.cover ? 1 : 0) + (UPGEN_WF_URLS.thumbnail ? 1 : 0);
+  const flag = document.querySelector('.upgen-wireframes-edit-flag');
+  if (flag) {
+    flag.style.display = n > 0 ? 'inline' : 'none';
+    flag.textContent = n + ' wireframe' + (n === 1 ? '' : 's') + ' set';
+  }
+}
+
+// Final submit — collects any edited prompts as overrides and POSTs
+// to /runs/<id>/upload-generate/run with the prompt_overrides payload.
+// Server signature already accepts this field; we just had to wire the
+// UI through.
+async function upgenPromptsSubmit() {
+  if (!UPGEN_STATE) return;
+  const btn = document.getElementById('upgen-prompts-submit-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Starting…';
+
+  const overrides = {};
+  for (const det of document.querySelectorAll('#upgen-prompts .gen-group')) {
+    const ta = det.querySelector('.gen-system');
+    if (!ta) continue;
+    const decoder = document.createElement('div');
+    decoder.innerHTML = ta.dataset.default;
+    const def = decoder.textContent || '';
+    if (ta.value !== def && ta.value.trim().length > 0) {
+      const group = det.getAttribute('data-group');
+      if (group) overrides[group] = { system: ta.value };
+    }
+  }
+
+  // Collect operator-supplied wireframe URLs (filled by drop-upload
+  // OR by URL paste). Only include non-empty entries — the server
+  // silently drops anything that isn't http(s).
+  const customWireframes = {};
+  if (UPGEN_WF_URLS.cover) customWireframes.cover = UPGEN_WF_URLS.cover;
+  if (UPGEN_WF_URLS.thumbnail) customWireframes.thumbnail = UPGEN_WF_URLS.thumbnail;
+
   try {
     const tok = (function(){ try { return sessionStorage.getItem('gw_repoint_bearer_v1') || ''; } catch (_e) { return ''; } })();
     const headers = tok
       ? { 'content-type': 'application/json', 'Authorization': 'Bearer ' + tok }
       : { 'content-type': 'application/json' };
+    const body = {};
+    if (Object.keys(overrides).length > 0) body.prompt_overrides = overrides;
+    if (Object.keys(customWireframes).length > 0) body.custom_wireframes = customWireframes;
     const r = await fetch('/runs/' + UPGEN_STATE.runId + '/upload-generate/run', {
       method: 'POST',
       headers,
-      body: JSON.stringify({}),
+      body: JSON.stringify(body),
     });
     const j = await r.json();
     if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
     window.location.href = j.url || ('/runs/' + UPGEN_STATE.runId);
   } catch (err) {
     btn.disabled = false;
-    btn.textContent = 'Upload & Generate →';
+    btn.textContent = 'Generate →';
     alert('Failed to start generation: ' + (err && err.message ? err.message : err));
   }
 }
@@ -4434,28 +4996,51 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   // at the persisted product file.
   let child: RunState;
   if (parent.mode === "upload-generate") {
-    // Locate the persisted product file for this image_id. The
-    // upload-generate session wrote it to
-    // <runOutDir>/runs/<parentRunId>/products/<safe-image-id>.<ext>.
-    // We find by prefix because we don't know the original ext here.
-    const productsDir = path.join(runOutDir(), "runs", parent.id, "products");
-    const safePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
-    let productPath: string | null = null;
+    // Locate the original product entry for this image_id. Two sources,
+    // in order of preference:
+    //   1) The original session manifest <runOutDir>/products-<runId>.json,
+    //      which holds either a file path (operator dropped a file) or
+    //      an http(s) URL (operator pasted one). This is the only source
+    //      that knows about URL-mode entries — the products dir is empty
+    //      for those.
+    //   2) Scan <runOutDir>/products-<runId>/<safe-image-id>.<ext> for a
+    //      file the original session left behind (fallback when the
+    //      manifest is gone but the file survives).
+    const productsDir = productsDirFor(parent.id);
+    const tmpDir = runOutDir();
+    await fs.mkdir(tmpDir, { recursive: true });
+    const manifestSrcPath = path.join(tmpDir, `products-${parent.id}.json`);
+    let productEntry: string | null = null;
     try {
-      const files = await fs.readdir(productsDir);
-      const hit = files.find((f) => f.startsWith(safePrefix));
-      if (hit) productPath = path.join(productsDir, hit);
-    } catch { /* dir gone — fail below */ }
-    if (!productPath) {
+      const raw = await fs.readFile(manifestSrcPath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && typeof parsed[imageId] === "string") {
+        productEntry = parsed[imageId];
+      }
+    } catch { /* no parent manifest — try disk scan below */ }
+    if (!productEntry) {
+      try {
+        const safePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+        const files = await fs.readdir(productsDir);
+        const hit = files.find((f) => f.startsWith(safePrefix));
+        if (hit) productEntry = path.join(productsDir, hit);
+      } catch { /* dir gone */ }
+    }
+    // For file-path entries, verify the file still exists; URL entries
+    // are passed through as-is (Replicate fetches them at gen time).
+    const isUrl = typeof productEntry === "string" && /^https?:\/\//i.test(productEntry);
+    if (productEntry && !isUrl) {
+      try { await fs.access(productEntry); }
+      catch { productEntry = null; }
+    }
+    if (!productEntry) {
       return sendJson(res, 410, {
-        error: `cannot regenerate ${imageId}: the original product file is no longer on disk at ${productsDir}. The retention sweep may have pruned it, or this run pre-dates the upload-generate feature.`,
+        error: `cannot regenerate ${imageId}: the original product file/URL is no longer available (looked in ${manifestSrcPath} and ${productsDir}). The retention sweep may have pruned it, or this run pre-dates the upload-generate feature.`,
       });
     }
     const childRunId = randomUUID().replace(/-/g, "").slice(0, 16);
-    const tmpDir = runOutDir();
-    await fs.mkdir(tmpDir, { recursive: true });
     const productsManifestPath = path.join(tmpDir, `products-${childRunId}.json`);
-    await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productPath }, null, 2), "utf8");
+    await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productEntry }, null, 2), "utf8");
     child = startUploadGenerate({
       client: parent.client,
       runId: childRunId,
@@ -4469,6 +5054,15 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
       // the buildPrompt path always rebuilds (we don't carry the
       // parent's empty-zone directive forward; it's re-applied
       // automatically in processOne).
+      //
+      // Wireframes — forward whatever the operator dropped at the
+      // original Generate-time so the regenerated single image
+      // matches the rest of the run's structural reference.
+      coverWireframeUrl: parent.customWireframes?.cover,
+      thumbnailWireframeUrl: parent.customWireframes?.thumbnail,
+      // Reuse parent's product-store base URL so the regenerated
+      // service/category image fetches the same product file.
+      productBaseUrl: parent.productBaseUrl,
     });
   } else {
     child = startRegen({
@@ -5392,6 +5986,18 @@ async function tryReconstructRunFromDisk(id: string): Promise<RunState | null> {
           j.mode === "upload" ? "upload"
           : j.mode === "upload-generate" ? "upload-generate"
           : "regen",
+        // Restore operator-supplied wireframes from the manifest so a
+        // post-restart Regenerate of a single image uses the same
+        // structural references as the original run. Silently ignore
+        // unexpected shapes.
+        customWireframes: (() => {
+          const cw = j.custom_wireframes;
+          if (!cw || typeof cw !== "object") return undefined;
+          const out: { cover?: string; thumbnail?: string } = {};
+          if (typeof cw.cover === "string" && /^https?:\/\//i.test(cw.cover)) out.cover = cw.cover;
+          if (typeof cw.thumbnail === "string" && /^https?:\/\//i.test(cw.thumbnail)) out.thumbnail = cw.thumbnail;
+          return Object.keys(out).length > 0 ? out : undefined;
+        })(),
       };
       RUNS.set(id, state);
       return state;
@@ -8147,6 +8753,51 @@ function safeProductFilename(imageId: string, ext: string): string {
 }
 
 /**
+ * Wireframes the operator drops in the Review-prompts modal. One per
+ * asset type (cover, thumbnail) per run. We store them at the volume
+ * root in a flat per-run dir so retention sweep and the serve route
+ * can find them deterministically.
+ */
+function wireframesDirFor(runId: string): string {
+  return path.join(runOutDir(), `wireframes-${runId}`);
+}
+
+/**
+ * Build the absolute URL of a wireframe file that the CLI will
+ * forward to Replicate. Replicate fetches over HTTPS; the URL must
+ * be public. Order of preference:
+ *   1. PUBLIC_BASE_URL env var (operator-supplied, takes precedence).
+ *   2. RAILWAY_PUBLIC_DOMAIN (auto-set on Railway).
+ *   3. Host header from the incoming request (fallback, works for
+ *      any reverse-proxied deploy where the operator hits the same
+ *      domain Replicate would).
+ * Returns null when no public base can be determined — in that case
+ * the operator must paste an already-public URL instead of uploading.
+ */
+function publicBaseUrlFromReq(req: IncomingMessage): string | null {
+  const fromEnv = (process.env.PUBLIC_BASE_URL ?? "").trim();
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
+  const railway = (process.env.RAILWAY_PUBLIC_DOMAIN ?? "").trim();
+  if (railway) return `https://${railway.replace(/^https?:\/\//, "")}`;
+  const host = String(req.headers.host ?? "").trim();
+  if (!host) return null;
+  // x-forwarded-proto is set by Railway / Vercel / Cloudflare etc.
+  const proto = String(req.headers["x-forwarded-proto"] ?? "http").split(",")[0]!.trim();
+  // 0.0.0.0 is the listen address the server binds to, and some
+  // browsers / proxies forward it verbatim in the Host header — it
+  // is NOT reachable externally and must be treated as a localhost
+  // signal. Same for 127.0.0.1 and literal "localhost".
+  if (
+    /^localhost(:\d+)?$/i.test(host)
+    || /^127\.0\.0\.1(:\d+)?$/.test(host)
+    || /^0\.0\.0\.0(:\d+)?$/.test(host)
+  ) {
+    return null;
+  }
+  return `${proto}://${host}`;
+}
+
+/**
  * GET /admin/diagnose-run?id=<runId> — read-only audit of a run CSV.
  * Surfaces the two structural issues that cause "apply failed:
  * unknown / mapping stale" cascades:
@@ -8497,6 +9148,72 @@ async function uploadGenerateProductPost(
   });
 }
 
+/**
+ * POST /upload-generate/<runId>/product-url/<imageId>
+ *   body: { url: "<https://...>" }
+ *
+ * Operator-pasted URL alternative to file upload. Same UX as the
+ * wireframe URL field. The URL is stored in the session's products
+ * map as a string starting with http(s). Downstream code (CLI,
+ * uploadGenerate.ts) detects the prefix and routes accordingly:
+ *   • service/category: pass URL directly to Replicate as image_input
+ *   • blog assets: server-fetch the bytes when needed for composite
+ *
+ * No bytes are uploaded; the operator's URL must already be publicly
+ * reachable from Replicate's CDN (Imgur, GitHub raw, Dropbox sharing
+ * link, etc.). Localhost URLs are rejected with a clear error.
+ */
+async function uploadGenerateProductUrlPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) return sendJson(res, 404, { error: `no upload-generate session for run ${runId}` });
+
+  // Same image_id allow-list check as file upload.
+  let known = false;
+  for (const it of session.items) {
+    if (it.image_ids.includes(imageId)) { known = true; break; }
+  }
+  if (!known) return sendJson(res, 400, { error: `image_id ${imageId} is not in the picked set for this session` });
+
+  const body = (await readApplyBody(req)) as { url?: unknown } | null;
+  const raw = typeof body?.url === "string" ? body.url.trim() : "";
+  if (!raw) return sendJson(res, 400, { error: "body.url required" });
+  if (!/^https?:\/\//i.test(raw)) return sendJson(res, 400, { error: "url must be http or https" });
+  // Localhost guard — Replicate cannot fetch from localhost.
+  try {
+    const h = new URL(raw).hostname.toLowerCase();
+    if (h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h.endsWith(".localhost")) {
+      return sendJson(res, 400, {
+        error: "localhost URL — Replicate cannot fetch from there. Paste a publicly-hosted URL (Imgur direct, GitHub raw, Dropbox sharing link, etc.).",
+      });
+    }
+  } catch {
+    return sendJson(res, 400, { error: "URL is not a valid URL" });
+  }
+
+  // Wipe any prior dropped file for this slot so the URL is the
+  // single source of truth. The serve-from-disk route then 404s for
+  // this image_id (intentional — URL-mode uses the operator's URL,
+  // not our store).
+  const dir = productsDirFor(runId);
+  try {
+    const existing = await fs.readdir(dir);
+    const filePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+    for (const f of existing) {
+      if (f.startsWith(filePrefix)) {
+        try { await fs.rm(path.join(dir, f), { force: true }); } catch { /* */ }
+      }
+    }
+  } catch { /* dir may not exist yet */ }
+
+  session.products.set(imageId, raw);
+  sendJson(res, 200, { ok: true, image_id: imageId, url: raw });
+}
+
 async function uploadGenerateProductDelete(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -8548,6 +9265,173 @@ async function uploadGenerateProductPreview(
   }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Wireframe upload + serve. Operator drops cover.png / thumbnail.png
+// in the Review-prompts modal. They land here on disk, get a public
+// URL via the serve route, and that URL is forwarded to the CLI which
+// passes it to Replicate as image_input[1].
+// ────────────────────────────────────────────────────────────────────────
+
+/** Allowed wireframe slot names. Keep in sync with the CLI args. */
+const WIREFRAME_SLOTS = new Set(["cover", "thumbnail"]);
+
+async function uploadGenerateWireframePost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  asset: string,
+) {
+  if (!WIREFRAME_SLOTS.has(asset)) {
+    return sendJson(res, 400, { error: `wireframe slot must be one of: ${[...WIREFRAME_SLOTS].join(", ")}` });
+  }
+  const session = UPGEN_SESSIONS.get(runId);
+  if (!session) {
+    return sendJson(res, 404, { error: `no upload-generate session for run ${runId} (already spawned or never started)` });
+  }
+
+  // 10 MB cap matches the product upload limit.
+  const claimedLen = Number.parseInt(String(req.headers["content-length"] ?? "0"), 10);
+  if (Number.isFinite(claimedLen) && claimedLen > 10 * 1024 * 1024) {
+    return sendJson(res, 413, { error: `file too large (${(claimedLen / 1024 / 1024).toFixed(1)} MB; max 10 MB)` });
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let aborted = false;
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      total += buf.length;
+      if (total > 10 * 1024 * 1024) { aborted = true; break; }
+      chunks.push(buf);
+    }
+  } catch (err) {
+    return sendJson(res, 500, { error: `wireframe upload stream failed: ${(err as Error).message}` });
+  }
+  if (aborted) return sendJson(res, 413, { error: "wireframe too large (>10 MB)" });
+  if (total === 0) return sendJson(res, 400, { error: "empty wireframe upload" });
+  const raw = Buffer.concat(chunks, total);
+
+  // Validate as a real image (no aspect-mismatch check — wireframes
+  // are loose structural references and the asset's aspect_ratio is
+  // separately controlled when Replicate renders).
+  const { validateAndCanonicalise } = await import("./uploadRun.js");
+  const v = await validateAndCanonicalise(raw, null);
+  if (!v.ok) return sendJson(res, v.status, { error: v.error });
+
+  // Wipe any previous wireframe for this slot. Different extensions
+  // would otherwise leave a stale alternate file.
+  const dir = wireframesDirFor(runId);
+  try {
+    const existing = await fs.readdir(dir);
+    for (const f of existing) {
+      if (f.startsWith(`${asset}.`)) {
+        try { await fs.rm(path.join(dir, f), { force: true }); } catch { /* */ }
+      }
+    }
+  } catch { /* dir may not exist */ }
+  await fs.mkdir(dir, { recursive: true });
+
+  const finalPath = path.join(dir, `${asset}.${v.ext}`);
+  await fs.writeFile(finalPath, v.bytes);
+
+  // Compute the public URL the CLI / Replicate will fetch.
+  // Falls back to a relative path if no public base can be determined
+  // — the client can prepend window.location.origin in that case
+  // (works for any deploy that's reachable from Replicate; doesn't
+  // work for localhost). When local, the operator should paste a
+  // public URL via the URL-input alternative.
+  const base = publicBaseUrlFromReq(req);
+  const relPath = `/wireframes/${runId}/${asset}`;
+  const url = base ? `${base}${relPath}` : relPath;
+
+  sendJson(res, 200, {
+    ok: true,
+    asset,
+    url,                // absolute when reachable; relative otherwise
+    relative_path: relPath,
+    width: v.width,
+    height: v.height,
+    mime: v.mime,
+    size_bytes: v.bytes.length,
+  });
+}
+
+/**
+ * GET /products-store/:runId/:imageId — serve a product file straight
+ * from disk (no UPGEN_SESSIONS lookup). Used by Replicate as the
+ * reference image_input for service/category asset generations.
+ * Works both for the initial run and for per-image Regenerate
+ * (because we read by runId, not by an in-memory session).
+ */
+async function productsStoreServe(
+  res: ServerResponse,
+  runId: string,
+  imageId: string,
+) {
+  const dir = productsDirFor(runId);
+  let names: string[] = [];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    send(res, 404, "text/plain", "no products dir for this run");
+    return;
+  }
+  const safePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
+  const hit = names.find((n) => n.startsWith(safePrefix));
+  if (!hit) { send(res, 404, "text/plain", "no product file for this image_id"); return; }
+  const p = path.join(dir, hit);
+  try {
+    const stat = statSync(p);
+    if (!stat.isFile()) { send(res, 404, "text/plain", "not a file"); return; }
+    const ext = extOf(p);
+    res.writeHead(200, {
+      "content-type": IMAGE_CT[ext] ?? "application/octet-stream",
+      "content-length": String(stat.size),
+      "cache-control": "public, max-age=300",
+    });
+    createReadStream(p).pipe(res);
+  } catch {
+    send(res, 404, "text/plain", "not found");
+  }
+}
+
+async function uploadGenerateWireframeServe(
+  res: ServerResponse,
+  runId: string,
+  asset: string,
+) {
+  if (!WIREFRAME_SLOTS.has(asset)) {
+    send(res, 400, "text/plain", "bad slot");
+    return;
+  }
+  const dir = wireframesDirFor(runId);
+  let names: string[] = [];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    send(res, 404, "text/plain", "no wireframe");
+    return;
+  }
+  const hit = names.find((n) => n.startsWith(`${asset}.`));
+  if (!hit) { send(res, 404, "text/plain", "no wireframe"); return; }
+  const p = path.join(dir, hit);
+  try {
+    const stat = statSync(p);
+    if (!stat.isFile()) { send(res, 404, "text/plain", "not a file"); return; }
+    const ext = extOf(p);
+    res.writeHead(200, {
+      "content-type": IMAGE_CT[ext] ?? "application/octet-stream",
+      "content-length": String(stat.size),
+      // Replicate fetches once; a short cache is enough to amortise
+      // any retry or per-record fetch the model performs.
+      "cache-control": "public, max-age=300",
+    });
+    createReadStream(p).pipe(res);
+  } catch {
+    send(res, 404, "text/plain", "not found");
+  }
+}
+
 function startUploadGenerate(opts: {
   client: string;
   runId: string;
@@ -8558,6 +9442,13 @@ function startUploadGenerate(opts: {
   provider?: string;
   extraInstructionsFile?: string;
   promptOverridesFile?: string;
+  /** Public HTTPS URLs the CLI forwards to Replicate as image_input[1]. */
+  coverWireframeUrl?: string;
+  thumbnailWireframeUrl?: string;
+  /** Public base URL prefix the CLI uses to build product reference
+   *  URLs for service/category assets. Already includes the runId
+   *  segment (e.g. https://host/products-store/<runId>). */
+  productBaseUrl?: string;
 }): RunState {
   const args = [
     "tsx", "src/cli.ts", "upload-generate",
@@ -8571,6 +9462,9 @@ function startUploadGenerate(opts: {
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
   if (opts.promptOverridesFile) args.push("--prompt-overrides-file", opts.promptOverridesFile);
+  if (opts.coverWireframeUrl) args.push("--cover-wireframe", opts.coverWireframeUrl);
+  if (opts.thumbnailWireframeUrl) args.push("--thumbnail-wireframe", opts.thumbnailWireframeUrl);
+  if (opts.productBaseUrl) args.push("--product-base-url", opts.productBaseUrl);
 
   const proc = spawn("npx", args, { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
 
@@ -8578,6 +9472,14 @@ function startUploadGenerate(opts: {
     id: opts.runId, client: opts.client, args, startedAt: new Date().toISOString(),
     log: [], done: false, exitCode: null, proc, listeners: new Set(),
     mode: "upload-generate",
+    customWireframes:
+      opts.coverWireframeUrl || opts.thumbnailWireframeUrl
+        ? {
+            ...(opts.coverWireframeUrl ? { cover: opts.coverWireframeUrl } : {}),
+            ...(opts.thumbnailWireframeUrl ? { thumbnail: opts.thumbnailWireframeUrl } : {}),
+          }
+        : undefined,
+    productBaseUrl: opts.productBaseUrl,
   };
   RUNS.set(opts.runId, state);
 
@@ -8620,7 +9522,17 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
     });
   }
 
-  type Body = { extra_instructions?: string; prompt_overrides?: unknown; provider?: string };
+  type Body = {
+    extra_instructions?: string;
+    prompt_overrides?: unknown;
+    provider?: string;
+    /** Operator-supplied wireframes for cover and/or thumbnail. URLs
+     *  must already be absolute http(s) — either built from a prior
+     *  POST /upload-generate/wireframe/.../<asset> response, or pasted
+     *  directly by the operator. The handler validates both before
+     *  forwarding to the CLI. */
+    custom_wireframes?: { cover?: string; thumbnail?: string };
+  };
   let body: Body = {};
   try {
     const chunks: Buffer[] = [];
@@ -8663,6 +9575,57 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
   const imageIds = expected;
   const pageTypeArg = session.pageTypes.join(",");
 
+  // Validate operator-supplied wireframe URLs. Only http(s) URLs go
+  // through to the CLI — anything else is silently ignored. The
+  // operator can either paste a public URL directly, or upload a
+  // file via POST /upload-generate/wireframe/<runId>/<asset> first
+  // and pass back the absolute URL the upload handler returned.
+  const isPublicUrl = (s: unknown): s is string =>
+    typeof s === "string" && /^https?:\/\/[^\s]+/i.test(s.trim());
+  // Replicate fetches the wireframe URL from its own cloud-hosted
+  // workers. Localhost / 0.0.0.0 / 127.0.0.1 URLs are NOT reachable
+  // from there — passing one through produces an opaque
+  // "Connection refused" error from inside Replicate. We catch the
+  // case here, strip the bad URL, and log a clear stderr line so the
+  // operator sees the explanation in the run log instead of the
+  // Replicate-side error. The run still proceeds — it just falls
+  // back to the default wireframe.
+  const isLocalhostUrl = (s: string): boolean => {
+    try {
+      const h = new URL(s).hostname.toLowerCase();
+      return h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h.endsWith(".localhost");
+    } catch { return false; }
+  };
+  const resolveWireframe = (raw: unknown, slot: "cover" | "thumbnail"): string | undefined => {
+    if (!isPublicUrl(raw)) return undefined;
+    const url = raw.trim();
+    if (isLocalhostUrl(url)) {
+      process.stderr.write(
+        `upload-generate/run: ${slot} wireframe URL points at ${url} — Replicate cannot fetch from localhost. ` +
+        `Falling back to the default wireframe for this slot. ` +
+        `For local testing, paste a publicly-hosted URL (e.g. Imgur / GitHub raw / Dropbox sharing link) into the wireframe slot instead of dropping a file.\n`,
+      );
+      return undefined;
+    }
+    return url;
+  };
+  const coverWireframeUrl = resolveWireframe(body.custom_wireframes?.cover, "cover");
+  const thumbnailWireframeUrl = resolveWireframe(body.custom_wireframes?.thumbnail, "thumbnail");
+
+  // Build the product-base URL the CLI will hand to Replicate for
+  // service/category asset reference images. Falls back to undefined
+  // (CLI then uses the legacy composite path) when the server is
+  // localhost — Replicate cannot reach there. Operators testing
+  // service flows need to run on a public host (Railway).
+  const publicBase = publicBaseUrlFromReq(req);
+  const productBaseUrl = publicBase ? `${publicBase}/products-store/${runId}` : undefined;
+  if (!publicBase) {
+    process.stderr.write(
+      `upload-generate/run: no public base URL detected (likely localhost) — service/category rows will fall back to the legacy composite path. ` +
+      `Test service flows on a public host (Railway) to use the AI-reference path.\n`,
+    );
+  }
+
   const state = startUploadGenerate({
     client: session.client,
     runId,
@@ -8673,6 +9636,9 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
     provider: typeof body.provider === "string" ? body.provider : undefined,
     extraInstructionsFile,
     promptOverridesFile,
+    coverWireframeUrl,
+    thumbnailWireframeUrl,
+    productBaseUrl,
   });
 
   // Session has done its job — the spawn owns the run from here.
@@ -8761,11 +9727,15 @@ export function startWebServer(port: number): void {
           if (t === "blog" || t === "service" || t === "category") selected.add(t);
         }
         if (selected.size === 0 && legacyPt) selected.add(legacyPt);
+        const sortRaw = (url.searchParams.get("sort") ?? "").trim().toLowerCase();
+        const sortBy: "created" | "modified" =
+          sortRaw === "modified" ? "modified" : "created";
         return await workspacePage(
           res,
           decodeURIComponent(wsMatch[1]),
           legacyPt ?? "blog",
           selected.size > 0 ? selected : undefined,
+          sortBy,
         );
       }
 
@@ -8780,6 +9750,11 @@ export function startWebServer(port: number): void {
         if (method === "POST")   return await uploadGenerateProductPost(req, res, upgenProdMatch[1], decodeURIComponent(upgenProdMatch[2]));
         if (method === "DELETE") return await uploadGenerateProductDelete(req, res, upgenProdMatch[1], decodeURIComponent(upgenProdMatch[2]));
       }
+      // Per-card URL paste (alternative to file drop).
+      const upgenProdUrlMatch = /^\/upload-generate\/([a-f0-9]+)\/product-url\/(.+)$/.exec(p);
+      if (method === "POST" && upgenProdUrlMatch && upgenProdUrlMatch[1] && upgenProdUrlMatch[2]) {
+        return await uploadGenerateProductUrlPost(req, res, upgenProdUrlMatch[1], decodeURIComponent(upgenProdUrlMatch[2]));
+      }
       const upgenProdPreviewMatch = /^\/upload-generate\/([a-f0-9]+)\/product\/(.+)$/.exec(p);
       if (method === "GET" && upgenProdPreviewMatch && upgenProdPreviewMatch[1] && upgenProdPreviewMatch[2]) {
         return await uploadGenerateProductPreview(res, upgenProdPreviewMatch[1], decodeURIComponent(upgenProdPreviewMatch[2]));
@@ -8787,6 +9762,25 @@ export function startWebServer(port: number): void {
       const upgenRunMatch = /^\/runs\/([a-f0-9]+)\/upload-generate\/run$/.exec(p);
       if (method === "POST" && upgenRunMatch && upgenRunMatch[1]) {
         return await uploadGenerateRunHandler(req, res, upgenRunMatch[1]);
+      }
+      // Wireframe upload (per session) — POST raw bytes + cover/thumbnail slot.
+      const upgenWireframeMatch = /^\/upload-generate\/([a-f0-9]+)\/wireframe\/(cover|thumbnail)$/.exec(p);
+      if (method === "POST" && upgenWireframeMatch && upgenWireframeMatch[1] && upgenWireframeMatch[2]) {
+        return await uploadGenerateWireframePost(req, res, upgenWireframeMatch[1], upgenWireframeMatch[2]);
+      }
+      // Wireframe serve — Replicate fetches from here in production.
+      const upgenWireframeServeMatch = /^\/wireframes\/([a-f0-9]+)\/(cover|thumbnail)$/.exec(p);
+      if (method === "GET" && upgenWireframeServeMatch && upgenWireframeServeMatch[1] && upgenWireframeServeMatch[2]) {
+        return await uploadGenerateWireframeServe(res, upgenWireframeServeMatch[1], upgenWireframeServeMatch[2]);
+      }
+      // Product store serve — Replicate fetches operator-uploaded
+      // product files from here when generating service/category
+      // assets (which use the product as an AI reference image_input
+      // rather than composite paste). Disk-backed; survives session
+      // cleanup so per-image Regenerate also works.
+      const productsStoreMatch = /^\/products-store\/([a-f0-9]+)\/(.+)$/.exec(p);
+      if (method === "GET" && productsStoreMatch && productsStoreMatch[1] && productsStoreMatch[2]) {
+        return await productsStoreServe(res, productsStoreMatch[1], decodeURIComponent(productsStoreMatch[2]));
       }
       const uploadMatch = /^\/runs\/([a-f0-9]+)\/upload\/(.+)$/.exec(p);
       if (uploadMatch && uploadMatch[1] && uploadMatch[2]) {
@@ -8841,11 +9835,19 @@ export function startWebServer(port: number): void {
       if (method === "GET" && p === "/api/prompts") {
         const { defaultTemplatesForGroup, promptGroupLabel } = await import("./buildPrompt.js");
         const groups = ["cover", "infographic", "page", "generic"] as const;
-        const out = groups.map((g) => ({
-          group: g,
-          label: promptGroupLabel(g),
-          ...defaultTemplatesForGroup(g),
-        }));
+        const flow = url.searchParams.get("flow");
+        const out = groups.map((g) => {
+          const tpl = defaultTemplatesForGroup(g);
+          if (flow === "upgen" && g === "page") {
+            return {
+              group: g,
+              label: promptGroupLabel(g),
+              system: UPGEN_SERVICE_DEFAULT_PROMPT,
+              user: tpl.user,
+            };
+          }
+          return { group: g, label: promptGroupLabel(g), ...tpl };
+        });
         return sendJson(res, 200, { groups: out });
       }
       if (method === "GET" && p === "/flows") return await flowsPage(res);

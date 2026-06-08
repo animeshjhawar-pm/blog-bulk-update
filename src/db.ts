@@ -99,29 +99,71 @@ export interface ClusterRow {
 }
 
 /**
+ * Sort options for the workspace cluster list. "created" sorts by the
+ * cluster's original creation date (stable across applies — what most
+ * operators want when working through a list in order). "modified"
+ * sorts by the cluster's last-updated timestamp (the previous default
+ * — useful when triaging recent edits).
+ */
+export type ClusterSort = "created" | "modified";
+
+/**
  * Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
- * (uppercase), clusters.u_at (not updated_at). Page-status filter is enforced
- * for every page_type — we never surface unpublished clusters in the UI.
+ * (uppercase), clusters.u_at (not updated_at), clusters.c_at (created_at).
+ * Page-status filter is enforced for every page_type — we never surface
+ * unpublished clusters in the UI.
  *
  * Accepts a single page_type or an array. When an array is passed the
- * results are merged in u_at-DESC order (newest first across types).
+ * results are merged in the chosen sort order (newest first).
+ *
+ * sortBy:
+ *   "created"  → ORDER BY c_at DESC (default — stable while working)
+ *   "modified" → ORDER BY u_at DESC (recent edits surface to top;
+ *                Apply also bumps u_at so applied clusters move up)
+ *
+ * If the DB query fails (e.g., c_at doesn't exist in some env), we
+ * fall back to u_at sort with a one-line stderr warning so the page
+ * still renders.
  */
 export async function listPublishedClusters(
   projectId: string,
   pageType: PageType | PageType[] = "blog",
+  sortBy: ClusterSort = "created",
 ): Promise<ClusterRow[]> {
   const types = Array.isArray(pageType) ? pageType : [pageType];
   if (types.length === 0) return [];
+  const orderClause = sortBy === "created" ? "ORDER BY c_at DESC" : "ORDER BY u_at DESC";
   const sql = `
     SELECT id, topic, page_info, u_at AS updated_at, page_type, slug
     FROM clusters
     WHERE p_id = $1::uuid
       AND page_type = ANY($2::text[])
       AND page_status = 'PUBLISHED'
-    ORDER BY u_at DESC
+    ${orderClause}
   `;
-  const res = await getPool().query<ClusterRow>(sql, [projectId, types]);
-  return res.rows;
+  try {
+    const res = await getPool().query<ClusterRow>(sql, [projectId, types]);
+    return res.rows;
+  } catch (err) {
+    if (sortBy === "created") {
+      // c_at column might be missing in some environments. Retry once
+      // with u_at so the operator still gets a useful list.
+      process.stderr.write(
+        `listPublishedClusters: sortBy=created failed (${(err as Error).message}); falling back to u_at\n`,
+      );
+      const fallbackSql = `
+        SELECT id, topic, page_info, u_at AS updated_at, page_type, slug
+        FROM clusters
+        WHERE p_id = $1::uuid
+          AND page_type = ANY($2::text[])
+          AND page_status = 'PUBLISHED'
+        ORDER BY u_at DESC
+      `;
+      const res = await getPool().query<ClusterRow>(fallbackSql, [projectId, types]);
+      return res.rows;
+    }
+    throw err;
+  }
 }
 
 /** Backwards-compat alias — existing call sites that only deal with blogs. */

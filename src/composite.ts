@@ -216,12 +216,24 @@ async function enforceLeftHalfColor(
   const lw = info.width;
   const lh = info.height;
 
-  // Three sample regions — corners + mid-edge — to be robust to stray
-  // text in any one location. Each region is up to 24x24 px.
+  // Sample BG colour only from regions where text/logos rarely land:
+  //   - LEFT EDGE column (first 8px wide, full height). The cover/
+  //     thumbnail wireframe always insets logo + title + subtitle
+  //     at least 20px from the left edge, so this strip is reliably
+  //     pure background.
+  //   - TOP EDGE strip (first 6 rows, full half-width). Above where
+  //     the logo crown lands.
+  //   - BOTTOM EDGE strip (last 6 rows). Below the subtitle.
+  // Previously I sampled top-left 24×24 — which overlapped with the
+  // brand logo on covers where the wreath sits at the very top, biasing
+  // the "from" colour toward logo cream and wrecking the recolour pass
+  // (cream text then read as "close to bg" and got wiped).
+  const leftEdgeW = Math.min(8, lw);
+  const topBotH = Math.min(6, lh);
   const regions: Array<{ x: number; y: number; w: number; h: number }> = [
-    { x: 0,                              y: 0,                                    w: Math.min(24, lw), h: Math.min(24, lh) },
-    { x: 0,                              y: Math.max(0, lh - Math.min(24, lh)),   w: Math.min(24, lw), h: Math.min(24, lh) },
-    { x: 0,                              y: Math.max(0, Math.floor(lh / 2) - 12), w: Math.min(8, lw),  h: Math.min(24, lh) },
+    { x: 0, y: 0,                 w: leftEdgeW, h: lh },         // left edge column
+    { x: 0, y: 0,                 w: lw,        h: topBotH },    // top strip
+    { x: 0, y: Math.max(0, lh - topBotH), w: lw, h: topBotH },   // bottom strip
   ];
   const reds: number[] = [], greens: number[] = [], blues: number[] = [];
   for (const r of regions) {
@@ -242,22 +254,93 @@ async function enforceLeftHalfColor(
   const fromG = median(greens);
   const fromB = median(blues);
 
-  // Per-channel threshold: ±60 each. Pixels within that box around
-  // the sampled bg colour are reclassified as background and
-  // rewritten. The threshold is generous enough that the AI's
-  // subtle gradients collapse to a flat target colour. Text/logos
-  // typically differ by >100 per channel so they survive.
-  const TH = 60;
-  const TH_SQ = TH * TH * 3;
+  // Two-stage classification: a pixel only gets recoloured if BOTH
+  // hold:
+  //
+  //   1. Color distance to sampled bg is within COLOR_TH per channel.
+  //      Catches the AI's flat bg fill plus mild gradient/noise.
+  //
+  //   2. The pixel is NOT near an edge. "Edge" = local luminance
+  //      gradient in a 5x5 neighbourhood exceeds EDGE_TH. This
+  //      protects text glyphs, logo elements, and chip/pill borders
+  //      regardless of how tonally close they are to the bg —
+  //      colour-distance alone fails when the AI renders title text
+  //      in a desaturated cream that sits within ~30 RGB of dark
+  //      teal (Sentinel covers, Trussed, etc.).
+  //
+  // The combination protects text bodies too: even if a glyph's
+  // interior pixel is within colour distance of bg, the glyph's edges
+  // (which always have a sharp luminance jump against bg) are
+  // protected first. Combined with neighbourhood dilation below,
+  // anything within 3 px of an edge stays untouched — covering the
+  // body of stroke-width text characters at typical poster sizes.
+
+  // Pass 1 — luminance map (Rec.709 weights, integer math for speed).
+  const px = lw * lh;
+  const lum = new Uint8Array(px);
+  for (let p = 0; p < px; p++) {
+    const i = p * ch;
+    const r = data[i] ?? 0;
+    const g = data[i + 1] ?? 0;
+    const b = data[i + 2] ?? 0;
+    lum[p] = (r * 54 + g * 183 + b * 19) >> 8; // ~0.21R + 0.72G + 0.07B
+  }
+
+  // Pass 2 — edge map. A pixel is "near a strong edge" if any 4-
+  // neighbour differs by > EDGE_TH in luminance. EDGE_TH=18 catches
+  // even faint cream-on-teal glyph edges (Sentinel title) while
+  // ignoring the AI's gentle bg gradient (typically < 8 per step).
+  const EDGE_TH = 18;
+  const edge = new Uint8Array(px);
+  for (let y = 0; y < lh; y++) {
+    for (let x = 0; x < lw; x++) {
+      const p = y * lw + x;
+      const cur = lum[p]!;
+      let isEdge = 0;
+      if (x > 0 && Math.abs(cur - (lum[p - 1] ?? 0)) > EDGE_TH) isEdge = 1;
+      if (!isEdge && x < lw - 1 && Math.abs(cur - (lum[p + 1] ?? 0)) > EDGE_TH) isEdge = 1;
+      if (!isEdge && y > 0 && Math.abs(cur - (lum[p - lw] ?? 0)) > EDGE_TH) isEdge = 1;
+      if (!isEdge && y < lh - 1 && Math.abs(cur - (lum[p + lw] ?? 0)) > EDGE_TH) isEdge = 1;
+      edge[p] = isEdge;
+    }
+  }
+
+  // Pass 3 — dilate the edge map by DILATE px so the protection
+  // extends inward from glyph edges to cover glyph BODIES and outward
+  // a touch to cover the AA halo around each character. 3 px is wide
+  // enough to fully cover typical poster-size stroke widths.
+  const DILATE = 3;
+  const protectMask = new Uint8Array(px);
+  for (let y = 0; y < lh; y++) {
+    for (let x = 0; x < lw; x++) {
+      if (!edge[y * lw + x]) continue;
+      const yMin = Math.max(0, y - DILATE);
+      const yMax = Math.min(lh - 1, y + DILATE);
+      const xMin = Math.max(0, x - DILATE);
+      const xMax = Math.min(lw - 1, x + DILATE);
+      for (let yy = yMin; yy <= yMax; yy++) {
+        for (let xx = xMin; xx <= xMax; xx++) {
+          protectMask[yy * lw + xx] = 1;
+        }
+      }
+    }
+  }
+
+  // Pass 4 — recolour. Pixel must be (within colour distance of bg)
+  // AND (not in the dilated protection mask).
+  const COLOR_TH = 40;
+  const COLOR_TH_SQ = COLOR_TH * COLOR_TH * 3;
   const out = Buffer.from(data); // mutable copy
-  for (let i = 0; i < data.length; i += ch) {
+  for (let p = 0; p < px; p++) {
+    if (protectMask[p]) continue;
+    const i = p * ch;
     const r = data[i] ?? 0;
     const g = data[i + 1] ?? 0;
     const b = data[i + 2] ?? 0;
     const dr = r - fromR;
     const dg = g - fromG;
     const db = b - fromB;
-    if (dr * dr + dg * dg + db * db < TH_SQ) {
+    if (dr * dr + dg * dg + db * db < COLOR_TH_SQ) {
       out[i]     = target.r;
       out[i + 1] = target.g;
       out[i + 2] = target.b;
@@ -298,6 +381,62 @@ function parseHex(hex: string): { r: number; g: number; b: number } | null {
 }
 
 /**
+ * Directive used by the Upload-&-Generate service/category flow when
+ * the operator supplied a product URL (drop or paste). The product
+ * URL is passed to Replicate as image_input[1], and this directive
+ * tells the AI EXPLICITLY:
+ *
+ *   1. The second reference image is THE PRODUCT — not loose
+ *      inspiration. It must be preserved bit-for-bit in the output.
+ *   2. Everything ELSE (background, lighting, setting, props,
+ *      composition) is to be newly generated and tailored to the
+ *      description below.
+ *
+ * Without this directive, the AI sees image_input[1] as one of
+ * several visual cues and re-interprets the product creatively —
+ * exactly what the operator does NOT want. The directive must sit
+ * at the very top of the prompt as a TOP-PRIORITY block so it
+ * overrides the page.ts prompt's default "generate a polished
+ * service image" behaviour, which assumes no reference is present.
+ *
+ * Wording is dense and redundant on purpose: image-gen models
+ * weight visual references vs. text directives roughly 40/60. To
+ * force preservation we hammer "do not modify the product" from
+ * multiple angles (colour, shape, materials, text, branding,
+ * orientation). The CHANGE section is the counter-balance — it
+ * gives the AI clear permission to be creative about everything
+ * EXCEPT the product itself, so it doesn't accidentally stay too
+ * close to the reference's surrounding context.
+ */
+export function productReferenceDirective(asset: AssetType): string {
+  if (asset !== "service_h1" && asset !== "service_body" && asset !== "category_industry") {
+    return "";
+  }
+  return [
+    "[PRODUCT REFERENCE — HARD CONSTRAINT, HIGHEST PRIORITY]",
+    "The SECOND reference image (image_input[1]) is the PRODUCT that MUST appear in this generated image. Your task is to PLACE that exact product into a NEW environmental scene that suits the description below.",
+    "",
+    "PRESERVATION — these MUST hold for the product:",
+    "• Visually IDENTICAL to the reference. Same colours, same materials, same surface finish, same shape, same proportions, same orientation, same scale relative to itself.",
+    "• Any printed text, labels, logos, badges, packaging copy, brand marks, model numbers, or any other text appearing on the product must be preserved EXACTLY as shown in the reference image — same wording, same typeface, same colour, same placement.",
+    "• Do NOT redesign, restyle, color-shift, recolour, simplify, idealise, smooth, stylise, AI-illustrate, prettify, or re-imagine the product.",
+    "• Do NOT add accessories, decorations, or modifications to the product.",
+    "• Treat the reference as a photographic ASSET that you are placing into a new scene — not as creative inspiration to be reinterpreted.",
+    "",
+    "REGENERATE — these elements MUST be newly generated:",
+    "• The background, environment, setting, and surrounding props.",
+    "• The lighting (natural, professional commercial-photography style, complementing the product without altering its appearance).",
+    "• Surfaces, textures, depth of field, shadows.",
+    "• The composition (the product is the central subject, framed for a hero image, with appropriate negative space).",
+    "",
+    "OUTPUT STYLE: a professional commercial product photograph or marketing image — polished, on-brand, photorealistic. NOT a flat illustration, NOT a sketch, NOT a stylised render.",
+    "",
+    "If a conflict arises between this PRODUCT REFERENCE block and the description below, this block wins for anything regarding the product's appearance; the description wins for the surrounding scene context.",
+    "[/PRODUCT REFERENCE]",
+  ].join("\n");
+}
+
+/**
  * The directive block we append to whatever asset prompt the build
  * pipeline already produces. Tells Replicate to leave the same zone
  * empty that `compositeProduct` will paste into. Phrased as a hard
@@ -326,13 +465,37 @@ export function emptyZoneDirective(asset: AssetType, brandColor: string | null =
     `Use exactly this hex value: ${targetColor}. ` +
     `Apply this same background colour to EVERY image in this run for visual uniformity; do not vary the colour between cover and thumbnail or between clusters.`;
 
+  // Pill / chip / capsule behind the category label. Image-gen models
+  // routinely default to an OUTLINED pill (just a border with the
+  // canvas bg showing through) when the prompt says "pill" — that's
+  // the design-system default for "pill button" in their training
+  // data. To get a FILLED chip (matching publication design references
+  // like BKB Kitchen Renovation and Bounce Daily Scooter Rental), the
+  // prompt must use the specific terminology image-gen models bind to
+  // filled shapes: "Material Design Chip", "filled badge", "tag", and
+  // describe the SOLID FILL behaviour with concrete colour mechanics.
+  const pillClause =
+    `CATEGORY-LABEL TAG/BADGE — HARD CONSTRAINT, FILLED ONLY: ` +
+    `The category-label text above the title (e.g. "TAX MANAGEMENT", "KITCHEN RENOVATION", "SCOOTER RENTAL") MUST be rendered inside a SOLID FILLED rounded-rectangle TAG, like a Material Design Chip in its "filled" variant, or a publication-style category TAG / BADGE. ` +
+    `EXPLICITLY FILLED: the entire interior area of the rounded rectangle is painted with one solid opaque colour — this colour is visible as a CONTINUOUS BLOCK of colour behind and around the text. The background canvas colour MUST NOT be visible through any part of the tag's interior. ` +
+    `The tag's fill colour: pick a brand-accent colour from the brand palette that contrasts with the main left-half background. For a dark-coloured left half, use a lighter brand accent (white, cream, a light brand tint). For a light-coloured left half, use a darker brand accent. The fill colour must be IMMEDIATELY visually distinct from the canvas — clearly different, not a subtle variation. ` +
+    `Text inside the tag: rendered in a colour that contrasts strongly with the tag's fill colour for legibility (white/light text on a dark tag fill, or dark/brand-coloured text on a light tag fill). The text sits horizontally and vertically centred. ` +
+    `Shape: rounded rectangle with fully-rounded ends (border-radius equals half the tag's height — so the ends look semicircular). Padding inside the tag: roughly 10–14px vertical, 18–24px horizontal around the text. ` +
+    `VISUAL REFERENCE TO MATCH (think of these examples mentally): a website "category tag" on a news article, a Material Design "filled chip", an iOS "filled capsule badge", a NYT "kicker tag" above a headline. The defining property of all of these is the SOLID INTERIOR FILL. ` +
+    `NEGATIVE CONSTRAINTS — strictly forbidden: ` +
+    `(a) NO outline-only / hollow / unfilled tag where the canvas background colour shows through the interior. ` +
+    `(b) NO thin border / stroke ring with empty middle — the tag's interior must be a solid colour, NOT the canvas colour. ` +
+    `(c) NO gradient or texture inside the tag — single flat opaque fill colour. ` +
+    `(d) NO floating category text on the canvas without any container shape behind it.`;
+
   switch (asset) {
     case "cover":
       return [
         "[PRODUCT COMPOSITE ZONE — HARD CONSTRAINT]",
         "The RIGHT HALF of this 16:9 canvas (from horizontal midpoint to right edge, full height) is RESERVED for a product photograph that will be composited onto the rendered image after generation.",
         "In the right half: render ONLY a clean, simple, uniform branded background (solid color, soft gradient, subtle brand pattern, or out-of-focus environmental scene). Do NOT render any product, packaging, illustration, photograph, mock-up, person, animal, text, or visual subject in the right half.",
-        "The LEFT HALF carries all rendered content — logo, title, subtitle, pill — exactly as the cover wireframe defines.",
+        "The LEFT HALF carries all rendered content — logo, category-label FILLED tag/badge, title, subtitle — exactly as the cover wireframe defines.",
+        pillClause,
         colorClause,
         "FLAT SEAM: the left half and right half MUST sit flat against each other at the vertical midpoint. Do NOT render any drop shadow, inner shadow, soft shadow, dark edge, vignette, gradient fade, bevel, glow, depth effect, separator line, layered-card appearance, or floating-element treatment at or near the vertical midpoint or the left edge of the right half. The two halves are coplanar, not stacked.",
         "[/PRODUCT COMPOSITE ZONE]",
@@ -346,7 +509,8 @@ export function emptyZoneDirective(asset: AssetType, brandColor: string | null =
         "[PRODUCT COMPOSITE ZONE — HARD CONSTRAINT]",
         "The RIGHT HALF of this canvas (from horizontal midpoint to right edge, full height) is RESERVED for a product photograph that will be composited onto the rendered image after generation.",
         "In the right half: render ONLY a clean, simple, uniform branded background (solid color, soft gradient, subtle brand pattern, or out-of-focus environmental scene). Do NOT render any product, packaging, illustration, photograph, mock-up, person, animal, text, or visual subject in the right half.",
-        "The LEFT HALF carries all rendered content — logo, title, subtitle, pill — exactly as the cover wireframe defines.",
+        "The LEFT HALF carries all rendered content — logo, category-label FILLED tag/badge, title, subtitle — exactly as the cover wireframe defines.",
+        pillClause,
         colorClause,
         "FLAT SEAM: the left half and right half MUST sit flat against each other at the vertical midpoint. Do NOT render any drop shadow, inner shadow, soft shadow, dark edge, vignette, gradient fade, bevel, glow, depth effect, separator line, layered-card appearance, or floating-element treatment at or near the vertical midpoint or the left edge of the right half. The two halves are coplanar, not stacked.",
         "[/PRODUCT COMPOSITE ZONE]",

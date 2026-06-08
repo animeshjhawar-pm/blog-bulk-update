@@ -474,6 +474,18 @@ program
     "--prompt-overrides-file <path>",
     "JSON file with per-run system+user template overrides keyed by prompt group",
   )
+  .option(
+    "--cover-wireframe <url>",
+    "Public HTTPS URL of a structural reference image for COVER generations. Used as Replicate's wireframe reference (image_input[1]) for all cover rows in this run. Falls back to the default cover wireframe when omitted.",
+  )
+  .option(
+    "--thumbnail-wireframe <url>",
+    "Public HTTPS URL of a structural reference image for THUMBNAIL generations. Used as Replicate's wireframe reference for all thumbnail rows. Falls back to default when omitted.",
+  )
+  .option(
+    "--product-base-url <prefix>",
+    "Public base URL the CLI prepends to each image_id to build the product reference URL for service_h1/service_body/category_industry rows (e.g. 'https://<host>/products-store/<runId>'). When omitted, those assets fall back to the legacy composite path.",
+  )
   .action(
     async (opts: {
       client: string;
@@ -486,6 +498,9 @@ program
       concurrency: string;
       extraInstructionsFile?: string;
       promptOverridesFile?: string;
+      coverWireframe?: string;
+      thumbnailWireframe?: string;
+      productBaseUrl?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
@@ -539,6 +554,19 @@ program
         if (ptList.length === 0) ptList.push("blog");
         const pageType = ptList.length === 1 ? ptList[0]! : ptList;
 
+        // Wireframes are optional. When the operator drops a custom
+        // wireframe in the modal, the web server forwards its URL
+        // here. Only http(s) URLs are accepted — Replicate fetches
+        // them as image_input[1] so the URL must be publicly
+        // reachable from the Replicate side.
+        const customWireframes: { cover?: string; thumbnail?: string } = {};
+        if (opts.coverWireframe && /^https?:\/\//i.test(opts.coverWireframe.trim())) {
+          customWireframes.cover = opts.coverWireframe.trim();
+        }
+        if (opts.thumbnailWireframe && /^https?:\/\//i.test(opts.thumbnailWireframe.trim())) {
+          customWireframes.thumbnail = opts.thumbnailWireframe.trim();
+        }
+
         const { runUploadGenerate } = await import("./uploadGenerate.js");
         await runUploadGenerate({
           client: opts.client,
@@ -551,6 +579,11 @@ program
           concurrency,
           extraInstructions,
           promptOverrides,
+          customWireframes: Object.keys(customWireframes).length > 0 ? customWireframes : undefined,
+          productBaseUrl:
+            opts.productBaseUrl && /^https?:\/\//i.test(opts.productBaseUrl.trim())
+              ? opts.productBaseUrl.trim()
+              : undefined,
         });
       } catch (err) {
         process.stderr.write(
