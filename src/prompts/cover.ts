@@ -237,7 +237,7 @@ Layout is FIXED and matches the attached wireframe (second reference image). Do 
 
   - Full height, edge to edge
 
-  - Boundary fade governed by <boundary_fade_rule>
+  - The split between the two columns is CLEAN — no shadow, no fade, no vignette, no divider line. The right-column visual meets the left-column background directly at the seam.
 
   - No text elements
 
@@ -275,19 +275,11 @@ All layout rules apply identically across both aspect ratios.
 
 </canvas_variants>
 
-<boundary_fade_rule>
+<column_seam_rule>
 
-The boundary between the two columns features a vertical pure black (#000000) shadow concentrated ON the 50% column separator. The shadow is heavily asymmetric — almost all of its visible extent is on the RIGHT side of the seam, falling into the image content. The LEFT side of the seam stays clean. The shadow is TIGHT and narrow — a restrained editorial seam, never a wide gradient band.
+The boundary between the left column and the right column is CLEAN — a direct, hard edge where the right-column visual meets the left-column background. Render with NO shadow, NO gradient, NO fade, NO vignette, NO divider line, and NO darkening of either side near the seam. Both columns reach the 50% split at full saturation and brightness. The left background colour stays uniform right up to the seam, and the right-column visual occupies its half edge-to-edge without any transitional band into the left column.
 
-- A narrow band of pure black (#000000) sits directly ON the 50% split line — the darkest part of the shadow is solid black at the seam and occupies roughly 0.5 to 1 percent of canvas width centred exactly on the seam.
-
-- From that pure-black line, the shadow fades RIGHTWARD into the image content over only about 2 to 3 percent of canvas width, quickly returning to full image opacity. Keep this rightward fade tight and short — a narrow shadow reads as a deliberate editorial seam; a wide gradient does not. Do not spread the shadow further into the image.
-
-- From the same pure-black line, the shadow fades LEFTWARD by 0.5 percent of canvas width or less — almost imperceptible. The left background colour stays clean and uniform right up to the seam. There is NO darkening band, NO grey transition zone, NO muddy fade encroaching into the left column. The left background reaches the seam at full saturation and brightness.
-
-The colour at the seam is unmistakably pure black (#000000), not dark grey, not a darkened version of the left background, not a darkened version of the right image. The seam reads as a tight, deliberate black editorial shadow line weighted entirely toward the right column — not a hairline divider, not a wide gradient, not a soft uniform vignette. If the model would otherwise render a wide or symmetric fade, bias the entire shadow rightward and compress its spread.
-
-</boundary_fade_rule>
+</column_seam_rule>
 
 <vertical_rhythm>
 
@@ -445,9 +437,9 @@ Forbid generic AI aesthetics: no hyper-smooth surreal textures, no unmotivated g
 
    Title appears in double quotes exactly once. Subtitle appears in double quotes exactly once. They MUST be different strings. Neither may contain a font name.
 
-8. BOUNDARY FADE — locked.
+8. COLUMN SEAM — locked.
 
-   Insert the language from <boundary_fade_rule> verbatim.
+   Insert the language from <column_seam_rule> verbatim: the split between the two columns is clean, with no shadow, fade, gradient, vignette, or divider — left and right meet directly at the 50% line.
 
 9. STYLE MODIFIERS — variable.
 
@@ -461,7 +453,7 @@ Forbid generic AI aesthetics: no hyper-smooth surreal textures, no unmotivated g
 
     Fixed exclusions always included:
 
-    \`wireframe annotation labels rendered as visible text, dashed border lines from wireframe, zone-numbered labels, placeholder text from wireframe, grey placeholder bars, annotation pills from wireframe, text on right side, illustration on left side, centred or stacked layout, layout shift, full-bleed background illustration, logo recoloured or redrawn, invented placeholder logo, logo wrapped in a fake rounded-rectangle background or container or lock-up not present in the supplied reference, logo washed out against background, logo blending into a same-colour background, title rendered in regular or medium weight, subtitle heavier than title, subtitle identical to title, duplicate title or subtitle text, font name rendered as visible subtitle text, font name rendered as visible title text, hex code rendered as visible text, CSS property rendered as visible text, pill missing, pill label smudged or illegible, font name rendered as pill label, illegible letters, garbled words, weak or invisible column boundary shadow, hairline divider at column split, soft uniform vignette without anchored dark line, wide or diffuse boundary gradient, boundary shadow spread far into the right image, boundary shadow rendered in grey instead of black, boundary shadow in any colour other than pure black, boundary shadow as a darkened tint of the left background, boundary shadow as a darkened tint of the right image, black shadow extending more than 1 percent into the left background, grey or muddy band along the right edge of the left column, symmetric column-boundary fade, left background darkened or tinted near the seam, stock-photo smiles, diverse team in office clichés, generic AI-slop aesthetic, plastic skin, waxy textures, HDR look, teal-orange cinematic grade, unmotivated glow or lens flare, floating particles, cyberpunk neon, watermarks, low resolution, oversaturated colours, rendered hex codes or font names as visible text, subjects from explicit_out_of_scope list.\`
+    \`wireframe annotation labels rendered as visible text, dashed border lines from wireframe, zone-numbered labels, placeholder text from wireframe, grey placeholder bars, annotation pills from wireframe, text on right side, illustration on left side, centred or stacked layout, layout shift, full-bleed background illustration, logo recoloured or redrawn, invented placeholder logo, logo wrapped in a fake rounded-rectangle background or container or lock-up not present in the supplied reference, logo washed out against background, logo blending into a same-colour background, title rendered in regular or medium weight, subtitle heavier than title, subtitle identical to title, duplicate title or subtitle text, font name rendered as visible subtitle text, font name rendered as visible title text, hex code rendered as visible text, CSS property rendered as visible text, pill missing, pill label smudged or illegible, font name rendered as pill label, illegible letters, garbled words, any shadow at the column seam, any gradient or fade at the column seam, any vignette near the seam, any divider line between the columns, darkening of either column near the seam, soft transition band between the columns, stock-photo smiles, diverse team in office clichés, generic AI-slop aesthetic, plastic skin, waxy textures, HDR look, teal-orange cinematic grade, unmotivated glow or lens flare, floating particles, cyberpunk neon, watermarks, low resolution, oversaturated colours, rendered hex codes or font names as visible text, subjects from explicit_out_of_scope list.\`
 
     Append any additional exclusions from style_guide.do_not_use if present.
 
@@ -477,7 +469,7 @@ CRITICAL:
 
 - Zone order within the prompt:
 
-  [Wireframe reference instruction] → [Left-column background] → [Logo with preservation + no-lock-up clause] → [Pill with derived label] → [Title with bold weight] → [Subtitle regular weight] → [Right-column visual] → [Boundary fade per boundary_fade_rule] → [Style modifiers] → [Negative clause] → [Aspect ratio and canvas dimensions from <canvas_variants>]
+  [Wireframe reference instruction] → [Left-column background] → [Logo with preservation + no-lock-up clause] → [Pill with derived label] → [Title with bold weight] → [Subtitle regular weight] → [Right-column visual] → [Column seam per column_seam_rule] → [Style modifiers] → [Negative clause] → [Aspect ratio and canvas dimensions from <canvas_variants>]
 
 - End with: --no [negative terms]
 
@@ -517,11 +509,9 @@ CRITICAL LOGO RULE:
 
 - The left-column background must give the logo clear contrast per the LOGO–BACKGROUND CONTRAST CHECK in construction step 3 — never a background that makes the logo blend in.
 
-CRITICAL BOUNDARY RULE:
+CRITICAL COLUMN SEAM RULE:
 
-- Boundary fade follows <boundary_fade_rule> exactly. Seam colour is pure black (#000000), not grey, not a tint of either column.
-
-- The shadow is heavily right-weighted and tightly compressed — a narrow seam with a short rightward spread, never a wide gradient. Left background stays clean to the seam — no leftward leak, no grey band, no symmetric fade.
+- The split between the two columns is a clean hard edge — no shadow, no gradient, no fade, no vignette, no divider line. Left and right meet directly at the 50% line with both sides at full saturation.
 
 Prompt length: 200–260 words inside the tags.
 
