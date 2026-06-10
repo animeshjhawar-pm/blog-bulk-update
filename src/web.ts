@@ -329,6 +329,33 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     font: inherit; padding: 7px 10px; border: 1px solid var(--border-strong); border-radius: 6px;
     background: #fff; color: var(--ink); width: 100%;
   }
+  /* Strip native (macOS/Windows) chrome from every <select> so the
+     control matches our buttons + inputs instead of jumping out as
+     an OS widget. Custom chevron SVG sits on the right; padding
+     reserves room for it. The popup options list is still native
+     (browser default) — that part is consistent across platforms
+     and is what users expect for keyboard / a11y. */
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23606770' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 12px;
+    padding-right: 30px;
+    cursor: pointer;
+  }
+  /* Compact pill-style select used inside toolbars (e.g. workspace
+     sort, recent-runs filters). Smaller padding + chevron offset. */
+  select.select-compact {
+    padding: 4px 24px 4px 8px;
+    background-position: right 6px center;
+    background-size: 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    width: auto;
+  }
   input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-bg); border-color: var(--brand); }
   input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; cursor: pointer; }
   textarea { font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.5; min-height: 110px; resize: vertical; }
@@ -1611,19 +1638,19 @@ ${recent.length > 0 ? `
            placeholder="Filter by client or page type…"
            autocomplete="off"
            oninput="filterRecentRuns()">
-    <select id="recent-status-filter" onchange="filterRecentRuns()" title="Status filter">
+    <select id="recent-status-filter" class="select-compact" onchange="filterRecentRuns()" title="Status filter">
       <option value="">All statuses</option>
       <option value="running">Running</option>
       <option value="ok">Completed</option>
       <option value="partial">Partial</option>
       <option value="failed">Failed</option>
     </select>
-    <select id="recent-applied-filter" onchange="filterRecentRuns()" title="Apply state">
+    <select id="recent-applied-filter" class="select-compact" onchange="filterRecentRuns()" title="Apply state">
       <option value="">All apply state</option>
       <option value="1">Has applies</option>
       <option value="0">Not yet applied</option>
     </select>
-    <select id="recent-mode-filter" onchange="filterRecentRuns()" title="Run type">
+    <select id="recent-mode-filter" class="select-compact" onchange="filterRecentRuns()" title="Run type">
       <option value="">All types</option>
       <option value="regen">↻ Generate</option>
       <option value="upload">↑ Upload</option>
@@ -1738,7 +1765,7 @@ ${recent.length > 0 ? `
     <div id="pt-loading" class="pt-loading"><span class="spinner"></span> Counting published pages…</div>
     <div id="pt-grid" style="display:none">
       <label for="pt-select" style="font-size:12px;color:var(--ink-muted);margin-bottom:4px;display:block">Page type</label>
-      <select id="pt-select" onchange="ptUpdate()" style="width:100%;font-size:14px;padding:10px 12px;border:1px solid var(--border-strong);border-radius:8px;background:#fff;color:var(--ink)">
+      <select id="pt-select" onchange="ptUpdate()" style="width:100%;font-size:14px;padding:10px 30px 10px 12px;background-position:right 12px center;background-size:14px;border-radius:8px">
         <option value="" disabled selected>Select a page type…</option>
       </select>
     </div>
@@ -2569,7 +2596,7 @@ async function saveToken(e) {
     </div>
     <div class="check-row" style="flex:0 0 auto;gap:6px">
       <label for="cluster-sort" style="font-size:12px;color:var(--muted)">Sort:</label>
-      <select id="cluster-sort" onchange="onSortChange(this.value)" style="padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg-1);color:var(--fg)">
+      <select id="cluster-sort" class="select-compact" onchange="onSortChange(this.value)">
         <option value="created"${sortBy === "created" ? " selected" : ""}>Created date (newest first)</option>
         <option value="modified"${sortBy === "modified" ? " selected" : ""}>Last modified (newest first)</option>
       </select>
