@@ -2273,7 +2273,13 @@ async function workspacePage(
   <td class="types"><div class="pills-wrap">${pills}</div></td>
   <td style="text-align:right" onclick="event.stopPropagation()">
     ${publishedUrl
-      ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View current page →</a>`
+      ? (c.page_status === "PUBLISHED"
+          ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View current page →</a>`
+          // GENERATED clusters resolve to a URL but the page isn't actually
+          // live yet — visiting it returns 404. Keep the link so the
+          // operator can confirm that for themselves if needed, but
+          // re-label it so they aren't promised a working page.
+          : `<a class="btn" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Page not published yet — this URL will 404 until Stormbreaker pushes it live.">Preview URL ↗</a>`)
       : `<span class="sub" style="font-size:11px">no slug</span>`}
   </td>
 </tr>`;
