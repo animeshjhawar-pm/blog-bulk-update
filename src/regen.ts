@@ -132,53 +132,37 @@ export function pickLogoUrl(
   // state. The pipeline does not break.
   if (disabled) return null;
 
-  // Operator-edited override always wins.
+  // 1. Operator-edited override ALWAYS wins. Saved via the workspace
+  //    "Logo URL" field → loadProjectOverrides(slug).logo_url, which
+  //    the caller threads in as `override` here. This lets an operator
+  //    replace the DB-resolved logo for one run / one client without
+  //    touching the projects table — useful when DB has the wrong
+  //    file (e.g. low-res thumbnail) or no logo at all.
   if (override && override.startsWith("http")) return override;
 
-  // The DB's projects.logo_urls is the AUTHORITATIVE source — it holds
-  // the exact URLs the live site renders. Resolution order:
+  // 2. No override → use ONLY projects.logo_urls.header_logo. Per
+  //    spec ("if not then only take the header_logo"). Everything
+  //    else (primary_logo / logo / footer_logo / canonical-path /
+  //    any-other) is intentionally NOT consulted — the previous
+  //    fallback chain produced wrong references on clients whose
+  //    DB had a header_logo but also stored stale alternates, and
+  //    the operator's recourse for any header_logo gap is now the
+  //    explicit "save logo URL" override in step 1.
   //
-  //   1. header_logo  — the logo the live page header actually shows.
-  //                     This is what we want as the image-gen reference.
-  //   2. primary_logo / logo / primaryLogo — alternate naming clients use.
-  //   3. footer_logo  — same brand mark, just placed in the footer.
-  //   4. canonical path website/<staging>/assets/logo/logo.webp — a GUESS.
-  //      Older code used this FIRST, which was wrong: for clients whose
-  //      real logo lives under assets/uploaded-assets/<ts>_<hash>.webp
-  //      (e.g. Sarkinen Calibrating) the canonical path resolves to a
-  //      different, wrong file (Sarkinen's is a 363 KB asset, not the
-  //      11 KB brand logo). The DB value must win over the path guess.
-  //   5. any other logo_urls entry EXCEPT favicon / gbp_url — favicons
-  //      are tiny 16×16 PNGs that feed Replicate a poor reference;
-  //      gbp_url is a Google-Business-Profile link, not a brand mark.
-  //
-  // The canonical path stays in the chain only as a fallback for
-  // clients whose logo_urls is empty or carries nothing usable.
+  //    All seven projects we've looked at (sentinel, specgas,
+  //    trussed, ach, inzure, evaspeaks, allcare) have header_logo
+  //    populated — verified before this change.
   const lu = (project.logo_urls && typeof project.logo_urls === "object")
     ? (project.logo_urls as Record<string, unknown>)
     : null;
-  const pick = (k: string): string | null => {
-    const v = lu?.[k];
-    return typeof v === "string" && v.startsWith("http") ? v : null;
-  };
-
-  const named = pick("header_logo")
-    ?? pick("primary_logo") ?? pick("logo") ?? pick("primaryLogo")
-    ?? pick("footer_logo");
-  if (named) return named;
-
-  if (project.staging_subdomain) {
-    return `https://file-host.link/website/${project.staging_subdomain}/assets/logo/logo.webp`;
+  const headerLogo = lu?.["header_logo"];
+  if (typeof headerLogo === "string" && headerLogo.startsWith("http")) {
+    return headerLogo;
   }
 
-  // Nothing named, no staging subdomain — take any logo_urls value
-  // that isn't a favicon or a GBP link.
-  if (lu) {
-    for (const [k, v] of Object.entries(lu)) {
-      if (k === "favicon" || k === "gbp_url") continue;
-      if (typeof v === "string" && v.startsWith("http")) return v;
-    }
-  }
+  // header_logo missing → no logo reference. Pipeline omits it cleanly.
+  // Operator can save an override via the workspace UI to fix it
+  // without a code change.
   return null;
 }
 
