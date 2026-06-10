@@ -778,6 +778,12 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .pill.pt-service  { background: #ede9fe; color: #5b21b6; padding: 0 6px; font-size: 10px; }
   .pill.pt-category { background: #fef3c7; color: #92400e; padding: 0 6px; font-size: 10px; }
 
+  /* Per-cluster status pill — PUBLISHED (green) means the page is live;
+     GENERATED (amber) means content rendered but not pushed to the
+     live site yet. Sits immediately right of the page_type pill. */
+  .pill.status-published { background: #d1fae5; color: #065f46; padding: 0 6px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; }
+  .pill.status-generated { background: #fef3c7; color: #92400e; padding: 0 6px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; }
+
   /* Page-type chooser modal */
   .pt-modal {
     position: fixed; top: 50%; left: 50%; transform: translate(-50%, -52%) scale(.97);
@@ -2004,6 +2010,10 @@ interface ClusterPayload {
   updated_at: string | null;
   cover_url: string | null;
   total: number;
+  /** PUBLISHED (live on the customer site) or GENERATED (content
+   *  rendered, not pushed live yet). Drives the status pill that
+   *  sits next to the page_type pill on the cluster row. */
+  page_status: "PUBLISHED" | "GENERATED";
   by_asset: Record<string, number>;
   images: Array<{
     id: string;
@@ -2205,6 +2215,7 @@ async function workspacePage(
       updated_at: c.updated_at ? c.updated_at.toISOString().slice(0, 10) : null,
       cover_url: cover?.previewUrl ?? null,
       total: recs.length,
+      page_status: c.page_status,
       by_asset: counts,
       images: recs.map((r) => ({
         id: r.imageId,
@@ -2252,11 +2263,11 @@ async function workspacePage(
       // Falls back gracefully when slug isn't set on the cluster row.
       const publishedUrl = buildPublishedUrl(project!, c.page_type, c.slug);
       return `
-<tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-page-type="${esc(c.page_type)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
+<tr class="cluster-row" data-cluster-id="${esc(c.id)}" data-page-type="${esc(c.page_type)}" data-page-status="${esc(c.page_status)}" data-topic="${esc(c.topic.toLowerCase())}" onclick="rowClick(event, '${esc(c.id)}')">
   <td onclick="event.stopPropagation()"><input type="checkbox" class="cluster-select" data-cluster-id="${esc(c.id)}" onclick="onClusterCheck('${esc(c.id)}', this.checked, event)"></td>
   <td class="topic">
     <div class="t">${esc(c.topic)}</div>
-    <div class="cid"><span class="pill pt-${esc(c.page_type)}">${esc(c.page_type)}</span> <code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
+    <div class="cid"><span class="pill pt-${esc(c.page_type)}">${esc(c.page_type)}</span> <span class="pill status-${esc(c.page_status.toLowerCase())}" title="${c.page_status === "PUBLISHED" ? "Live on the customer site" : "Content generated; not yet published live"}">${esc(c.page_status)}</span> <code>${esc(c.id)}</code> · ${esc(c.updated_at ?? "")}</div>
   </td>
   <td class="preview">${cover}</td>
   <td class="types"><div class="pills-wrap">${pills}</div></td>

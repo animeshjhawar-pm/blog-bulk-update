@@ -86,6 +86,12 @@ export type ClusterPageInfo = Record<string, unknown>;
 
 export type PageType = "blog" | "service" | "category";
 
+/** Cluster lifecycle state as Stormbreaker tracks it. We surface only
+ *  the two states the workspace cares about — PUBLISHED (already live)
+ *  and GENERATED (content rendered, not yet pushed to the live site).
+ *  Anything else (null / DRAFT / archival states) stays hidden. */
+export type ClusterStatus = "PUBLISHED" | "GENERATED";
+
 export interface ClusterRow {
   id: string;
   topic: string | null;
@@ -96,6 +102,10 @@ export interface ClusterRow {
   /** clusters.slug — used to construct the published-page URL on the
    * cluster row's "View Published Page →" CTA. */
   slug: string | null;
+  /** Lifecycle status. PUBLISHED clusters are live; GENERATED
+   *  clusters have rendered content that hasn't been published yet —
+   *  both are surfaced in the workspace, distinguished by a pill. */
+  page_status: ClusterStatus;
 }
 
 /**
@@ -108,10 +118,14 @@ export interface ClusterRow {
 export type ClusterSort = "created" | "modified";
 
 /**
- * Real schema: clusters.p_id (not project_id), clusters.page_status='PUBLISHED'
- * (uppercase), clusters.u_at (not updated_at), clusters.c_at (created_at).
- * Page-status filter is enforced for every page_type — we never surface
- * unpublished clusters in the UI.
+ * Real schema: clusters.p_id (not project_id), clusters.page_status
+ * (uppercase enum-ish: PUBLISHED, GENERATED, null, etc.), clusters.u_at
+ * (not updated_at), clusters.c_at (created_at).
+ *
+ * The workspace surfaces BOTH live (`PUBLISHED`) and ready-but-not-
+ * pushed (`GENERATED`) clusters — the per-cluster status pill lets
+ * the operator distinguish them. Other statuses (null / archived)
+ * stay hidden.
  *
  * Accepts a single page_type or an array. When an array is passed the
  * results are merged in the chosen sort order (newest first).
@@ -124,7 +138,12 @@ export type ClusterSort = "created" | "modified";
  * If the DB query fails (e.g., c_at doesn't exist in some env), we
  * fall back to u_at sort with a one-line stderr warning so the page
  * still renders.
+ *
+ * Name kept (`listPublishedClusters`) for grep-stability; behaviour
+ * is now PUBLISHED ∪ GENERATED.
  */
+const WORKSPACE_VISIBLE_STATUSES: ClusterStatus[] = ["PUBLISHED", "GENERATED"];
+
 export async function listPublishedClusters(
   projectId: string,
   pageType: PageType | PageType[] = "blog",
@@ -134,15 +153,15 @@ export async function listPublishedClusters(
   if (types.length === 0) return [];
   const orderClause = sortBy === "created" ? "ORDER BY c_at DESC" : "ORDER BY u_at DESC";
   const sql = `
-    SELECT id, topic, page_info, u_at AS updated_at, page_type, slug
+    SELECT id, topic, page_info, u_at AS updated_at, page_type, slug, page_status
     FROM clusters
     WHERE p_id = $1::uuid
       AND page_type = ANY($2::text[])
-      AND page_status = 'PUBLISHED'
+      AND page_status = ANY($3::text[])
     ${orderClause}
   `;
   try {
-    const res = await getPool().query<ClusterRow>(sql, [projectId, types]);
+    const res = await getPool().query<ClusterRow>(sql, [projectId, types, WORKSPACE_VISIBLE_STATUSES]);
     return res.rows;
   } catch (err) {
     if (sortBy === "created") {
@@ -152,14 +171,14 @@ export async function listPublishedClusters(
         `listPublishedClusters: sortBy=created failed (${(err as Error).message}); falling back to u_at\n`,
       );
       const fallbackSql = `
-        SELECT id, topic, page_info, u_at AS updated_at, page_type, slug
+        SELECT id, topic, page_info, u_at AS updated_at, page_type, slug, page_status
         FROM clusters
         WHERE p_id = $1::uuid
           AND page_type = ANY($2::text[])
-          AND page_status = 'PUBLISHED'
+          AND page_status = ANY($3::text[])
         ORDER BY u_at DESC
       `;
-      const res = await getPool().query<ClusterRow>(fallbackSql, [projectId, types]);
+      const res = await getPool().query<ClusterRow>(fallbackSql, [projectId, types, WORKSPACE_VISIBLE_STATUSES]);
       return res.rows;
     }
     throw err;
@@ -288,7 +307,10 @@ export async function lookupClusterSlugs(clusterIds: string[]): Promise<Map<stri
   return out;
 }
 
-/** How many published clusters of each page_type does this project have? */
+/** How many workspace-visible clusters (PUBLISHED ∪ GENERATED) of each
+ *  page_type does this project have? Drives the page-type picker
+ *  counts on the home modal and the tabs on the workspace, so it must
+ *  match what listPublishedClusters actually returns. */
 export async function publishedClusterCountsByPageType(
   projectId: string,
 ): Promise<Record<PageType, number>> {
@@ -296,11 +318,11 @@ export async function publishedClusterCountsByPageType(
     SELECT page_type, count(*)::int AS n
     FROM clusters
     WHERE p_id = $1::uuid
-      AND page_status = 'PUBLISHED'
+      AND page_status = ANY($2::text[])
       AND page_type IN ('blog', 'service', 'category')
     GROUP BY 1
   `;
-  const res = await getPool().query<{ page_type: PageType; n: number }>(sql, [projectId]);
+  const res = await getPool().query<{ page_type: PageType; n: number }>(sql, [projectId, WORKSPACE_VISIBLE_STATUSES]);
   const out: Record<PageType, number> = { blog: 0, service: 0, category: 0 };
   for (const r of res.rows) out[r.page_type] = r.n;
   return out;
