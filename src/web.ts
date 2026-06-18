@@ -9206,11 +9206,23 @@ async function uploadGenerateProductUrlPost(
     return sendJson(res, 400, { error: "URL is not a valid URL" });
   }
 
-  // Wipe any prior dropped file for this slot so the URL is the
-  // single source of truth. The serve-from-disk route then 404s for
-  // this image_id (intentional — URL-mode uses the operator's URL,
-  // not our store).
+  // Fetch the bytes RIGHT NOW and persist to disk. The previous
+  // behaviour (store the URL as a string, let the CLI fetch it at
+  // run time hours later) failed reliably for any source with a
+  // short-TTL signed URL — Airtable attachment URLs
+  // (v5.airtableusercontent.com) expire within hours and return
+  // HTTP 410; Dropbox temporary preview links, S3 presigned URLs,
+  // and similar all share the same trap.
+  //
+  // By downloading at paste time, we convert URL-mode into the same
+  // disk-backed shape as drag-drop: the CLI reads the local file,
+  // and Replicate fetches via /products-store/<runId>/<imageId>
+  // (served from disk) instead of the upstream URL. The original
+  // URL's TTL no longer matters once the bytes are ours.
   const dir = productsDirFor(runId);
+  await fs.mkdir(dir, { recursive: true });
+  // Wipe any prior file for this slot first so different extensions
+  // don't leave a stale alternate behind.
   try {
     const existing = await fs.readdir(dir);
     const filePrefix = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + ".";
@@ -9221,8 +9233,50 @@ async function uploadGenerateProductUrlPost(
     }
   } catch { /* dir may not exist yet */ }
 
-  session.products.set(imageId, raw);
-  sendJson(res, 200, { ok: true, image_id: imageId, url: raw });
+  let bytes: Buffer;
+  let ext = "png";
+  try {
+    const r = await fetch(raw);
+    if (!r.ok) {
+      return sendJson(res, 502, {
+        error:
+          `couldn't fetch ${raw.slice(0, 120)}: HTTP ${r.status}. ` +
+          (r.status === 403 || r.status === 410 || r.status === 404
+            ? "This URL has likely expired — Airtable / Dropbox / S3 signed URLs are short-lived. Re-export the asset to a public link (Imgur direct, GitHub raw, a public bucket) or drop the file instead."
+            : "Check that the URL is publicly reachable."),
+      });
+    }
+    const cl = Number.parseInt(r.headers.get("content-length") ?? "0", 10);
+    if (Number.isFinite(cl) && cl > 10 * 1024 * 1024) {
+      return sendJson(res, 413, { error: `file too large (${(cl / 1024 / 1024).toFixed(1)} MB; max 10 MB)` });
+    }
+    const ct = (r.headers.get("content-type") ?? "").toLowerCase();
+    if (ct.includes("png")) ext = "png";
+    else if (ct.includes("jpeg") || ct.includes("jpg")) ext = "jpg";
+    else if (ct.includes("webp")) ext = "webp";
+    else {
+      // Fall back to the URL's path extension.
+      const m = /\.([a-z0-9]{2,5})(?:[?#]|$)/i.exec(new URL(raw).pathname);
+      if (m && /^(png|jpe?g|webp)$/i.test(m[1]!)) ext = m[1]!.toLowerCase().replace("jpeg", "jpg");
+    }
+    bytes = Buffer.from(await r.arrayBuffer());
+    if (bytes.byteLength > 10 * 1024 * 1024) {
+      return sendJson(res, 413, { error: `file too large (${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB; max 10 MB)` });
+    }
+  } catch (err) {
+    return sendJson(res, 502, {
+      error: `couldn't fetch ${raw.slice(0, 120)}: ${(err as Error).message}. If this is an Airtable / Dropbox / S3 signed URL it has probably expired — paste a fresh URL or drop the file instead.`,
+    });
+  }
+
+  const safeName = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + "." + ext;
+  const outPath = path.join(dir, safeName);
+  await fs.writeFile(outPath, bytes);
+
+  // Store the LOCAL PATH (not the URL) so the rest of the pipeline
+  // treats this slot identically to a drag-dropped file.
+  session.products.set(imageId, outPath);
+  sendJson(res, 200, { ok: true, image_id: imageId, bytes: bytes.byteLength, ext });
 }
 
 async function uploadGenerateProductDelete(
