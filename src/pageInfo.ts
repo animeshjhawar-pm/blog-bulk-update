@@ -84,12 +84,36 @@ export function normalizeImageType(raw: string | undefined): AssetType {
   return "generic";
 }
 
-/** "#16:9" / "16:9" / "1:1" → "16:9". Returns null on miss. */
+/** Whitelist of aspect ratios we'll honour when present on a
+ *  page_info image's `context` field. Anything outside this set is
+ *  almost certainly NOT an aspect ratio — most commonly it's a
+ *  position-index string some upstream template wrote by mistake
+ *  ("#2:1", "#3:1", "#4:1" appearing on category_industry items
+ *  numbered 2/3/4, where the actual aspect is 1:1). Callers fall
+ *  back to DEFAULT_ASPECT[asset] when we return null. */
+const VALID_ASPECT_RATIOS = new Set([
+  "1:1",
+  "3:2", "2:3",
+  "4:3", "3:4",
+  "16:9", "9:16",
+  "4:5", "5:4",
+  "21:9",
+]);
+
+/** "#16:9" / "16:9" / "1:1" → "16:9". Returns null on miss OR when
+ *  the parsed value isn't a real aspect ratio (see VALID_ASPECT_RATIOS).
+ *  Restricting to a whitelist guards against upstream data corruption
+ *  — observed on Comp-Air Ohio cluster a3a4ec53-…-e4f3592c4eda where
+ *  `industries.items[i].image.context` held "#2:1" / "#3:1" / "#4:1"
+ *  (position indices, not aspects), all of which would otherwise have
+ *  been generated at the wrong aspect by Replicate. */
 export function parseAspectRatio(context: string | undefined): string | null {
   if (!context) return null;
   const m = /(\d+)\s*:\s*(\d+)/.exec(context);
   if (!m) return null;
-  return `${m[1]}:${m[2]}`;
+  const ratio = `${m[1]}:${m[2]}`;
+  if (!VALID_ASPECT_RATIOS.has(ratio)) return null;
+  return ratio;
 }
 
 function descriptionFor(cluster: ClusterRow): string {
