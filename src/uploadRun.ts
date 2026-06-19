@@ -228,11 +228,19 @@ export async function validateAndCanonicalise(
   };
 }
 
+/** Parse "W:H" into W/H. Returns NaN when either dimension is
+ *  larger than 50 — a typical aspect ratio component is 1–21
+ *  (4:5, 16:9, 21:9 are the extremes we see). Anything past 50
+ *  is almost certainly upstream garbage (position index, copy-paste
+ *  typo, "9999:1" type values) and should NOT propagate to the
+ *  aspect-mismatch math or Replicate. */
 function aspectToNumber(a: string): number {
   const m = /^(\d+)\s*:\s*(\d+)$/.exec(a.trim());
   if (!m) return Number.NaN;
   const n = Number(m[1]), d = Number(m[2]);
-  return d ? n / d : Number.NaN;
+  if (!d) return Number.NaN;
+  if (n > 50 || d > 50 || n < 1 || d < 1) return Number.NaN;
+  return n / d;
 }
 function gcd(a: number, b: number): number { return b === 0 ? a : gcd(b, a % b); }
 function simplifyAspect(w: number, h: number): string {

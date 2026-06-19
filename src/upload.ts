@@ -142,13 +142,30 @@ async function readSourceBytes(
   return { bytes: Buffer.from(await resp.arrayBuffer()), source: "remote" };
 }
 
+/** Whitelist of extensions the Gushwork media API accepts. Anything
+ *  outside this set is silently coerced to "png" downstream, so we'd
+ *  rather pin it here than have an opaque 415 surface mid-upload. */
+const VALID_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp"]);
+
 function extFor(row: CsvRowParsed): string {
+  const normalise = (raw: string): string | null => {
+    const e = raw.toLowerCase();
+    if (e === "jpeg") return "jpg";
+    return VALID_IMAGE_EXTS.has(e) ? e : null;
+  };
+
   const fromLocal = path.extname(row.image_local_path ?? "").replace(".", "");
-  if (fromLocal) return fromLocal.toLowerCase();
+  if (fromLocal) {
+    const e = normalise(fromLocal);
+    if (e) return e;
+  }
   try {
     const u = new URL(row.image_url_new);
     const m = /\.([a-z0-9]{2,5})$/i.exec(u.pathname);
-    if (m) return m[1]!.toLowerCase();
+    if (m) {
+      const e = normalise(m[1]!);
+      if (e) return e;
+    }
   } catch {
     /* ignore */
   }

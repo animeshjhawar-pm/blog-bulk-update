@@ -120,6 +120,19 @@ const WIREFRAME_URLS: Partial<Record<AssetType, string>> = {
  * independently, which meant the preview and the image-gen reference
  * could disagree.
  */
+/** Real HTTP(S) URL — not just "starts with the letters http". Guards
+ *  against typos like "https//example.com" (missing colon), "http "
+ *  (trailing space), and any string the URL constructor refuses. */
+function isHttpUrl(s: string | null | undefined): s is string {
+  if (typeof s !== "string") return false;
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export function pickLogoUrl(
   project: ProjectRow,
   override: string | null,
@@ -138,7 +151,7 @@ export function pickLogoUrl(
   //    replace the DB-resolved logo for one run / one client without
   //    touching the projects table — useful when DB has the wrong
   //    file (e.g. low-res thumbnail) or no logo at all.
-  if (override && override.startsWith("http")) return override;
+  if (isHttpUrl(override)) return override;
 
   // 2. No override → use ONLY projects.logo_urls.header_logo. Per
   //    spec ("if not then only take the header_logo"). Everything
@@ -156,8 +169,8 @@ export function pickLogoUrl(
     ? (project.logo_urls as Record<string, unknown>)
     : null;
   const headerLogo = lu?.["header_logo"];
-  if (typeof headerLogo === "string" && headerLogo.startsWith("http")) {
-    return headerLogo;
+  if (isHttpUrl(typeof headerLogo === "string" ? headerLogo : null)) {
+    return headerLogo as string;
   }
 
   // header_logo missing → no logo reference. Pipeline omits it cleanly.
