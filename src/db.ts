@@ -152,12 +152,18 @@ export async function listPublishedClusters(
   const types = Array.isArray(pageType) ? pageType : [pageType];
   if (types.length === 0) return [];
   const orderClause = sortBy === "created" ? "ORDER BY c_at DESC" : "ORDER BY u_at DESC";
+  // d_at IS NULL: clusters is a soft-delete table — deleted pages
+  // keep their row but get a non-null d_at. Without this filter we
+  // were surfacing ~1.4k soft-deleted clusters in the workspace
+  // (mostly GENERATED), letting operators kick off regens against
+  // pages that no longer exist on the live site.
   const sql = `
     SELECT id, topic, page_info, u_at AS updated_at, page_type, slug, page_status
     FROM clusters
     WHERE p_id = $1::uuid
       AND page_type = ANY($2::text[])
       AND page_status = ANY($3::text[])
+      AND d_at IS NULL
     ${orderClause}
   `;
   try {
@@ -176,6 +182,7 @@ export async function listPublishedClusters(
         WHERE p_id = $1::uuid
           AND page_type = ANY($2::text[])
           AND page_status = ANY($3::text[])
+          AND d_at IS NULL
         ORDER BY u_at DESC
       `;
       const res = await getPool().query<ClusterRow>(fallbackSql, [projectId, types, WORKSPACE_VISIBLE_STATUSES]);
@@ -314,12 +321,17 @@ export async function lookupClusterSlugs(clusterIds: string[]): Promise<Map<stri
 export async function publishedClusterCountsByPageType(
   projectId: string,
 ): Promise<Record<PageType, number>> {
+  // d_at IS NULL: same soft-delete filter as listPublishedClusters
+  // so the page-type picker counts and the workspace tabs don't
+  // promise N clusters then show fewer once deleted ones are
+  // filtered out at render time.
   const sql = `
     SELECT page_type, count(*)::int AS n
     FROM clusters
     WHERE p_id = $1::uuid
       AND page_status = ANY($2::text[])
       AND page_type IN ('blog', 'service', 'category')
+      AND d_at IS NULL
     GROUP BY 1
   `;
   const res = await getPool().query<{ page_type: PageType; n: number }>(sql, [projectId, WORKSPACE_VISIBLE_STATUSES]);
@@ -409,12 +421,20 @@ export interface ClusterForApply {
   staging_subdomain: string | null;
 }
 export async function getClusterForApply(clusterId: string): Promise<ClusterForApply | null> {
+  // c.d_at IS NULL — refuse to fetch a soft-deleted cluster for the
+  // apply pipeline. Repoint would otherwise write fresh page_info to
+  // a deleted row, which Gushwork's frontend wouldn't render anyway
+  // (silent no-op from the operator's perspective). Returning null
+  // here makes repointCluster surface the clean "cluster not found
+  // / no page_info in DB" message — same path as a genuinely-missing
+  // cluster_id, which is the correct user-facing framing.
   const sql = `
     SELECT c.id::text AS id, c.p_id::text AS p_id, c.page_type, c.page_info,
            p.staging_subdomain
     FROM clusters c
     JOIN projects p ON p.id = c.p_id
     WHERE c.id = $1::uuid
+      AND c.d_at IS NULL
     LIMIT 1
   `;
   const r = await getPool().query<ClusterForApply>(sql, [clusterId]);
