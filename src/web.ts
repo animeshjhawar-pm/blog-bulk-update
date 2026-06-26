@@ -4151,6 +4151,36 @@ async function upgenPromptsSubmit() {
 
 renderAssetFilter();
 refreshTotals();
+
+// ?preselect=<cluster_id> support — the run page's "↻ Re-import
+// cluster" affordance jumps here with this query param when a card
+// failed apply with a stale-mapping error. We scroll the cluster
+// into view and tick its checkbox so the operator can immediately
+// hit "Generate →" / "Upload + Generate" against current page_info.
+(function () {
+  try {
+    const u = new URL(window.location.href);
+    const cid = u.searchParams.get('preselect');
+    if (!cid) return;
+    const row = document.querySelector('tr.cluster-row[data-cluster-id="' + CSS.escape(cid) + '"]');
+    if (!row) return;
+    const cb = row.querySelector('input.cluster-select');
+    if (cb && !cb.checked) {
+      cb.checked = true;
+      // Drive the same code path a real click would.
+      if (typeof onClusterCheck === 'function') onClusterCheck(cid, true, null);
+    }
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // Brief highlight so the operator knows where they landed.
+    row.style.transition = 'background-color 0.6s ease';
+    const prevBg = row.style.backgroundColor;
+    row.style.backgroundColor = '#fef3c7';
+    setTimeout(function () { row.style.backgroundColor = prevBg; }, 1800);
+    // Strip the param so a reload doesn't keep re-firing the flash.
+    u.searchParams.delete('preselect');
+    window.history.replaceState({}, '', u.toString());
+  } catch (e) { /* tolerate any DOM weirdness — best-effort UX */ }
+})();
 </script>`;
 
   sendHtml(res, 200, shell(`workspace · ${slug}`, body, scripts, esc(slug)));
@@ -6072,6 +6102,11 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
   // below can reference it without needing the inner-scope vars
   // (grouped, publishedUrlOf) at template-eval time.
   let runClustersForJs: Record<string, { topic: string; url: string }> = {};
+  // Dominant page_type across the run's clusters — used by the
+  // "↻ Re-import cluster" link the apply-failure renderer injects, so
+  // the workspace lands on the right tab when the operator clicks
+  // through. Falls back to "blog" when we can't infer.
+  let runPageTypeForJs = "blog";
   if (state.done && state.csvPath) {
     const rows = await readRunCsvOrEmpty(state.csvPath);
     if (rows.length > 0) {
@@ -6122,6 +6157,16 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
           { topic: g.topic || "", url: publishedUrlOf(clusterId) || "" },
         ]),
       );
+      // Pick the most common page_type across this run's clusters as
+      // the "Re-import cluster" link target. Most runs are single-type
+      // anyway; the tally picks correctly if a run somehow mixes types.
+      const ptTally = new Map<string, number>();
+      for (const cid of grouped.keys()) {
+        const pt = clusterMeta.get(cid)?.page_type;
+        if (pt) ptTally.set(pt, (ptTally.get(pt) ?? 0) + 1);
+      }
+      const ptTop = [...ptTally.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      if (ptTop) runPageTypeForJs = ptTop;
       const oldUrlOf = (imageId: string): string | null => {
         // Primary source: the CSV column we now write at run start.
         const fromCsv = csvOldUrls.get(imageId);
@@ -6472,6 +6517,12 @@ const RUN_STARTED_AT = ${JSON.stringify(state.startedAt)};
 // build kept tripping on it. window.* is initialised the moment
 // this line is parsed, no ordering hazard.
 window.RUN_STAGE = ${JSON.stringify(stage)};
+// Client slug + dominant page_type of this run, used by the
+// "↻ Re-import cluster" link the apply-failure renderer injects on
+// stale-mapping errors so the operator can jump back to the
+// workspace with the cluster pre-selected.
+window.RUN_CLIENT_SLUG = ${JSON.stringify(state.client)};
+window.RUN_PAGE_TYPE = ${JSON.stringify(runPageTypeForJs)};
 // Cluster metadata for the modal that confirms a multi-cluster
 // apply. The "apply to all instances" button needs to show the
 // operator the live page URL + topic for every cluster that shares
@@ -6634,8 +6685,40 @@ function paintCard(imageId, opts) {
   }
   const errLine = card.querySelector('.rc-status-line');
   if (errLine) {
-    errLine.textContent = (s === 'failed' && opts && opts.error) ? ('Reason: ' + opts.error) : '';
-    errLine.style.display = (s === 'failed' && opts && opts.error) ? 'block' : 'none';
+    const showError = s === 'failed' && opts && opts.error;
+    if (showError) {
+      // Detect the stale-mapping case (gate 2 in repoint refused
+      // because the run's recorded image_id no longer matches live
+      // page_info). Inject a one-click "Re-import cluster" link
+      // that jumps back to the workspace with the cluster
+      // pre-selected; the operator's old recourse was to navigate
+      // home → search client → workspace → find cluster → tick →
+      // start fresh run, which is 5+ clicks and easy to lose track of.
+      const isStale = /stale\b|no longer matches live page_info|re-import the cluster/i.test(opts.error);
+      const cid = card.dataset.clusterId || '';
+      const slug = (typeof RUN_CLIENT_SLUG === 'string' && RUN_CLIENT_SLUG) ? RUN_CLIENT_SLUG : '';
+      const pageType = (typeof RUN_PAGE_TYPE === 'string' && RUN_PAGE_TYPE) ? RUN_PAGE_TYPE : '';
+      // Reset element + content. Use innerHTML so the link is
+      // clickable.
+      errLine.style.display = 'block';
+      let html = 'Reason: ' + escapeHtml(opts.error);
+      if (isStale && cid && slug) {
+        const params = new URLSearchParams();
+        if (pageType) params.set('selected', pageType);
+        params.set('preselect', cid);
+        const href = '/workspace/' + encodeURIComponent(slug) + '?' + params.toString();
+        html +=
+          ' <a href="' + escapeHtml(href) + '" '
+          + 'style="display:inline-block;margin-left:8px;padding:2px 8px;background:#4338ca;color:#fff;border-radius:4px;text-decoration:none;font-weight:500;" '
+          + 'title="Open the workspace with this cluster pre-selected so you can start a fresh run against its current page_info">'
+          + '↻ Re-import cluster</a>';
+      }
+      errLine.innerHTML = html;
+    } else {
+      errLine.textContent = '';
+      errLine.style.display = 'none';
+      errLine.innerHTML = '';
+    }
   }
 }
 
