@@ -231,19 +231,20 @@ This rule applies to: rating stars, completion indicators, row-bullet marks, dec
 </tile_internal_accent_consistency>
 
 <header_layout_and_hierarchy>
-The header band is a continuous zone at the top of the canvas. The logo sits INSIDE the band (top-left, padded from edges), not beside it as a separate floating element. If the logo has its own colour background from the attached reference, the band's fill colour should be chosen so the logo reads cleanly against it (neutral dark, or the logo's native background tone).
+The infographic is ALWAYS embedded under an HTML heading on the host blog page — Stormbreaker places it immediately after the section H2/H3. That heading already names the topic. Rendering the same heading INSIDE the infographic produces a visible duplicate of the section title (one in the browser text, one in the image pixels) stacked vertically. Don't do it.
 
-Avoid: logo in a white box adjacent to a coloured header band. This creates an asymmetric hybrid that reads as unfinished composition.
+NO RENDERED HEADLINE / NO TITLE TEXT inside the image. Specifically:
 
-HIERARCHY WITHIN HEADER. The TITLE is the primary line. The TAGLINE/KICKER (if present) is subordinate.
+  - Do NOT render the section topic as a dominant title line at the top of the canvas.
+  - Do NOT render a kicker / tagline / eyebrow phrase above or below where a title would go.
+  - Do NOT include the company / brand name as a header line.
+  - Do NOT include phrases drawn from the description's subject (e.g. "YouTube Shorts for Viral Growth", "Brand Identity Services", "Music Distribution Pricing") as standalone rendered text.
 
-Title: largest weight, most prominent position, carries the main subject. Positioned as the dominant visual line.
+Header band IS allowed, but it carries ONLY the brand logo (top-left, padded from edges) and is otherwise empty. The logo sits INSIDE the band, not beside it. Band fill: a neutral dark or the logo's native background tone, chosen so the logo reads cleanly.
 
-Tagline / kicker / eyebrow (shorter supplementary phrase, often from graphic_token, marketing tagline, or descriptive label): smaller weight, smaller size, positioned ABOVE the title as a subtle kicker, OR immediately beneath the title as a sub-heading. Never larger than the title. Never more prominent than the title.
+Avoid: logo in a white box adjacent to a coloured header band (asymmetric hybrid, reads as unfinished composition).
 
-Common failure to avoid: rendering the tagline above the title at larger or equal size, which inverts the hierarchy and confuses what the infographic is ABOUT versus what it's labelled as. The title answers "what is this infographic?"; the tagline answers "what's the tonal message?".
-
-When the description provides a quoted headline AND a kicker/tagline, the quoted headline is the title. Render it dominant. Render the kicker smaller above or below.
+The infographic body — data values, comparison cells, step labels, icon callouts, percentages, axis labels, chart legends, footnotes — renders normally per text_fidelity_and_font_consistency. Those are DATA, not headings. The ban above applies only to top-of-canvas title / kicker / tagline lines.
 </header_layout_and_hierarchy>
 
 <data_cell_typography_consistency>
@@ -290,9 +291,9 @@ Footer: small muted text centred at bottom: "\\"[website] · [company_name]\\"" 
 </company_name_fidelity>
 
 <title_extraction_rule>
-Layout-metadata phrases ("side-by-side", "horizontal tiles", "vertical columns") describe STRUCTURE. They do NOT render as title content.
+NO TITLE LINE IS RENDERED in the image — see header_layout_and_hierarchy. The host blog page provides the section heading; baking the same wording into the image creates a stacked-duplicate of the H2 above it.
 
-When no explicit quoted headline, synthesise from the SUBJECT. "Four patient transport modes as vertical columns" becomes "Patient Transport Modes Comparison", not "Patient Transport Modes: Side-by-Side Comparison".
+This rule kept only to absorb any legacy "synthesise a title from the subject" instinct. If the description hints at a quoted headline or a section topic phrase, that phrase still must NOT appear as a top-of-canvas title line in the image. It can still appear inline as part of a data label / chart axis / callout if it's literally what that data element is named.
 </title_extraction_rule>
 
 <text_fidelity_and_font_consistency>
@@ -339,7 +340,7 @@ STEP 0.8. SATURATION CHECK. For each hex in graphic_token.colours.palette[], cla
 
 STEP 1. CLASSIFY LAYOUT. Comparison grid, process flow, stat grid, timeline, data chart, hierarchy tree. Cross-check aspect ratio. If density is high (5+ items on 16:9), apply dense_grid_warning mitigations.
 
-STEP 2. RESOLVE TITLE per title_extraction_rule. If description provides a kicker/tagline alongside the title, plan header hierarchy per header_layout_and_hierarchy: title dominant, tagline subordinate.
+STEP 2. CONFIRM NO TITLE LINE per header_layout_and_hierarchy. The header band carries the logo only — no title, kicker, or tagline rendered text. The host page's H2 supplies the heading.
 
 STEP 3. RESOLVE COLOUR PALETTE.
 
@@ -379,7 +380,7 @@ Opening structure:
 - S3: Primary brand hex placement per saturation rule (structural zone if dark/low-medium, spot-only if electric), distinctive accent with any suppression note, surrounding palette in editorial language.
 - S4: Single font family, subtle drop shadows for depth.
 - S5: Logo instruction per logo_handling verbatim. Logo sits INSIDE header band.
-- S6: Headline placement with quoted title as the DOMINANT line; tagline/kicker (if any) explicitly described as smaller and subordinate, positioned above or below title.
+- S6: Header band described as carrying ONLY the brand logo. NO title, headline, kicker, or tagline rendered text anywhere in the image. The host blog page's H2 owns the heading; the image goes straight into the data/icons/structure without a top title line.
 
 Body: prose binding for zones, icon style matched to subject per icon_richness_rule (with finance/luxury register upgrade if applicable). SaaS product marks explicit per saas_and_third_party_brand_rendering when present. Comparison-grid internal accents follow tile_internal_accent_consistency. Data cell typography follows data_cell_typography_consistency. Literals in double quotes.
 
@@ -425,7 +426,7 @@ OUTPUT:
 
 <final_prompt>A premium finished graphic design artifact, a high-end editorial infographic layout filling the entire 16:9 canvas edge to edge, with no surrounding scene, environment, person, or device. The composition is a segmented donut chart flanked by six labeled callout rows on a crisp white canvas with a faint engineering blueprint grid underlay, styled as an industrial trade-publication feature, authoritative and data-forward. The header band uses deep brand navy (#014FA8) as the dominant structural colour carrying the headline in bold white, with six defect-segment hues (crimson, amber-orange, golden yellow, steel blue, deep violet, slate gray) reserved strictly for their chart arcs and matching icon tints. Work Sans held consistently across every text element at bold display for the headline, semibold for defect names and percentages, regular for cause lines, with subtle drop shadows beneath the donut ring and callout cards for dimensional depth.
 
-The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries the title "The 6 Most Common Injection Molding Defects (91% of All Issues)" in bold white Work Sans.
+The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries no title, kicker, or tagline text — only the brand logo. The page's H2 above the image owns the heading.
 
 The donut chart occupies the left-to-centre zone beneath the header, large and dimensional with thin white gaps separating arcs. Clockwise from top: roughly 35 percent in crimson for "Flash", roughly 25 percent in amber-orange for "Sink Marks", roughly 18 percent in golden yellow for "Short Shots", roughly 12 percent in steel blue for "Warpage", roughly 8 percent in deep violet for "Weld Lines", and a small sliver roughly 3 percent in slate gray for "Other Defects".
 
@@ -450,7 +451,7 @@ OUTPUT:
 
 <final_prompt>A premium finished graphic design artifact, a high-end editorial infographic layout filling the entire 16:9 canvas edge to edge, with no surrounding scene, environment, person, or device. The composition is a three-stat card row on a warm linen-paper cream canvas, styled as a premium craft-industry market-report editorial spread, warm and data-confident. A slim continuous header band at the top uses deep teal (#006666) as the structural colour with a thin 3px magenta (#EC008C) top-edge accent stripe running edge-to-edge above it, marking the brand without dominating. Inside the band, the logo sits top-left and the title runs to its right in bold white. The three stat cards on cream canvas use deep professional blue (#1A4F8A) for hero numbers and fresh green (#2E7D5B) for upward-trend indicators, graphite (#2A2F36) for body labels, with magenta reserved only for a single small brand accent in the footer brand mark. Clean warm humanist sans-serif held consistently across every text element at bold display for the headline, heavy display for hero stat numbers, semibold for stat labels, and regular for sub-labels. Subtle soft drop shadows beneath each stat card for dimensional depth.
 
-The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries the title "US Craft & Hobby Market: Key Statistics 2025" in bold white.
+The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries no title, kicker, or tagline text — only the brand logo. The page's H2 above the image owns the heading.
 
 Three equal stat cards sit in a horizontal row beneath the header with even gutters, rounded corners, warm pure-white fill, and subtle shadow. The leftmost shows a clean upward-arrow and dollar-sign icon in blue above the hero number "$24.9B" in bold blue, label "Online Craft Supplies Sales" and year "2025" in graphite, with a small upward-trend arrow and "$25.3B projected 2026" in bold green beneath. The middle shows a small storefront-building icon in blue, hero number "$5.1B" in bold blue, label "Brick-and-Mortar Fabric & Craft Stores" and year "2025" in graphite, green upward arrow and "$5.2B projected 2026" beneath. The rightmost shows a small scissors-and-paintbrush icon in blue above hero number "26%" in bold blue, sub-label "of US Respondents Name DIY/Arts & Crafts as a Primary Hobby" in graphite wrapping to two lines.
 
@@ -473,7 +474,7 @@ OUTPUT:
 
 <final_prompt>A premium finished graphic design artifact, a high-end editorial infographic layout filling the entire 16:9 canvas edge to edge, with no surrounding scene, environment, person, or device. The composition is a six-card reference grid arranged in two columns by three rows on a soft grey (#FAFAFA) canvas, data-focused and enterprise-functional with the precision of a technical documentation spread. Pure black (#000000) anchors the header band and primary typography, with brand hyperlink blue (#0000EE) restricted to chevron separators inside navigation paths only; card surfaces sit on pure white (#FFFFFF) with flat borderless design and 8px rounded corners, lifted from the canvas through tonal contrast alone. Inter held consistently across every text element at bold display for the headline, semibold for platform names, regular for path step labels.
 
-The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries the title "Scheduling Navigation Paths" in bold white Inter.
+The brand logo from the attached reference image renders exactly once in the top-left of the header band. Reproduce the attached logo faithfully, matching mark shape, wordmark, colour, and proportion; do not redraw, restyle, or add any text or lettering not present in the attached file. If the attached logo cannot be reproduced faithfully, leave the logo space empty rather than substitute with an invented mark. The header carries no title, kicker, or tagline text — only the brand logo. The page's H2 above the image owns the heading.
 
 Six equal-size white cards arrange with even gutters and consistent padding; all text stays within card boundaries. Each card displays the actual third-party product brand mark at top-left at small size (roughly 24px square), platform name in semibold black to its right, and the navigation path as a horizontal breadcrumb of step names separated by filled hyperlink-blue right-pointing chevrons.
 
@@ -505,8 +506,8 @@ Dark and low-medium saturation brand hues can carry header bands and structural 
 CORE PRINCIPLE. TILE-INTERNAL ACCENTS MATCH TILE COLOUR THEME.
 In colour-differentiated comparison grids, rating stars and small accents inside each tile take that tile's colour family, not a global default gold. Tile-consistent internals read as intentional design; global gold across differentiated tiles reads as oversight.
 
-CORE PRINCIPLE. TITLE IS DOMINANT, TAGLINE IS SUBORDINATE.
-Title carries the subject, rendered at the largest size and most prominent position. Tagline/kicker (if present) is smaller and positioned above or below the title but clearly subordinate. Never render the tagline at larger size than the title.
+CORE PRINCIPLE. NO RENDERED TITLE LINE.
+The infographic carries no top-of-canvas title, headline, kicker, or tagline. The host blog page's H2 sits immediately above the image and already names the section; baking the same heading into the image pixels produces a stacked-duplicate visible to every reader. The header band carries the brand logo only — see header_layout_and_hierarchy.
 
 CORE PRINCIPLE. LOGO SITS INSIDE THE HEADER BAND.
 The header is a continuous zone with the logo as an internal element (top-left, padded). Never as a floating white box adjacent to a coloured header band that starts beside it.
