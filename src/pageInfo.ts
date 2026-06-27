@@ -360,6 +360,10 @@ const MDX_ATTR_ALT      = /\balt\s*=\s*["']([^"']*)["']/i;
 interface MdxImageTag {
   imageId: string;
   alt: string;
+  /** Character offset of the <Image> tag within the source markdown.
+   *  Used to recover the surrounding section text when the tag's alt
+   *  is missing/generic (see deriveDescriptionFromSection). */
+  offset: number;
 }
 
 function scanMdxImageTags(md: string): MdxImageTag[] {
@@ -370,7 +374,7 @@ function scanMdxImageTags(md: string): MdxImageTag[] {
     const imageId = (MDX_ATTR_IMAGE_ID.exec(attrs)?.[1] ?? "").trim();
     if (!imageId) { skippedNoId++; continue; }
     const alt = (MDX_ATTR_ALT.exec(attrs)?.[1] ?? "").trim();
-    out.push({ imageId, alt });
+    out.push({ imageId, alt, offset: m.index ?? 0 });
   }
   if (skippedNoId > 0) {
     // Helpful breadcrumb when a Sentinel-style blog's <Image> tags are
@@ -392,21 +396,124 @@ function blogTextMd(pi: ClusterPageInfo): string | null {
   return null;
 }
 
+// ── Description fallback for blog inline images ─────────────────────
+// Some clients ship inline <Image> tags with no usable description:
+// the upstream renderer stamps a type label into `alt` ("Infographic",
+// "Internal") or leaves it empty instead of writing a real caption.
+// Feeding that to the prompt builder gives Claude nothing image-
+// specific, so every infographic in the post collapses onto the shared
+// project context (business_context / company_info / graphic_token /
+// topic — all identical across the post) and they come out nearly
+// identical, with headings that aren't grounded in the blog body.
+//
+// When the alt is weak we recover an image-specific description from
+// the SAME blog_text.md the tag lives in — its section heading + that
+// section's prose. Clients whose alt text is a genuine caption never
+// trip this guard, so their prompts are byte-for-byte unchanged.
+
+const GENERIC_ALT_TOKENS = new Set([
+  "infographic", "internal", "external", "generic",
+  "image", "img", "photo", "picture", "graphic", "illustration",
+  "cover", "thumbnail", "banner",
+]);
+
+/** True when an <Image> alt carries no real description — empty, or a
+ *  bare type/placeholder token. Conservative by design: only an exact
+ *  generic token (after trim+lowercase) matches, never a real caption
+ *  that merely happens to be short. */
+function isWeakDescription(alt: string | undefined): boolean {
+  const v = (alt ?? "").trim().toLowerCase();
+  if (!v) return true;
+  return GENERIC_ALT_TOKENS.has(v);
+}
+
+const MD_HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*$/gm;
+
+/** Strip MDX/HTML tags + common markdown syntax down to readable prose
+ *  and collapse whitespace. Cheap and lossy — good enough for a prompt
+ *  hint, not for rendering. */
+function markdownToPlainText(s: string): string {
+  return s
+    .replace(/<[^>]+>/g, " ")                   // <Image .../> and other tags
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")  // [text](url) / ![alt](url) → text
+    .replace(/`+/g, " ")                        // code ticks
+    .replace(/[*_>#]+/g, " ")                   // emphasis / blockquote / stray #
+    .replace(/\|/g, " ")                        // table pipes
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Recover an image-specific description for an inline <Image> whose alt
+ * is missing/generic, using the section of `md` the tag sits in: the
+ * nearest heading at/above `offset` plus that section's prose.
+ *
+ * Robust to where the image sits within its section (right after the
+ * heading or after the body) — we take the whole section between the
+ * bounding headings rather than only the text before the tag, so
+ * there's no off-by-one on tag position. Returns "" when nothing usable
+ * is found (the caller falls back further).
+ */
+function deriveDescriptionFromSection(md: string, offset: number): string {
+  let heading = "";
+  let sectionStart = 0;
+  let sectionEnd = md.length;
+  for (const m of md.matchAll(MD_HEADING_RE)) {
+    const idx = m.index ?? 0;
+    if (idx <= offset) {
+      heading = (m[2] ?? "").trim();
+      sectionStart = idx + m[0].length;
+    } else {
+      sectionEnd = idx;
+      break;
+    }
+  }
+  const headingText = markdownToPlainText(heading);
+  const body = markdownToPlainText(md.slice(sectionStart, sectionEnd)).slice(0, 500).trim();
+  if (headingText && body) return `${headingText}. ${body}`;
+  return headingText || body;
+}
+
 /**
  * Convert MDX <Image> tags to ImageRecords. Per the user's spec for
  * Sentinel-style blogs, the 1st tag is consumed by coverRecord, so
  * here we only emit the 2nd-onwards as inline infographics.
  * page_info.thumbnail is handled by thumbnailRecord.
+ *
+ * Description source: the tag's `alt` text. When that alt is empty or a
+ * generic placeholder (isWeakDescription), we substitute the
+ * surrounding section text so each infographic gets a distinct,
+ * blog-grounded description instead of all sharing the project context.
  */
-function mdxToRecords(cluster: ClusterRow, tags: MdxImageTag[]): ImageRecord[] {
-  return tags.slice(1).map((t) => ({
-    cluster,
-    asset: "infographic" as AssetType,
-    imageId: t.imageId,
-    description: t.alt,
-    aspectRatio: DEFAULT_ASPECT.infographic,
-    source: "page_info.blog_text.md<Image>[0]" as ImageSource,
-  }));
+function mdxToRecords(cluster: ClusterRow, tags: MdxImageTag[], md: string): ImageRecord[] {
+  let enriched = 0;
+  const records = tags.slice(1).map((t) => {
+    let description = t.alt;
+    if (isWeakDescription(t.alt)) {
+      const derived = deriveDescriptionFromSection(md, t.offset);
+      // Prefer the section text; if even that is empty fall back to the
+      // blog topic so two images are never handed an identical empty
+      // description (the exact thing that makes them converge). The
+      // generic alt is the last resort.
+      description = derived || (cluster.topic ?? "").trim() || t.alt;
+      if (derived) enriched++;
+    }
+    return {
+      cluster,
+      asset: "infographic" as AssetType,
+      imageId: t.imageId,
+      description,
+      aspectRatio: DEFAULT_ASPECT.infographic,
+      source: "page_info.blog_text.md<Image>[0]" as ImageSource,
+    };
+  });
+  if (enriched > 0) {
+    process.stderr.write(
+      `mdxToRecords: recovered ${enriched} inline description(s) from section context ` +
+        `(alt empty/generic) for cluster=${cluster.id}\n`,
+    );
+  }
+  return records;
 }
 
 async function inlineRecordsForCluster(
@@ -436,7 +543,7 @@ async function inlineRecordsForCluster(
   const md = blogTextMd(cluster.page_info ?? {});
   if (md) {
     const mdxTags = scanMdxImageTags(md);
-    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags);
+    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags, md);
   }
 
   // 2. S3 markdown <image_requirement> placeholders — for clusters
