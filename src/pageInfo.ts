@@ -31,7 +31,8 @@ export type ImageSource =
   | "page_info.fold_data.service_steps.images[0]"
   | "page_info.fold_data.service_description.images[0]"
   | "page_info.fold_data.industries.items[]"
-  | "page_info.blog_text.md<Image>[0]";
+  | "page_info.blog_text.md<Image>[0]"
+  | "page_info.blog_text.md![0]";
 
 export interface ImageRecord {
   cluster: ClusterRow;
@@ -474,20 +475,56 @@ function deriveDescriptionFromSection(md: string, offset: number): string {
   return headingText || body;
 }
 
+// Leading markdown image at the very top of blog_text.md, e.g.
+//   ![alt](https://…/<hash>/1080.webp "image_id:<uuid>")
+// The alt text can itself contain escaped brackets (\[2026 Data\]), so we
+// match non-greedily up to the FIRST `](`. Title (if present) carries the
+// canonical cover id as `image_id:<uuid>`.
+const LEADING_MD_IMAGE = /^\s*!\[[\s\S]*?\]\(\s*(\S+?)(?:\s+"([^"]*)")?\s*\)/;
+const TITLE_IMAGE_ID = /image_id:([0-9a-f-]{36})/i;
+
 /**
- * Convert MDX <Image> tags to ImageRecords. Per the user's spec for
- * Sentinel-style blogs, the 1st tag is consumed by coverRecord, so
- * here we only emit the 2nd-onwards as inline infographics.
- * page_info.thumbnail is handled by thumbnailRecord.
+ * Some blog templates (e.g. Seiz) embed the cover as the FIRST *markdown*
+ * image at the very top of blog_text.md — NOT as the first <Image/>
+ * component (the SpecGas / Sentinel style). `scanMdxImageTags` only sees
+ * <Image> components, so without this the first *body* <Image> gets
+ * mislabelled as the cover and one real infographic is dropped. Detect the
+ * leading markdown image and use its `image_id:` title as the cover id
+ * (falling back to the URL hash, then the raw URL). Returns null when
+ * blog_text.md doesn't open with a markdown image, in which case the
+ * existing <Image>[0]-as-cover behaviour is preserved untouched.
+ */
+function leadingMarkdownCover(md: string): { imageId: string; url: string } | null {
+  const m = LEADING_MD_IMAGE.exec(md);
+  if (!m) return null;
+  const url = (m[1] ?? "").trim();
+  if (!url) return null;
+  const title = m[2] ?? "";
+  const imageId = TITLE_IMAGE_ID.exec(title)?.[1] ?? imageIdFromThumbnailUrl(url) ?? url;
+  return { imageId, url };
+}
+
+/**
+ * Convert MDX <Image> tags to ImageRecords. By default the 1st tag is the
+ * cover (consumed by coverRecord) so only the 2nd-onwards become inline
+ * infographics. When the cover came from a leading markdown image instead
+ * (see leadingMarkdownCover), pass startIndex=0 so EVERY <Image> component
+ * is emitted as a body infographic. page_info.thumbnail is handled by
+ * thumbnailRecord.
  *
  * Description source: the tag's `alt` text. When that alt is empty or a
- * generic placeholder (isWeakDescription), we substitute the
- * surrounding section text so each infographic gets a distinct,
- * blog-grounded description instead of all sharing the project context.
+ * generic placeholder (isWeakDescription), we substitute the surrounding
+ * section text so each infographic gets a distinct, blog-grounded
+ * description instead of all sharing the project context.
  */
-function mdxToRecords(cluster: ClusterRow, tags: MdxImageTag[], md: string): ImageRecord[] {
+function mdxToRecords(
+  cluster: ClusterRow,
+  tags: MdxImageTag[],
+  md: string,
+  startIndex = 1,
+): ImageRecord[] {
   let enriched = 0;
-  const records = tags.slice(1).map((t) => {
+  const records = tags.slice(startIndex).map((t) => {
     let description = t.alt;
     if (isWeakDescription(t.alt)) {
       const derived = deriveDescriptionFromSection(md, t.offset);
@@ -520,6 +557,9 @@ async function inlineRecordsForCluster(
   cluster: ClusterRow,
   stagingSubdomain: string | null,
   cache: Map<string, string | null>,
+  /** When true the cover came from a leading markdown image, so EVERY
+   * <Image> component is a body infographic (nothing is consumed as cover). */
+  coverFromLeadingMd = false,
 ): Promise<ImageRecord[]> {
   // 1. MDX (page_info.blog_text.md <Image imageId="UUID"/>) — Sentinel /
   //    SpecGas-style blogs. Promoted from "fallback shape" to "primary"
@@ -543,7 +583,9 @@ async function inlineRecordsForCluster(
   const md = blogTextMd(cluster.page_info ?? {});
   if (md) {
     const mdxTags = scanMdxImageTags(md);
-    if (mdxTags.length > 0) return mdxToRecords(cluster, mdxTags, md);
+    if (mdxTags.length > 0) {
+      return mdxToRecords(cluster, mdxTags, md, coverFromLeadingMd ? 0 : 1);
+    }
   }
 
   // 2. S3 markdown <image_requirement> placeholders — for clusters
@@ -786,12 +828,31 @@ async function recordsForClusterByType(
   if (pageType === "service") return serviceRecords(cluster);
   if (pageType === "category") return categoryRecords(cluster);
 
-  // Blog: cover comes from coverRecord (which prefers the 1st MDX
-  // <Image> UUID, falling back to synthetic). thumbnail is always
-  // synthesised from page_info.thumbnail. inline images come from
-  // S3 markdown / DB Shape A / MDX (2nd+) / Shape B in that order.
-  const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache);
-  return [coverRecord(cluster), thumbnailRecord(cluster), ...inline];
+  // Blog cover resolution, in priority order:
+  //   1. Leading markdown image at the top of blog_text.md
+  //      (`![alt](url "image_id:<uuid>")`) — the Seiz-style template. Its
+  //      title carries the real cover id; every <Image> component below it
+  //      is then a body infographic.
+  //   2. Otherwise coverRecord() — 1st <Image> UUID (SpecGas / Sentinel
+  //      style) with cover_image_id / synthetic fallbacks, and the inline
+  //      pass consumes that 1st <Image> as the cover (slice from index 1).
+  // thumbnail is always synthesised from page_info.thumbnail. inline
+  // images come from S3 markdown / DB Shape A / MDX / Shape B in order.
+  const md = blogTextMd(cluster.page_info ?? {});
+  const lead = md ? leadingMarkdownCover(md) : null;
+  const inline = await inlineRecordsForCluster(cluster, stagingSubdomain, cache, !!lead);
+  const cover: ImageRecord = lead
+    ? {
+        cluster,
+        asset: "cover",
+        imageId: lead.imageId,
+        description: descriptionFor(cluster),
+        aspectRatio: DEFAULT_ASPECT.cover,
+        source: "page_info.blog_text.md![0]",
+        previewUrl: lead.url,
+      }
+    : coverRecord(cluster);
+  return [cover, thumbnailRecord(cluster), ...inline];
 }
 
 export async function collectImageRecords(
