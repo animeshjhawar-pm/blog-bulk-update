@@ -430,16 +430,33 @@ function isWeakDescription(alt: string | undefined): boolean {
 
 const MD_HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*$/gm;
 
+/** Decode the handful of HTML entities that show up in blog_text.md
+ *  (`&#x20;`, `&amp;`, `&nbsp;`, …). Anything we don't map explicitly
+ *  collapses to a space so no raw `&…;` leaks into a prompt. */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&nbsp;|&#160;|&#x20;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#0?39;|&#x27;/gi, "'")
+    .replace(/&[a-z0-9#x]+;/gi, " ");           // any other entity → space
+}
+
 /** Strip MDX/HTML tags + common markdown syntax down to readable prose
  *  and collapse whitespace. Cheap and lossy — good enough for a prompt
- *  hint, not for rendering. */
+ *  hint, not for rendering. Whole markdown table rows are dropped rather
+ *  than flattened, so a cost table doesn't turn into a run of cell values
+ *  that dilutes the image prompt. */
 function markdownToPlainText(s: string): string {
-  return s
+  return decodeEntities(s)
+    .replace(/^\s*\|.*$/gm, " ")                // drop entire markdown table rows
     .replace(/<[^>]+>/g, " ")                   // <Image .../> and other tags
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")  // [text](url) / ![alt](url) → text
     .replace(/`+/g, " ")                        // code ticks
     .replace(/[*_>#]+/g, " ")                   // emphasis / blockquote / stray #
-    .replace(/\|/g, " ")                        // table pipes
+    .replace(/\|/g, " ")                        // stray table pipes
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -470,9 +487,27 @@ function deriveDescriptionFromSection(md: string, offset: number): string {
     }
   }
   const headingText = markdownToPlainText(heading);
-  const body = markdownToPlainText(md.slice(sectionStart, sectionEnd)).slice(0, 500).trim();
+  // Use the WHOLE section prose (no arbitrary 500-char trim, which used
+  // to lop off the back half of a section). A high safety ceiling only
+  // guards against a pathological multi-KB section blowing up the prompt
+  // — normal blog sections never reach it, so nothing real is trimmed.
+  const body = markdownToPlainText(md.slice(sectionStart, sectionEnd)).slice(0, 4000).trim();
   if (headingText && body) return `${headingText}. ${body}`;
   return headingText || body;
+}
+
+/** Start offset of the section (nearest heading at/above `offset`), or
+ *  -1 when the tag sits before any heading. Used to detect when two
+ *  images share one section (they'd otherwise get identical section
+ *  descriptions). */
+function sectionStartOffset(md: string, offset: number): number {
+  let start = -1;
+  for (const m of md.matchAll(MD_HEADING_RE)) {
+    const idx = m.index ?? 0;
+    if (idx <= offset) start = idx;
+    else break;
+  }
+  return start;
 }
 
 // Leading markdown image at the very top of blog_text.md, e.g.
@@ -512,10 +547,18 @@ function leadingMarkdownCover(md: string): { imageId: string; url: string } | nu
  * is emitted as a body infographic. page_info.thumbnail is handled by
  * thumbnailRecord.
  *
- * Description source: the tag's `alt` text. When that alt is empty or a
- * generic placeholder (isWeakDescription), we substitute the surrounding
- * section text so each infographic gets a distinct, blog-grounded
- * description instead of all sharing the project context.
+ * Description source: the blog SECTION the image sits in — its heading
+ * plus that section's prose (the text between the bounding headings).
+ * The image should be relevant to the content around it, so the section
+ * is the source of truth; the tag's `alt` (which merely describes
+ * whatever image happened to be there before, sometimes mismatched to
+ * its section) is NOT used as the primary description.
+ *
+ * Fallbacks when a section yields no prose: the blog topic, then the alt.
+ *
+ * Exception — two images under ONE heading share the same section text
+ * and would otherwise get identical descriptions. In that (rare) case we
+ * append each image's own alt so they stay distinct.
  */
 function mdxToRecords(
   cluster: ClusterRow,
@@ -523,18 +566,27 @@ function mdxToRecords(
   md: string,
   startIndex = 1,
 ): ImageRecord[] {
-  let enriched = 0;
-  const records = tags.slice(startIndex).map((t) => {
-    let description = t.alt;
-    if (isWeakDescription(t.alt)) {
-      const derived = deriveDescriptionFromSection(md, t.offset);
-      // Prefer the section text; if even that is empty fall back to the
-      // blog topic so two images are never handed an identical empty
-      // description (the exact thing that makes them converge). The
-      // generic alt is the last resort.
-      description = derived || (cluster.topic ?? "").trim() || t.alt;
-      if (derived) enriched++;
+  const used = tags.slice(startIndex);
+
+  // Count images per section so co-located images can be disambiguated.
+  const sectionIds = used.map((t) => sectionStartOffset(md, t.offset));
+  const perSection = new Map<number, number>();
+  for (const s of sectionIds) perSection.set(s, (perSection.get(s) ?? 0) + 1);
+
+  let derivedCount = 0;
+  const records = used.map((t, i) => {
+    const section = deriveDescriptionFromSection(md, t.offset);
+    let description = section || (cluster.topic ?? "").trim() || t.alt;
+    if (section) derivedCount++;
+
+    // Two+ images in the same section → shared section text. Append the
+    // per-image alt (when it's a real caption) so they don't converge to
+    // one identical description.
+    if ((perSection.get(sectionIds[i]!) ?? 0) > 1) {
+      const alt = (t.alt ?? "").trim();
+      if (alt && !isWeakDescription(alt)) description = `${description} Image focus: ${alt}`;
     }
+
     return {
       cluster,
       asset: "infographic" as AssetType,
@@ -544,10 +596,10 @@ function mdxToRecords(
       source: "page_info.blog_text.md<Image>[0]" as ImageSource,
     };
   });
-  if (enriched > 0) {
+  if (derivedCount > 0) {
     process.stderr.write(
-      `mdxToRecords: recovered ${enriched} inline description(s) from section context ` +
-        `(alt empty/generic) for cluster=${cluster.id}\n`,
+      `mdxToRecords: description from blog section context for ${derivedCount} inline ` +
+        `image(s) for cluster=${cluster.id}\n`,
     );
   }
   return records;
