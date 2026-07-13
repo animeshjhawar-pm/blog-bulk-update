@@ -305,6 +305,77 @@ export async function sweepRunRetention(
     }
   } catch { /* outDir may not exist yet */ }
 
+  // ── 2c. Repoint backups + previews ────────────────────────────────
+  // Every apply writes:
+  //   <outDir>/repoint-backups/<clusterId>-<stamp>.json
+  //   <outDir>/repoint-preview/<clusterId>-<stamp>.json
+  //
+  // The backup is what `revert.ts` reads to restore a cluster's old
+  // page_info — the LATEST per cluster is the only one revert ever
+  // uses. Older backups sit as dead weight; each apply mints new
+  // ones and none of the old ones ever get read.
+  //
+  // Previews are the write-time diff snapshot — they're informational
+  // only, never read for revert, so their whole population is
+  // reclaimable after a short grace window (48h — enough for an
+  // operator to inspect the diff after a suspicious apply).
+  //
+  // Rules:
+  //   backups:  keep the newest 1 per cluster; delete all older.
+  //   previews: delete anything older than 48h.
+  //
+  // On a busy deploy this pair combined dwarfs every other artefact
+  // (2.3 GB observed on Railway before this sweep landed), so the
+  // reclaim is significant.
+  const repointBackupsDir = path.join(outDir, "repoint-backups");
+  const repointPreviewDir = path.join(outDir, "repoint-preview");
+  const PREVIEW_TTL_MS = 48 * 3600 * 1000;
+  const nowMs = Date.now();
+
+  // 2c-a: backups — one per cluster, latest wins.
+  try {
+    const files = await fs.readdir(repointBackupsDir);
+    // Group <cid>-<stamp>.json files by cluster_id (uuid prefix).
+    const byCluster = new Map<string, Array<{ name: string; mtime: number }>>();
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const m = /^([0-9a-f-]{36})-/.exec(f);
+      if (!m) continue;
+      const cid = m[1]!;
+      const stat = await fs.stat(path.join(repointBackupsDir, f)).catch(() => null);
+      if (!stat) continue;
+      const arr = byCluster.get(cid) ?? [];
+      arr.push({ name: f, mtime: stat.mtimeMs });
+      byCluster.set(cid, arr);
+    }
+    for (const [, arr] of byCluster) {
+      // Sort newest first; keep [0], delete [1..].
+      arr.sort((a, b) => b.mtime - a.mtime);
+      for (let i = 1; i < arr.length; i++) {
+        const full = path.join(repointBackupsDir, arr[i]!.name);
+        const sz = await fs.stat(full).then((s) => s.size).catch(() => 0);
+        await rmIfExists(full);
+        result.orphanRunsDeleted++;
+        result.bytesFreed += sz;
+      }
+    }
+  } catch { /* dir doesn't exist yet */ }
+
+  // 2c-b: previews — TTL only, no per-cluster retention.
+  try {
+    const files = await fs.readdir(repointPreviewDir);
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const full = path.join(repointPreviewDir, f);
+      const stat = await fs.stat(full).catch(() => null);
+      if (!stat) continue;
+      if (nowMs - stat.mtimeMs < PREVIEW_TTL_MS) continue;
+      await rmIfExists(full);
+      result.orphanRunsDeleted++;
+      result.bytesFreed += stat.size;
+    }
+  } catch { /* dir doesn't exist yet */ }
+
   // ── 3. Legacy out/images/<slug>/<file> cleanup ────────────────────
   // Files written by older versions (and any future CLI runs that
   // don't pass --run-id) live here. Build the set of paths currently
