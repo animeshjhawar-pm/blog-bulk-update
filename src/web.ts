@@ -7303,6 +7303,53 @@ function refreshPickedCount() {
   const regen = document.getElementById('regen-all-btn');
   if (regen) regen.disabled = n === 0;
 }
+/**
+ * Client-side concurrency cap for the bulk-action buttons. Each card
+ * triggers its own /api/apply/image (or /api/regen-one) round-trip
+ * that eventually hits an external, rate-sensitive API (Gushwork
+ * media / Replicate). Firing them all in parallel via
+ * Promise.all/allSettled produces a burst equal to the number of
+ * selected cards — 25 cards observed on prod produced a 25-request
+ * spike to Gushwork's processMedia in a single second (RCA). The
+ * server-side pLimit(4) inside uploadRows only limits WITHIN one
+ * apply — it cannot see the other 24 in-flight applies, since each
+ * arrives as an independent request.
+ *
+ * Cap concurrent bulk workers at 4 to match the intended per-batch
+ * ceiling. Workers pull from a shared index; N=cards.length calls
+ * still happen, just at most 4 at once.
+ */
+const BULK_APPLY_CONCURRENCY = 4;
+
+// Simple in-page pool. Runs workerFn(items[i], i) for every i, with
+// at most N in flight. onProgress(done, total) is called after each
+// item settles (rejections included). Never throws — returns
+// { failed } so callers can report to the operator.
+async function runWithConcurrency(items, workerFn, concurrency, onProgress) {
+  const total = items.length;
+  if (total === 0) return { failed: 0 };
+  const cap = Math.min(concurrency, total);
+  let idx = 0;
+  let completed = 0;
+  let failed = 0;
+  onProgress && onProgress(0, total);
+  const worker = async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= total) return;
+      try {
+        await workerFn(items[i], i);
+      } catch (_e) {
+        failed++;
+      }
+      completed++;
+      onProgress && onProgress(completed, total);
+    }
+  };
+  await Promise.all(Array.from({ length: cap }, worker));
+  return { failed };
+}
+
 async function applyAllPicked() {
   if (applyBusyGuard()) return;
   const pickedCards = [];
@@ -7314,12 +7361,14 @@ async function applyAllPicked() {
   const counts = countApplicable(pickedCards);
   if (!(await confirmBulkApply(counts.total + ' selected', counts))) return;
   setApplyBusy(true);
+  const btn = document.getElementById('apply-all-btn');
+  const origLabel = btn ? btn.textContent : '';
   try {
-    // Iterate CARDS (not just image_ids) so each card's
-    // cluster_id rides along. Shared image_ids across clusters used
-    // to dedupe down to one id here, which caused one card click to
-    // cascade into N apply attempts on the server. Now each card
-    // becomes its own narrowly-scoped apply.
+    // Iterate CARDS (not just image_ids) so each card's cluster_id
+    // rides along. Shared image_ids across clusters used to dedupe
+    // down to one id here, which caused one card click to cascade
+    // into N apply attempts on the server. Now each card becomes its
+    // own narrowly-scoped apply.
     const cards = pickedCards
       .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
       .filter((c) => !(c.dataset.upload === '1' && c.dataset.needsFile === '1'))
@@ -7327,12 +7376,22 @@ async function applyAllPicked() {
         const s = stateOf.get(c.dataset.imageId) ?? 'pending';
         return s !== 'applied' && s !== 'applying';
       });
-    const settled = await Promise.allSettled(
-      cards.map((c) => applyOne(c.dataset.imageId, { bulk: true, card: c })),
+    // Bounded pool — see BULK_APPLY_CONCURRENCY. Before this, the map
+    // fed straight into Promise.allSettled and every card fired
+    // in parallel; prod RCA showed 25 selected → 25 concurrent hits
+    // to Gushwork's processMedia. With BULK_APPLY_CONCURRENCY=4 the
+    // ceiling on outbound bursts is 4 regardless of selection size.
+    const { failed } = await runWithConcurrency(
+      cards,
+      (c) => applyOne(c.dataset.imageId, { bulk: true, card: c }),
+      BULK_APPLY_CONCURRENCY,
+      (done, total) => {
+        if (btn) btn.textContent = 'Applying ' + done + '/' + total + '…';
+      },
     );
-    const failed = settled.filter((s) => s.status === 'rejected').length;
     if (failed > 0) alert(failed + ' of ' + cards.length + ' picked applies failed. Check the failed cards for details.');
   } finally {
+    if (btn) btn.textContent = origLabel || 'Upload + Repoint selected →';
     setApplyBusy(false);
   }
 }
@@ -7513,9 +7572,20 @@ async function regenAllPicked() {
   // Disable the button so a stray click doesn't double-fire while a
   // batch is in flight.
   const btn = document.getElementById('regen-all-btn');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating ' + picked.length + '…'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating 0/' + picked.length + '…'; }
   try {
-    await Promise.all(picked.map((id) => regenOne(id)));
+    // Bounded pool — same reasoning as applyAllPicked. Each regenOne
+    // spawns a fresh CLI subprocess that calls Replicate; firing 25
+    // simultaneously spikes both Replicate quota and Railway CPU.
+    // BULK_APPLY_CONCURRENCY=4 keeps outbound bursts bounded.
+    await runWithConcurrency(
+      picked,
+      (id) => regenOne(id),
+      BULK_APPLY_CONCURRENCY,
+      (done, total) => {
+        if (btn) btn.innerHTML = '<span class="spinner"></span> Regenerating ' + done + '/' + total + '…';
+      },
+    );
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate selected'; }
   }
