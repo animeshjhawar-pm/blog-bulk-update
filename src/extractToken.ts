@@ -1,6 +1,6 @@
 import { scrapeClientSite } from "./firecrawl.js";
 import { callPortkey, detectPortkeyEnv } from "./portkey.js";
-import { loadToken, loadOperatorToken, saveToken, type GraphicToken } from "./tokens.js";
+import { loadOperatorToken, saveToken, type GraphicToken } from "./tokens.js";
 import { lookupProjectGraphicToken } from "./db.js";
 import { interpolate } from "./interpolate.js";
 import {
@@ -83,8 +83,8 @@ export interface ResolveTokenParams {
 }
 
 /**
- * Resolution order (runtime override beats everything; DB beats bundled
- * defaults; live extract is the last resort):
+ * Resolution order (runtime override beats stored token; NO live
+ * extract fallback):
  *
  *   1. OPERATOR layer — `<OPERATOR_DIR>/<slug>.json`. The workspace
  *      dashboard's "Save token" writes here. If the operator edited
@@ -92,20 +92,21 @@ export interface ResolveTokenParams {
  *      otherwise their dashboard change does nothing.
  *
  *   2. `projects.graphic_token` JSONB in the DB. The schema's source
- *      of truth, populated by the upstream content pipeline.
+ *      of truth, populated by the upstream content pipeline. 615/617
+ *      stormbreaker projects have this backfilled — the DB is the
+ *      only path we actually need for regen.
  *
- *   3. BUNDLED layer — `graphic-tokens/<slug>.json` committed to the
- *      repo. The 5 pinned clients (sentinel/specgas/...) ship with
- *      these as a fallback for when DB hasn't been backfilled.
- *      (`loadToken` reads operator-then-bundled; since (1) already
- *      checked operator, this call effectively reaches bundled only.)
+ * If both miss, we FAIL LOUDLY rather than silently scrape+Portkey.
+ * Operator remedy is either backfill projects.graphic_token or hit
+ * the "⚡ Extract now" button in the workspace UI, which explicitly
+ * runs a live extract (runExtractTokenCli) and saves the result.
  *
- *   4. Live Firecrawl + Portkey extraction. Last resort.
- *
- * Mode B (`--use-saved-token`, CLI flag) still requires SOMETHING
- * concrete to exist — operator/DB/bundled — and errors before
- * falling back to a live extract, preserving the "don't silently
- * scrape when I asked for the saved one" semantics.
+ * The bundled `graphic-tokens/<slug>.json` and live Firecrawl+Portkey
+ * fallbacks used to sit under this function. Both were removed
+ * because (a) the 5 pinned bundled clients all have DB tokens now,
+ * and (b) the live path was silently costing Firecrawl+Portkey $ on
+ * every regen for the 2 projects missing a token, when the correct
+ * fix is to backfill the DB row once.
  */
 export async function resolveGraphicToken(
   params: ResolveTokenParams,
@@ -140,33 +141,13 @@ export async function resolveGraphicToken(
     );
   }
 
-  // 3. Bundled (and, on local dev where there's no operator layer,
-  // also any locally-saved token). loadToken does operator-then-bundled
-  // — operator was already checked above, so in production this only
-  // reaches bundled.
-  const fromBundled = await loadToken(params.slug);
-  if (fromBundled) {
-    process.stderr.write(`regen: graphic_token=saved (graphic-tokens/${params.slug}.json)\n`);
-    return { token: fromBundled, source: "saved" };
-  }
-
-  // Mode B fail-fast.
-  if (params.useSavedToken) {
-    throw new Error(
-      `--use-saved-token set, but no graphic_token found in operator dir, projects.graphic_token, or graphic-tokens/${params.slug}.json. ` +
-        `Backfill projects.graphic_token, save an override via the workspace UI, or run: npm run extract-token -- --client ${params.slug}`,
-    );
-  }
-
-  // 4. Final fallback — live extract.
-  process.stderr.write(
-    `regen: graphic_token not in operator/DB/bundled — falling back to live Firecrawl + Portkey extract\n`,
+  // Neither operator override nor DB row — fail loudly. Silently
+  // falling back to a live Firecrawl+Portkey extract used to happen
+  // here; it was the wrong default (paid, slow, race-prone) when the
+  // fix is a one-row DB backfill or a one-click "Extract now" in UI.
+  throw new Error(
+    `No graphic_token found for project ${params.projectId} (${params.slug}). ` +
+      `Backfill projects.graphic_token in stormbreaker, or open the workspace UI ` +
+      `and click "⚡ Extract now" for this project to run a live extract and save it.`,
   );
-  const token = await liveExtract({
-    slug: params.slug,
-    url: params.url,
-    projectId: params.projectId,
-  });
-  process.stderr.write(`regen: graphic_token=live (in-memory, not written to disk)\n`);
-  return { token, source: "live" };
 }
