@@ -1,5 +1,5 @@
 import { scrapeClientSite } from "./firecrawl.js";
-import { callPortkey } from "./portkey.js";
+import { callPortkey, detectPortkeyEnv } from "./portkey.js";
 import { loadToken, loadOperatorToken, saveToken, type GraphicToken } from "./tokens.js";
 import { lookupProjectGraphicToken } from "./db.js";
 import { interpolate } from "./interpolate.js";
@@ -40,9 +40,9 @@ async function liveExtract(params: {
     userPrompt,
     maxTokens: 16000,
     metadata: {
-      step_name: "extract_graphic_token",
-      flow_type: "new",
-      client_id: params.slug,
+      service: "image-update-tool",
+      env: detectPortkeyEnv(),
+      sub_step: "extract_graphic_token",
       project_id: params.projectId,
     },
   });

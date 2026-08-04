@@ -1,4 +1,4 @@
-import { callPortkey } from "./portkey.js";
+import { callPortkey, detectPortkeyEnv } from "./portkey.js";
 import { interpolate } from "./interpolate.js";
 import {
   GENERATE_INFOGRAPHIC_SYSTEM_PROMPT_NEW,
@@ -268,9 +268,9 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
     userPrompt,
     maxTokens: 64000,
     metadata: {
-      step_name: "build_image_prompt",
-      flow_type: "new",
-      client_id: params.projectId,
+      service: "image-update-tool",
+      env: detectPortkeyEnv(),
+      sub_step: `build_image_prompt:${asset}`,
       project_id: params.projectId,
     },
   });

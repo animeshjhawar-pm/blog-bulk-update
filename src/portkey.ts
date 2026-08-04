@@ -87,11 +87,31 @@ async function fetchWithRetry(
   throw lastErr ?? new Error(`${opName}: exhausted retries`);
 }
 
+// Portkey Analytics metadata. Sent as the X-Portkey-Metadata header
+// so cost/latency dashboards can filter by service, env, sub-step,
+// and the stormbreaker project the run is scoped to.
+//
+// project_id MUST be the stormbreaker project UUID (i.e. the same
+// value used to look up clusters) — never a client slug or per-run
+// id, so all history for a project rolls up on the Portkey side.
 export interface PortkeyMetadata {
-  project_id?: string;
-  step_name: string;
-  flow_type: "old" | "new";
-  client_id: string;
+  service: string;
+  env: string;
+  sub_step: string;
+  project_id: string;
+}
+
+/**
+ * Detect the deployment environment for Portkey analytics.
+ * Railway sets RAILWAY_ENVIRONMENT (production/preview/etc.); we
+ * fall back to NODE_ENV, then "local" for developer machines.
+ */
+export function detectPortkeyEnv(): string {
+  return (
+    process.env.RAILWAY_ENVIRONMENT ??
+    process.env.NODE_ENV ??
+    "local"
+  );
 }
 
 /**
@@ -241,8 +261,23 @@ export async function callPortkey(params: {
         body: JSON.stringify({
           model,
           messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user",   content: userPrompt },
+            // System prompt is marked with Anthropic prompt-caching
+            // (ephemeral, 5-minute TTL). Requires
+            // x-portkey-strict-open-ai-compliance: false (set above)
+            // so Portkey forwards cache_control to Anthropic. Cache
+            // hits show as cache_read_input_tokens on the response
+            // and in Portkey Logs.
+            {
+              role: "system",
+              content: [
+                {
+                  type: "text",
+                  text: systemPrompt,
+                  cache_control: { type: "ephemeral", ttl: "5m" },
+                },
+              ],
+            },
+            { role: "user", content: userPrompt },
           ],
           max_tokens: maxTokens,
         }),
@@ -278,7 +313,7 @@ export async function callPortkey(params: {
     // gateway actually returned — crucial when Portkey swaps a Claude
     // adapter and our OpenAI-shaped reader misses.
     console.warn(
-      `[Portkey][${metadata.step_name}] empty-text response`,
+      `[Portkey][${metadata.sub_step}] empty-text response`,
       { model, diag, rawKeys: Object.keys(json) },
     );
     throw new Error(
@@ -371,7 +406,7 @@ export async function callPortkeyStoredPrompt(params: {
   if (!text) {
     const diag = diagnoseEmptyResponse(json);
     console.warn(
-      `[Portkey stored][${metadata.step_name}] empty-text response`,
+      `[Portkey stored][${metadata.sub_step}] empty-text response`,
       { promptId, diag, rawKeys: Object.keys(json) },
     );
     throw new Error(
