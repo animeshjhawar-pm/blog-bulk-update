@@ -54,6 +54,7 @@ import {
   loadRetentionConfig,
   sweepRunRetention,
   expiryForRun,
+  SESSION_SENTINEL_NAME,
   type RetentionConfig,
 } from "./retention.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
@@ -8912,6 +8913,23 @@ function productsDirFor(runId: string): string {
   return path.join(runOutDir(), `products-${runId}`);
 }
 
+// Persistence sentinel — the "session is live" signal for retention.
+// UPGEN_SESSIONS lives in-memory, so a pod restart or a browser-close
+// wipes it and the next retention sweep would prune the operator's
+// still-owned files. This sentinel is disk-backed proof-of-life:
+// touched at session start and on every product drop, honored by
+// sweepRunRetention within SESSION_SENTINEL_TTL_MS. Name is imported
+// from retention.ts so the write and read sides can't drift.
+async function touchSessionSentinel(runId: string): Promise<void> {
+  try {
+    const dir = productsDirFor(runId);
+    await fs.mkdir(dir, { recursive: true });
+    // writeFile with an empty body updates mtime atomically whether
+    // the file exists or not — simpler than fs.utimes + fs.open.
+    await fs.writeFile(path.join(dir, SESSION_SENTINEL_NAME), "");
+  } catch { /* best-effort — sweep will still respect UPGEN_SESSIONS */ }
+}
+
 function safeProductFilename(imageId: string, ext: string): string {
   return `${imageId.replace(/[^a-zA-Z0-9._-]+/g, "_")}.${ext}`;
 }
@@ -9216,6 +9234,9 @@ async function uploadGenerateStartHandler(req: IncomingMessage, res: ServerRespo
     startedAt: new Date().toISOString(),
     products: new Map(),
   });
+  // Disk-backed proof-of-life so retention keeps this dir even if the
+  // pod restarts or the operator closes the tab before Generate.
+  await touchSessionSentinel(runId);
 
   // Stamp operator email so the recent-runs "Run by" column resolves
   // even if the operator never reaches the CLI-spawn step (e.g.
@@ -9299,6 +9320,7 @@ async function uploadGenerateProductPost(
   const finalPath = path.join(dir, safeProductFilename(imageId, v.ext));
   await fs.writeFile(finalPath, v.bytes);
   session.products.set(imageId, finalPath);
+  await touchSessionSentinel(runId);
 
   sendJson(res, 200, {
     ok: true,
@@ -9429,6 +9451,7 @@ async function uploadGenerateProductUrlPost(
   // Store the LOCAL PATH (not the URL) so the rest of the pipeline
   // treats this slot identically to a drag-dropped file.
   session.products.set(imageId, outPath);
+  await touchSessionSentinel(runId);
   sendJson(res, 200, { ok: true, image_id: imageId, bytes: bytes.byteLength, ext });
 }
 

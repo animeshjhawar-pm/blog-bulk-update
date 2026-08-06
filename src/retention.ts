@@ -28,6 +28,16 @@ import { runOutDir } from "./runOutDir.js";
  * the file just stops being visible in subsequent `readdir`.
  */
 
+// Disk-backed proof-of-life sentinel for live upload-generate
+// sessions. Written by web.ts::touchSessionSentinel at session start
+// and on every product drop. Kept in sync with the same-named const
+// in web.ts. The 24h TTL is a coarse "operator hasn't come back"
+// timeout — enough for someone to drop files, close their laptop, and
+// resume next morning, but not so long that abandoned sessions
+// accumulate forever.
+export const SESSION_SENTINEL_NAME = ".in-progress";
+export const SESSION_SENTINEL_TTL_MS = 24 * 60 * 60 * 1000;
+
 export interface RetentionConfig {
   /** RECORD cap — manifest + csv + html. A run "exists" as long as its
    *  record does (it stays in the runs list, the CSV is inspectable,
@@ -309,6 +319,19 @@ export async function sweepRunRetention(
       const runId = match[1]!;
       if (remainingRunIds.has(runId)) continue;
       const p = path.join(outDir, d.name);
+      // Disk-backed proof-of-life sentinel: web.ts writes
+      // `products-<runId>/.in-progress` at upload-generate session
+      // start and on every product drop. If the sentinel exists and is
+      // fresh (≤ SESSION_SENTINEL_TTL_MS), the operator hasn't
+      // abandoned this session — keep the dir even though there's no
+      // manifest yet. Handles the case where UPGEN_SESSIONS was wiped
+      // by a pod restart / browser close mid-session.
+      if (dirMatchProducts) {
+        try {
+          const sentinelStat = await fs.stat(path.join(p, SESSION_SENTINEL_NAME));
+          if (Date.now() - sentinelStat.mtimeMs < SESSION_SENTINEL_TTL_MS) continue;
+        } catch { /* no sentinel — proceed to evict */ }
+      }
       const sz = d.isDirectory() ? await dirSize(p) : await fs.stat(p).then((s) => s.size).catch(() => 0);
       if (d.isDirectory()) await rmrfIfExists(p);
       else await rmIfExists(p);
