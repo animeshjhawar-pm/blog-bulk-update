@@ -149,6 +149,12 @@ async function dirSize(p: string): Promise<number> {
 export async function sweepRunRetention(
   cfg: RetentionConfig = loadRetentionConfig(),
   outDir: string = runOutDir(),
+  // runIds that are live in-memory (upload-generate sessions the
+  // operator has opened but whose CLI hasn't produced a manifest
+  // yet). Without this, an operator who drops product files but is
+  // slow to click Generate loses their files to the 30-min retention
+  // sweep, and the run fails with ENOENT at generation time.
+  protectedRunIds: ReadonlySet<string> = new Set<string>(),
 ): Promise<SweepResult> {
   const result: SweepResult = {
     scanned: 0,
@@ -255,6 +261,12 @@ export async function sweepRunRetention(
       remainingRunIds.add(e.runId);
     }
   }
+  // Also treat live upload-generate sessions as owned — their
+  // products-<runId>/ dir was created before the CLI ran, so it has
+  // no manifest yet and would otherwise be swept as orphan (the ENOENT
+  // failure mode where the operator drops files, waits >30 min, then
+  // hits Generate).
+  for (const runId of protectedRunIds) remainingRunIds.add(runId);
   const runsRoot = path.join(outDir, "runs");
   try {
     const runDirs = await fs.readdir(runsRoot, { withFileTypes: true });

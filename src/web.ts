@@ -9119,7 +9119,7 @@ async function adminSweepHandler(req: IncomingMessage, res: ServerResponse) {
     imageRetentionHours: numOr(body?.image_retention_hours, base.imageRetentionHours),
   };
   try {
-    const r = await sweepRunRetention(cfg);
+    const r = await sweepRunRetention(cfg, undefined, new Set(UPGEN_SESSIONS.keys()));
     sendJson(res, 200, {
       ok: true,
       cfg_used: cfg,
@@ -10165,7 +10165,7 @@ export function startWebServer(port: number): void {
       + `images kept ${cfg.imageMaxRunsKept} runs / ${cfg.imageRetentionHours}h\n`,
     );
     const runSweep = () => {
-      sweepRunRetention(cfg)
+      sweepRunRetention(cfg, undefined, new Set(UPGEN_SESSIONS.keys()))
         .then((r) => {
           if (r.evicted > 0 || r.imagesOnlyPruned > 0) {
             process.stdout.write(
