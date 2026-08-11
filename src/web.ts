@@ -61,6 +61,8 @@ import {
   verifyWebhookPathToken,
   writeWebhookResult,
   sweepWebhookCache,
+  buildWebhookUrl,
+  publicBaseUrl,
 } from "./webhookStore.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
 
@@ -10070,6 +10072,33 @@ export function startWebServer(port: number): void {
       // failure. /healthz sidesteps that entirely.
       if (method === "GET" && (p === "/healthz" || p === "/_health")) {
         return sendJson(res, 200, { ok: true });
+      }
+
+      // Diagnostic: shows whether webhook mode is wired end-to-end
+      // without needing to trigger a real prediction. Redacts nothing
+      // sensitive — the URL Replicate calls is what we'd have sent
+      // anyway, and the path token is a hash of the secret, not the
+      // secret itself.
+      if (method === "GET" && p === "/healthz/webhook") {
+        const url = buildWebhookUrl();
+        const base = publicBaseUrl();
+        const secretConfigured = Boolean((process.env.WEBHOOK_SECRET ?? "").trim());
+        return sendJson(res, 200, {
+          webhook_enabled: url !== null,
+          secret_configured: secretConfigured,
+          public_base_url: base,
+          public_base_source: process.env.PUBLIC_BASE_URL
+            ? "PUBLIC_BASE_URL"
+            : process.env.RAILWAY_PUBLIC_DOMAIN
+              ? "RAILWAY_PUBLIC_DOMAIN"
+              : null,
+          webhook_url: url,
+          hint: url
+            ? "webhook mode active — Replicate will POST prediction results to webhook_url; subprocesses read from disk cache"
+            : secretConfigured
+              ? "WEBHOOK_SECRET set but no public URL — set PUBLIC_BASE_URL or run on Railway (auto-sets RAILWAY_PUBLIC_DOMAIN)"
+              : "WEBHOOK_SECRET not set — feature off, falling back to Replicate polling",
+        });
       }
 
       // Replicate → us callback when a prediction that we created with
