@@ -120,8 +120,19 @@ const MAX_RETRIES   = 3;
 // 30s, doubled per attempt, ±20% jitter) with a bigger retry budget.
 // Jitter prevents two concurrent operators from retrying on the same
 // tick and thundering-herding Replicate at the moment it opens up.
-const RATE_LIMIT_MAX_RETRIES = 5;
+// Budget bumped 5 → 8 after ops observed images still failing with
+// E003 despite the initial fix — Replicate's nano-banana-pro throttle
+// windows exceeded the previous ~7.5 min ceiling. 8 attempts of
+// jittered doubling gives ~30 min worst-case (30/60/120/240/480/960/
+// 1920 s), which covers the longest sustained throttle we've seen.
+const RATE_LIMIT_MAX_RETRIES = 8;
 const RATE_LIMIT_BASE_DELAY_MS = 30_000;
+// Individual sleep cap. Without this, attempt 7 → 8 grows to 32 min
+// then 64 min per sleep, longer than most operators are willing to
+// wait staring at a "Regenerating…" spinner. Cap at 10 min per sleep
+// so the schedule flattens into a long polling cadence instead of
+// exponential blowout, while the retry budget still adds up.
+const RATE_LIMIT_MAX_SLEEP_MS = 10 * 60_000;
 
 function isReplicateRateLimit(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? "");
@@ -129,7 +140,8 @@ function isReplicateRateLimit(err: unknown): boolean {
 }
 
 function rateLimitBackoffMs(attempt: number): number {
-  const base = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  const raw = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  const base = Math.min(raw, RATE_LIMIT_MAX_SLEEP_MS);
   const jitter = 1 + (Math.random() * 0.4 - 0.2); // ±20%
   return Math.round(base * jitter);
 }
