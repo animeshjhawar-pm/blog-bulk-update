@@ -109,6 +109,31 @@ const INITIAL_WAIT_SECONDS = 60;
 // @backoff.on_exception(backoff.expo, Exception, max_tries=3)
 const MAX_RETRIES   = 3;
 
+// E003 = Replicate's "model unavailable due to high demand" error —
+// a MODEL-SIDE global throttle, not our per-account rate limit. Our
+// concurrency knob (`--concurrency N`) can't influence it: even one
+// prediction is refused when it fires. Typical recovery is minutes,
+// not seconds, so the default 1s/2s/4s backoff exhausts before the
+// throttle clears and the operator sees "failed".
+//
+// When we detect the E003 shape, we switch to a longer schedule (base
+// 30s, doubled per attempt, ±20% jitter) with a bigger retry budget.
+// Jitter prevents two concurrent operators from retrying on the same
+// tick and thundering-herding Replicate at the moment it opens up.
+const RATE_LIMIT_MAX_RETRIES = 5;
+const RATE_LIMIT_BASE_DELAY_MS = 30_000;
+
+function isReplicateRateLimit(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /ModelRateLimitError|\(E003\)|currently unavailable due to high demand/i.test(msg);
+}
+
+function rateLimitBackoffMs(attempt: number): number {
+  const base = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  const jitter = 1 + (Math.random() * 0.4 - 0.2); // ±20%
+  return Math.round(base * jitter);
+}
+
 async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -342,6 +367,11 @@ async function runSinglePrediction(
   // POST response with status=succeeded and we skip polling entirely.
   let predictionId: string | null = null;
   let immediateResult: ReplicateResult | null = null;
+  // Rate-limit retries are counted separately so a single E003 spell
+  // doesn't burn the generic retry budget on 7 seconds of tight loops.
+  // A single attempt that trips E003 rewinds the counter and switches
+  // to the long-schedule backoff.
+  let rateLimitAttempts = 0;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const resp = await fetch(endpoint, {
@@ -405,6 +435,20 @@ async function runSinglePrediction(
       }
       break;
     } catch (err) {
+      if (isReplicateRateLimit(err)) {
+        rateLimitAttempts++;
+        if (rateLimitAttempts >= RATE_LIMIT_MAX_RETRIES) throw err;
+        const delay = rateLimitBackoffMs(rateLimitAttempts);
+        process.stderr.write(
+          `replicate: E003 rate-limit (attempt ${rateLimitAttempts}/${RATE_LIMIT_MAX_RETRIES}) — sleeping ${Math.round(delay / 1000)}s before retry\n`,
+        );
+        await sleep(delay);
+        // Rewind so this attempt doesn't also count against MAX_RETRIES —
+        // the generic budget is for actual transient failures, not for
+        // waiting out a global model throttle.
+        attempt--;
+        continue;
+      }
       if (attempt === MAX_RETRIES) throw err;
       await sleep(Math.pow(2, attempt - 1) * 1000); // exponential backoff: 1s, 2s, 4s
     }
