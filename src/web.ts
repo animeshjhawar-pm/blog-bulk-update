@@ -3806,6 +3806,25 @@ async function upgenClear(imageId) {
   updateUpgenProgress();
 }
 
+// Reset ONE slot back to "needs a product" and flag it visually,
+// because its file is gone from the volume. Distinct from upgenClear:
+// no DELETE round-trip (there's nothing left to delete) and the zone
+// carries an explanatory error state so the operator can see at a
+// glance which slots to re-drop.
+function upgenMarkSlotLost(imageId) {
+  if (UPGEN_STATE) UPGEN_STATE.dropped.delete(imageId);
+  const dz = document.querySelector('.upgen-dropzone[data-image-id="' + imageId + '"]');
+  if (!dz) return;
+  dz.classList.remove('uploading');
+  dz.classList.add('error');
+  dz.innerHTML =
+    '<div class="dz-icon">⚠️</div>' +
+    '<div class="dz-text">File no longer on the server</div>' +
+    '<div class="dz-sub">Drop the product image again</div>';
+  const statusEl = document.querySelector('.upgen-product-status[data-image-id="' + imageId + '"]');
+  if (statusEl) { statusEl.style.color = 'var(--err)'; statusEl.textContent = 'needs re-upload'; }
+}
+
 // Drop modal's submit button no longer kicks off generation directly.
 // Instead it transitions to the prompt-review modal — mirrors the
 // Generate flow's "click Generate → review prompts → confirm" pattern.
@@ -4141,6 +4160,19 @@ async function upgenPromptsSubmit() {
       body: JSON.stringify(body),
     });
     const j = await r.json();
+    // Server refused because some product files are no longer on the
+    // volume (retention sweep reclaimed them, or the container was
+    // redeployed mid-session). Reset exactly those slots and drop the
+    // operator back on the upload step so it's obvious what to re-drop
+    // — an alert alone left them staring at a modal full of green
+    // thumbnails with no idea which slot was at fault.
+    if (!r.ok && Array.isArray(j.missing_image_ids) && j.missing_image_ids.length > 0) {
+      for (const id of j.missing_image_ids) upgenMarkSlotLost(id);
+      upgenPromptsBack();
+      updateUpgenProgress();
+      alert(j.error || 'Some product files are no longer available — re-drop the marked slots.');
+      return;
+    }
     if (!r.ok || !j.run_id) throw new Error(j.error || ('HTTP ' + r.status));
     window.location.href = j.url || ('/runs/' + UPGEN_STATE.runId);
   } catch (err) {
@@ -9762,6 +9794,49 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
       missing_image_ids: missing,
     });
   }
+
+  // Pre-flight: the check above only proves the in-memory session map
+  // has an entry — not that the bytes are still on the volume. The CLI
+  // reads each product path minutes later and fails the row outright
+  // with "cannot load product (…): ENOENT" if it can't, so a single
+  // missing file silently converts into a permanently-failed card that
+  // Regenerate cannot fix either (it re-reads the same missing path).
+  // Verify on disk BEFORE spawning, and refuse the run with the exact
+  // slots to re-drop rather than producing a run full of dead rows.
+  const unreadable: string[] = [];
+  for (const [imageId, entry] of session.products.entries()) {
+    // Legacy sessions may still hold a pasted http(s) URL rather than a
+    // downloaded local path; the CLI fetches those itself, so there is
+    // nothing on disk for us to stat.
+    if (/^https?:\/\//i.test(entry)) continue;
+    try {
+      const st = await fs.stat(entry);
+      // Zero-length means a torn/partial write — the CLI would hand
+      // sharp an empty buffer and fail with a far less obvious error.
+      if (!st.isFile() || st.size === 0) unreadable.push(imageId);
+    } catch {
+      unreadable.push(imageId);
+    }
+  }
+  if (unreadable.length > 0) {
+    process.stderr.write(
+      `upload-generate/run: refusing to spawn ${runId} — ${unreadable.length}/${expected.length} ` +
+        `product file(s) are no longer on disk under ${productsDirFor(runId)}\n`,
+    );
+    return sendJson(res, 422, {
+      error:
+        `${unreadable.length} of ${expected.length} product file(s) are no longer on disk, so generation would fail for those slots. ` +
+        `This happens when a session sits open long enough for the retention sweep to reclaim its files, or when the container was redeployed mid-session. ` +
+        `Re-drop the product image for the highlighted slots and click Generate again — nothing has been generated or charged for.`,
+      missing_image_ids: unreadable,
+    });
+  }
+
+  // Refresh the sentinel so the retention TTL is measured from the
+  // moment generation starts, not from the operator's last drop. A long
+  // run (50+ images at ~1–2 min each) otherwise burns its protection
+  // window while the CLI is still working.
+  await touchSessionSentinel(runId);
 
   type Body = {
     extra_instructions?: string;
