@@ -35,6 +35,24 @@ const Schema = z.object({
    * src/runOutDir.ts so the rest of the codebase has one source of truth.
    */
   RUN_OUT_DIR: z.preprocess(emptyToUndef, z.string().min(1).optional()),
+  /**
+   * Public URL of this server (no trailing slash) — used to build the
+   * webhook URL Replicate calls back with prediction results. Falls
+   * back to RAILWAY_PUBLIC_DOMAIN (auto-set on Railway) when unset.
+   * When neither is available, the webhook path is skipped and
+   * generation falls back to Replicate-side polling.
+   */
+  PUBLIC_BASE_URL: z.preprocess(emptyToUndef, z.string().min(1).optional()),
+  /**
+   * HMAC secret for signing Replicate webhook URLs. When unset, the
+   * webhook feature is disabled entirely and every prediction polls
+   * Replicate directly (pre-webhook behaviour). Any string ≥ 32 chars
+   * is fine — this is a shared secret between the parent web process
+   * (which signs at POST time) and itself (which verifies at webhook-
+   * receive time). Rotating it invalidates in-flight prediction URLs;
+   * only rotate when nothing is running.
+   */
+  WEBHOOK_SECRET: z.preprocess(emptyToUndef, z.string().min(16).optional()),
 });
 
 export type Env = z.infer<typeof Schema>;

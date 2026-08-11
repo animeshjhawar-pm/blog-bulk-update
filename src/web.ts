@@ -57,6 +57,11 @@ import {
   SESSION_SENTINEL_NAME,
   type RetentionConfig,
 } from "./retention.js";
+import {
+  verifyWebhookPathToken,
+  writeWebhookResult,
+  sweepWebhookCache,
+} from "./webhookStore.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
@@ -4236,6 +4241,77 @@ refreshTotals();
 // pointing real operators at it for production data outside trusted
 // engineering review.
 // ────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /webhook/replicate/<pathToken>
+ *   Body: Replicate's prediction payload (id, status, output, error, …)
+ *
+ * Called by Replicate when a prediction created with a `webhook` field
+ * reaches a terminal state. We authenticate via the URL-path token
+ * (SHA256(WEBHOOK_SECRET)[:32]), parse the prediction, and drop the
+ * outcome into the disk cache at
+ *   <runOutDir>/webhook-cache/<predictionId>.json
+ * where the waiting CLI subprocess picks it up in its poll loop
+ * ([src/replicate.ts]).
+ *
+ * Any auth/format failure returns 200 anyway — Replicate retries
+ * webhooks aggressively on non-2xx, and there's nothing they can do
+ * about a mismatched secret. We log loudly so misconfigurations
+ * surface.
+ */
+async function replicateWebhookHandler(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathToken: string,
+) {
+  if (!verifyWebhookPathToken(pathToken)) {
+    process.stderr.write(
+      `webhook: rejected /webhook/replicate/<token> — bad path token (WEBHOOK_SECRET set? correct value?)\n`,
+    );
+    // 200 so Replicate doesn't retry into oblivion.
+    return sendJson(res, 200, { ok: false, error: "auth" });
+  }
+  const raw = await readApplyBody(req);
+  const payload = raw as
+    | {
+        id?: unknown;
+        status?: unknown;
+        output?: unknown;
+        error?: unknown;
+      }
+    | null;
+  const predictionId = typeof payload?.id === "string" ? payload.id : "";
+  const status = typeof payload?.status === "string" ? payload.status : "";
+  if (!predictionId || (status !== "succeeded" && status !== "failed" && status !== "canceled")) {
+    process.stderr.write(
+      `webhook: dropped payload (id=${predictionId || "?"} status=${status || "?"} — not terminal)\n`,
+    );
+    return sendJson(res, 200, { ok: true, ignored: true });
+  }
+  const output = payload!.output;
+  const firstOutput =
+    typeof output === "string"
+      ? output
+      : Array.isArray(output) && typeof output[0] === "string"
+        ? (output[0] as string)
+        : undefined;
+  const errorMsg = typeof payload!.error === "string" ? payload!.error : undefined;
+  try {
+    await writeWebhookResult(predictionId, {
+      status: status as "succeeded" | "failed" | "canceled",
+      output: firstOutput,
+      error: errorMsg,
+      receivedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    process.stderr.write(
+      `webhook: failed to persist ${predictionId}: ${(err as Error).message}\n`,
+    );
+    // Still 200 — Replicate retrying won't fix a disk error our side.
+    return sendJson(res, 200, { ok: false, error: "persist" });
+  }
+  return sendJson(res, 200, { ok: true });
+}
 
 async function readApplyBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -9995,6 +10071,15 @@ export function startWebServer(port: number): void {
       if (method === "GET" && (p === "/healthz" || p === "/_health")) {
         return sendJson(res, 200, { ok: true });
       }
+
+      // Replicate → us callback when a prediction that we created with
+      // a `webhook` field reaches terminal state. Auth is the URL-path
+      // token (SHA256(WEBHOOK_SECRET)[:32]); dropped payloads still
+      // return 200 to avoid Replicate's retry storm.
+      const webhookMatch = /^\/webhook\/replicate\/([A-Za-z0-9_-]+)$/.exec(p);
+      if (method === "POST" && webhookMatch && webhookMatch[1]) {
+        return await replicateWebhookHandler(req, res, webhookMatch[1]);
+      }
       if (method === "GET" && p === "/") return homePage(res);
 
       // /import?client=<slug> — page-type chooser shown after the
@@ -10275,6 +10360,21 @@ export function startWebServer(port: number): void {
         })
         .catch((err) => {
           process.stderr.write(`retention: sweep failed: ${(err as Error).message}\n`);
+        });
+      // Piggyback: reap old webhook-cache files here too. Each is
+      // tiny (<1 KB) but a busy day mints thousands, so a periodic
+      // sweep keeps the volume tidy.
+      sweepWebhookCache()
+        .then((r) => {
+          if (r.deleted > 0) {
+            process.stdout.write(
+              `retention: webhook-cache — ${r.deleted} file(s) reaped · `
+              + `freed ${(r.bytesFreed / 1024).toFixed(1)} KB\n`,
+            );
+          }
+        })
+        .catch((err) => {
+          process.stderr.write(`retention: webhook-cache sweep failed: ${(err as Error).message}\n`);
         });
     };
     runSweep();

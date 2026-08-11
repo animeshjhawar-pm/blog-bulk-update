@@ -9,6 +9,7 @@
 // All three use the same /predictions endpoint + poll flow; only the input
 // shape and endpoint path differ.
 // ---------------------------------------------------------------------------
+import { buildWebhookUrl, readWebhookResult } from "./webhookStore.js";
 
 export type ImageModel =
   | "google/nano-banana-pro"
@@ -76,19 +77,32 @@ function isTransientEmptyOutputMessage(msg: string | null | undefined): boolean 
   return /no image content found in response|output was empty/i.test(msg);
 }
 
-// Polling budget. Historically this was 280s — tuned to fit inside
-// Vercel's 300s function cap. Railway has no such constraint and
-// nano-banana-pro can spike past 280s under Replicate load; failing
-// at that boundary means the prediction may still complete on
-// Replicate's side but we throw the error away. Bumping to 540s
-// (matches gpt-image-2's existing leash) catches the long tail.
+// Polling budget. Historically this was 280s (Vercel 300s cap), then
+// 540s (Railway, catching the nano-banana-pro long tail). Now bumped
+// to 30 min because webhook mode means we're not paying for polls
+// while we wait — we file-stat every 2s and read the prediction
+// state Replicate PUSHES to us. On the fallback (webhook disabled or
+// stale) path we're back to actual Replicate polls, but the ceiling
+// governs that path the same way it always did.
 //
 // REPLICATE_MAX_WAIT_MS overrides this per-deployment if you need
 // something tighter or longer than the default.
 const DEFAULT_MAX_WAIT_MS = (() => {
   const env = Number.parseInt(process.env.REPLICATE_MAX_WAIT_MS ?? "", 10);
-  return Number.isFinite(env) && env > 0 ? env : 540_000;
+  return Number.isFinite(env) && env > 0 ? env : 30 * 60_000;
 })();
+// Webhook-mode fallback: if the parent's webhook cache stays empty
+// for this long after the initial `Prefer: wait` window, resume
+// polling Replicate directly. Covers webhook-delivery failures
+// (Replicate outage, our public URL misconfigured, DNS drop) without
+// permanently wedging the run. 5 min matches the user-visible
+// "surely this is stuck" instinct.
+const WEBHOOK_FALLBACK_MS = 5 * 60_000;
+// How often to check the webhook cache file. File stats are cheap;
+// 2s matches the pre-webhook Replicate poll cadence so behaviour on
+// the fallback path is unchanged.
+const WEBHOOK_POLL_INTERVAL_MS = 2_000;
+
 // gpt-image-2 routinely takes 2–5 min for img2img with two reference
 // images (its OpenAI backend is slower than Gemini's, and content
 // moderation adds latency). Give it a longer leash so we don't bail
@@ -384,6 +398,17 @@ async function runSinglePrediction(
   // A single attempt that trips E003 rewinds the counter and switches
   // to the long-schedule backoff.
   let rateLimitAttempts = 0;
+  // Webhook path: when the parent has a public URL AND WEBHOOK_SECRET
+  // set, ask Replicate to POST the terminal state back to us instead
+  // of us polling. Falls back automatically to Replicate polling when
+  // unavailable, so local dev / misconfigured deploys keep working.
+  const webhookUrl = buildWebhookUrl();
+  const webhookEnabled = webhookUrl !== null;
+  const postBody: Record<string, unknown> = { input };
+  if (webhookUrl) {
+    postBody.webhook = webhookUrl;
+    postBody.webhook_events_filter = ["completed"];
+  }
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const resp = await fetch(endpoint, {
@@ -393,7 +418,7 @@ async function runSinglePrediction(
           "Content-Type": "application/json",
           Prefer: `wait=${INITIAL_WAIT_SECONDS}`,
         },
-        body: JSON.stringify({ input }),
+        body: JSON.stringify(postBody),
       });
 
       if (resp.status === 401) {
@@ -474,7 +499,50 @@ async function runSinglePrediction(
   // moderation adds latency).
   const maxWaitMs = maxWaitMsForModel(model);
   const deadline  = Date.now() + maxWaitMs;
+  // Webhook-mode state: we check the parent's cache first (cheap file
+  // stat, no Replicate egress). If the cache stays empty past
+  // WEBHOOK_FALLBACK_MS we assume the webhook won't land and fall back
+  // to Replicate polling for the rest of the deadline.
+  const webhookFallbackAt = webhookEnabled ? Date.now() + WEBHOOK_FALLBACK_MS : 0;
+  let fallenBack = !webhookEnabled;
   while (Date.now() < deadline) {
+    if (!fallenBack) {
+      // Webhook path — check the cache the parent's handler writes.
+      await sleep(WEBHOOK_POLL_INTERVAL_MS);
+      const cached = await readWebhookResult(predictionId);
+      if (cached) {
+        if (cached.status === "succeeded") {
+          const image_url = cached.output ?? "";
+          if (!image_url) {
+            throw new ReplicateGenerationError(
+              "Replicate succeeded but output was empty",
+              predictionId,
+            );
+          }
+          return { image_url, prediction_id: predictionId };
+        }
+        const errMsg = cached.error ?? "no error message";
+        if (isTransientEmptyOutputMessage(errMsg)) {
+          throw new ReplicateGenerationError(
+            `Replicate prediction ${cached.status}: ${errMsg} (output was empty)`,
+            predictionId,
+          );
+        }
+        throw new ReplicateGenerationError(
+          `Replicate prediction ${cached.status}: ${errMsg}`,
+          predictionId,
+        );
+      }
+      if (Date.now() >= webhookFallbackAt) {
+        process.stderr.write(
+          `replicate: webhook cache empty after ${WEBHOOK_FALLBACK_MS / 1000}s (prediction_id=${predictionId}) — falling back to Replicate polling\n`,
+        );
+        fallenBack = true;
+      }
+      continue;
+    }
+
+    // Fallback / webhook-disabled path — poll Replicate directly.
     await sleep(POLL_INTERVAL);
 
     const pollResp = await fetch(
