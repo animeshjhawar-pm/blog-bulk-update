@@ -321,17 +321,28 @@ export async function sweepRunRetention(
       const p = path.join(outDir, d.name);
       // Disk-backed proof-of-life sentinel: web.ts writes
       // `products-<runId>/.in-progress` at upload-generate session
-      // start and on every product drop. If the sentinel exists and is
-      // fresh (≤ SESSION_SENTINEL_TTL_MS), the operator hasn't
-      // abandoned this session — keep the dir even though there's no
-      // manifest yet. Handles the case where UPGEN_SESSIONS was wiped
-      // by a pod restart / browser close mid-session.
-      if (dirMatchProducts) {
-        try {
-          const sentinelStat = await fs.stat(path.join(p, SESSION_SENTINEL_NAME));
-          if (Date.now() - sentinelStat.mtimeMs < SESSION_SENTINEL_TTL_MS) continue;
-        } catch { /* no sentinel — proceed to evict */ }
-      }
+      // start, on every product drop, and again at spawn time. If the
+      // sentinel exists and is fresh (≤ SESSION_SENTINEL_TTL_MS), the
+      // operator hasn't abandoned this session — keep the artefact even
+      // though there's no manifest yet. Handles the case where
+      // UPGEN_SESSIONS was wiped by a pod restart / browser close
+      // mid-session.
+      //
+      // The sentinel vouches for ALL THREE artefacts of the session,
+      // not just the directory it happens to live in. Checking it only
+      // for `products-<runId>/` (the previous behaviour) meant a live
+      // session could still lose its `wireframes-<runId>/` dir and its
+      // `products-<runId>.json` manifest to the sweep — the wireframe
+      // loss silently downgrades cover/thumbnail to the default
+      // reference, and losing the manifest breaks per-image Regenerate
+      // for the rest of that run's life (regenOneHandler reads it to
+      // recover the original product entry).
+      try {
+        const sentinelStat = await fs.stat(
+          path.join(outDir, `products-${runId}`, SESSION_SENTINEL_NAME),
+        );
+        if (Date.now() - sentinelStat.mtimeMs < SESSION_SENTINEL_TTL_MS) continue;
+      } catch { /* no sentinel — proceed to evict */ }
       const sz = d.isDirectory() ? await dirSize(p) : await fs.stat(p).then((s) => s.size).catch(() => 0);
       if (d.isDirectory()) await rmrfIfExists(p);
       else await rmIfExists(p);
