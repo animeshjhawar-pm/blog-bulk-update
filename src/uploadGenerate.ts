@@ -21,6 +21,7 @@ import { generate, type Provider } from "./generate.js";
 import { openCsv, type CsvRow, type CsvWriter } from "./csv.js";
 import { writeHtmlReport } from "./html.js";
 import { makeLimiter } from "./concurrency.js";
+import { unitCostUsd } from "./pricing.js";
 import {
   collectImageRecords,
   type AssetType,
@@ -169,7 +170,7 @@ async function processOne(args: {
     process.stderr.write(`[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
-      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "" },
+      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0" },
     };
   }
 
@@ -203,7 +204,7 @@ async function processOne(args: {
     process.stderr.write(`[${rowNum}/${totalRows}] id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
-      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "" },
+      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0" },
     };
   }
 
@@ -425,6 +426,8 @@ async function processOne(args: {
         status: "completed",
         error: "",
         prediction_id: gen.predictionId ?? "",
+        provider: gen.provider,
+        cost_usd: unitCostUsd(gen.provider).toString(),
       },
     };
   } catch (err) {
@@ -446,6 +449,8 @@ async function processOne(args: {
         status: "failed",
         error: message,
         prediction_id: failedPredictionId ?? "",
+        provider: "",
+        cost_usd: "0",
       },
     };
   }

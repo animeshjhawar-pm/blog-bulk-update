@@ -27,6 +27,16 @@ export const CSV_HEADER = [
   // original prediction (predictions often finish on Replicate's side
   // after our polling budget expires).
   "prediction_id",
+  // Which upstream produced this image: "replicate" for the primary
+  // Replicate nano-banana-pro path, "fal" when the E003 fallback in
+  // generate.ts kicked in. Empty for failed/mocked rows. Powers the
+  // per-image cost pill + run-level total in the UI, and lets us
+  // audit style drift after the fact.
+  "provider",
+  // Per-image USD cost at time of generation, from src/pricing.ts.
+  // "0" for failed / mocked / dry-run rows so a sum across the run
+  // isn't polluted by retries that Replicate/fal didn't bill for.
+  "cost_usd",
 ] as const;
 
 export type CsvHeader = (typeof CSV_HEADER)[number];

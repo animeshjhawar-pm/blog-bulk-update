@@ -422,6 +422,9 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
       project_id: project.id,
       previous_image_url: r.previewUrl ?? "",
       prediction_id: "",
+      // Upload-only rows never touch a generation provider — no cost.
+      provider: "",
+      cost_usd: "0",
     };
     await csv.write(row);
   }

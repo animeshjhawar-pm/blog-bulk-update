@@ -64,6 +64,7 @@ import {
   buildWebhookUrl,
   publicBaseUrl,
 } from "./webhookStore.js";
+import { unitCostUsd, formatUsd } from "./pricing.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
@@ -1014,6 +1015,25 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .state-pill.state-applied  { background: var(--ok); color: #fff; }
   .result-card .state-pill.state-failed   { background: var(--err-bg); color: var(--err); }
   .result-card .state-pill.state-pending  { display: none; }
+  .result-card .cost-pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 1px 8px; border-radius: 999px;
+    font-size: 10.5px; font-weight: 500; font-variant-numeric: tabular-nums;
+    background: #eef2ff; color: #4338ca;
+    border: 1px solid #c7d2fe;
+  }
+  .result-card .cost-pill.cost-pill-fal {
+    background: #fef3c7; color: #92400e; border-color: #fcd34d;
+  }
+  .run-cost-total {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    background: #f3f4f6; color: #374151;
+    font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
+    border: 1px solid #e5e7eb;
+  }
+  .run-cost-total .rct-label { font-weight: 500; color: #6b7280; }
+  .run-cost-total .rct-fal   { color: #92400e; font-weight: 500; }
   /* Per-image / per-cluster / all-image picks on the Publish (runs) page. */
   .rc-pick { position: absolute; top: 8px; left: 8px; z-index: 3;
     background: rgba(255,255,255,.85); backdrop-filter: blur(4px);
@@ -6403,6 +6423,18 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
     <div class="rc-row">
       <span class="pill ${esc(r.asset_type)}">${esc(r.asset_type)} · ${esc(r.aspect_ratio)}</span>
       ${isFailed ? `<span class="state-pill state-failed">failed</span>` : `<span class="state-pill"></span>`}
+      ${(() => {
+        // Per-image cost pill. Only shown when generation succeeded
+        // (cost_usd > 0) — hides for failed/dry-run/upload-only rows
+        // that never billed. Provider labelled so an operator can
+        // spot fal fallbacks at a glance.
+        const rawCost = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
+        const prov = ((r as unknown as { provider?: string }).provider ?? "").trim();
+        if (!Number.isFinite(rawCost) || rawCost <= 0) return "";
+        const label = prov === "fal" ? "fal" : prov === "replicate" ? "replicate" : prov;
+        const cls = prov === "fal" ? "cost-pill cost-pill-fal" : "cost-pill";
+        return `<span class="${cls}" title="Generation cost via ${esc(label)}">${esc(label)} · ${esc(formatUsd(rawCost))}</span>`;
+      })()}
     </div>
     <div class="rc-id"><code>${esc(r.image_id)}</code></div>
     <div class="rc-desc">${esc((r.description_used || "").slice(0, 220))}</div>
@@ -6458,6 +6490,27 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
     </label>
     <h2 style="margin:0">${stage === "prepare" ? "Step 1 · Drop replacement images" : "Publish — verify and push to S3"}</h2>
     <span class="sub">${rows.length} ${stage === "prepare" ? "slots awaiting files" : "new images"} across ${grouped.size} clusters${stage === "prepare" ? "" : ` · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}`}</span>
+    ${(() => {
+      // Run-level cost total. Sum cost_usd across all rows and break
+      // down by provider so the operator can see fal fallback spend
+      // separately from Replicate primary spend. Zero-cost rows
+      // (failed / dry-run / upload-only) contribute nothing.
+      if (stage === "prepare") return "";
+      let totalUsd = 0, replicateUsd = 0, falUsd = 0, replicateN = 0, falN = 0;
+      for (const r of rows) {
+        const c = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
+        if (!Number.isFinite(c) || c <= 0) continue;
+        totalUsd += c;
+        const prov = ((r as unknown as { provider?: string }).provider ?? "").trim();
+        if (prov === "fal") { falUsd += c; falN++; }
+        else if (prov === "replicate") { replicateUsd += c; replicateN++; }
+      }
+      if (totalUsd <= 0) return "";
+      const parts: string[] = [];
+      if (replicateN > 0) parts.push(`${replicateN} × replicate ${formatUsd(replicateUsd)}`);
+      if (falN > 0) parts.push(`<span class="rct-fal">${falN} × fal ${formatUsd(falUsd)}</span>`);
+      return `<span class="run-cost-total" title="Sum of per-image generation costs — Replicate + fal fallback"><span class="rct-label">cost</span> ${esc(formatUsd(totalUsd))}${parts.length ? ` · <span class="rct-label">${parts.join(" + ")}</span>` : ""}</span>`;
+    })()}
     <span class="sub" id="picked-count" style="margin-left:auto"></span>
   </div>
   <div class="sub" style="margin-top:6px">${stage === "prepare"

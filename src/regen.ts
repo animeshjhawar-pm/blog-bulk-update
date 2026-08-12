@@ -23,6 +23,7 @@ import { downloadImage } from "./rehost.js";
 import { openCsv, type CsvRow, type CsvWriter } from "./csv.js";
 import { writeHtmlReport } from "./html.js";
 import { makeLimiter } from "./concurrency.js";
+import { unitCostUsd } from "./pricing.js";
 import {
   collectImageRecords,
   type AssetType,
@@ -279,6 +280,8 @@ async function processOne(args: {
         status: "completed",
         error: "",
         prediction_id: "",
+        provider: "",
+        cost_usd: "0",
       },
     };
   }
@@ -358,6 +361,8 @@ async function processOne(args: {
           status: "dry-run",
           error: "",
           prediction_id: "",
+          provider: "",
+          cost_usd: "0",
         },
       };
     }
@@ -406,6 +411,8 @@ async function processOne(args: {
         status: "completed",
         error: "",
         prediction_id: gen.predictionId ?? "",
+        provider: gen.provider,
+        cost_usd: unitCostUsd(gen.provider).toString(),
       },
     };
   } catch (err) {
@@ -431,6 +438,8 @@ async function processOne(args: {
         status: "failed",
         error: message,
         prediction_id: failedPredictionId ?? "",
+        provider: "",
+        cost_usd: "0",
       },
     };
   }
