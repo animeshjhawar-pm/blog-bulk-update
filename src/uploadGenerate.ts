@@ -633,6 +633,7 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     projectId: project.id,
     startedAt,
     rows: allRows,
+    runId: options.runId,
   });
 
   await closePool();

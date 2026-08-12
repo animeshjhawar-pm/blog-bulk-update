@@ -631,6 +631,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     projectId: project.id,
     startedAt,
     rows: allRows,
+    runId: options.runId,
   });
 
   await closePool();

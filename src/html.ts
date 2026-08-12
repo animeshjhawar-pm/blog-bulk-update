@@ -27,6 +27,16 @@ export interface HtmlReportParams {
   projectId: string;
   startedAt: string;
   rows: CsvRow[];
+  /**
+   * The runId this HTML report belongs to. When set, previews and
+   * downloads route through /runs/<runId>/preview/<image_id> and
+   * /runs/<runId>/download/<image_id> — our server endpoints — so
+   * the browser NEVER hits the raw provider URL. Critical for the
+   * fal.ai fallback path, whose fal.media URLs return a sandbox CSP
+   * that blocks direct browser display; the same fix is safe for
+   * Replicate URLs (which also expire after ~1h).
+   */
+  runId?: string;
 }
 
 export async function writeHtmlReport(params: HtmlReportParams): Promise<void> {
@@ -38,16 +48,34 @@ export async function writeHtmlReport(params: HtmlReportParams): Promise<void> {
   };
   const csvFile = path.basename(params.csvPath);
 
+  // Route every image URL through our server. Two reasons:
+  //   1. fal.media (fallback path) returns a `sandbox` CSP that
+  //      blocks direct browser display — <img src=fal.media/…> would
+  //      render as a broken image or blank frame depending on browser.
+  //   2. Replicate signed URLs expire ~1h after generation, so opening
+  //      an old report would hit a 403 on every image.
+  // Our /preview/ endpoint streams the local rehost'd file (or
+  // server-side fetches remote when the local copy has been pruned),
+  // so the browser sees regular image bytes with no CSP hostility and
+  // no auth expiry.
+  const previewSrc = (imageId: string): string =>
+    params.runId ? `/runs/${encodeURIComponent(params.runId)}/preview/${encodeURIComponent(imageId)}` : "";
+  const downloadHref = (imageId: string): string =>
+    params.runId ? `/runs/${encodeURIComponent(params.runId)}/download/${encodeURIComponent(imageId)}` : "";
+
   const tableRows = rows
     .map((r) => {
-      const preview = r.image_url_new
-        ? `<img src="${escapeAttr(r.image_url_new)}" alt="${escapeAttr(r.image_id)}" loading="lazy">`
-        : `<div class="empty">${escapeHtml(r.status)}</div>`;
-      const localLink = r.image_local_path
-        ? `<a href="${escapeAttr("file://" + r.image_local_path)}">download local</a>`
+      const hasImage = Boolean(r.image_url_new || r.image_local_path);
+      const preview = hasImage && params.runId
+        ? `<img src="${escapeAttr(previewSrc(r.image_id))}" alt="${escapeAttr(r.image_id)}" loading="lazy">`
+        : hasImage
+          ? `<div class="empty">image (no runId — open the run page in the workspace)</div>`
+          : `<div class="empty">${escapeHtml(r.status)}</div>`;
+      const openLink = hasImage && params.runId
+        ? `<a href="${escapeAttr(previewSrc(r.image_id))}" target="_blank" rel="noopener">open new</a>`
         : "";
-      const newUrlLink = r.image_url_new
-        ? `<a href="${escapeAttr(r.image_url_new)}" target="_blank" rel="noopener">open new</a>`
+      const downloadLink = hasImage && params.runId
+        ? `<a href="${escapeAttr(downloadHref(r.image_id))}" download>download</a>`
         : "";
       const errorCell = r.error
         ? `<div class="err">${escapeHtml(truncate(r.error, 240))}</div>`
@@ -68,9 +96,8 @@ export async function writeHtmlReport(params: HtmlReportParams): Promise<void> {
   <td class="desc">${escapeHtml(truncate(r.description_used, 320))}</td>
   <td class="status"><span class="pill pill-${escapeAttr(r.status)}">${escapeHtml(r.status)}</span>${errorCell}</td>
   <td class="actions">
-    ${r.image_url_new ? `<button class="copy" data-copy="${escapeAttr(r.image_url_new)}">copy url</button>` : ""}
-    ${newUrlLink}
-    ${localLink}
+    ${openLink}
+    ${downloadLink}
   </td>
 </tr>`;
     })
