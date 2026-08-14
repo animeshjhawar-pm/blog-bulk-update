@@ -282,6 +282,7 @@ async function processOne(args: {
         prediction_id: "",
         provider: "",
         cost_usd: "0",
+        model: "",
       },
     };
   }
@@ -363,6 +364,7 @@ async function processOne(args: {
           prediction_id: "",
           provider: "",
           cost_usd: "0",
+          model: "",
         },
       };
     }
@@ -412,7 +414,8 @@ async function processOne(args: {
         error: "",
         prediction_id: gen.predictionId ?? "",
         provider: gen.provider,
-        cost_usd: unitCostUsd(gen.provider).toString(),
+        cost_usd: unitCostUsd(gen.provider, gen.model).toString(),
+        model: gen.model ?? "",
       },
     };
   } catch (err) {
@@ -440,6 +443,7 @@ async function processOne(args: {
         prediction_id: failedPredictionId ?? "",
         provider: "",
         cost_usd: "0",
+        model: "",
       },
     };
   }

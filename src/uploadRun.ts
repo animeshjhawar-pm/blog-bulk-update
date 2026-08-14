@@ -425,6 +425,7 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
       // Upload-only rows never touch a generation provider — no cost.
       provider: "",
       cost_usd: "0",
+      model: "",
     };
     await csv.write(row);
   }

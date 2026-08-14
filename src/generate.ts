@@ -33,6 +33,14 @@ export interface GenerateParams {
 export interface GenerateResult {
   imageUrl: string;
   provider: Provider;
+  /**
+   * Which model produced the image. Distinguishes the two Replicate
+   * paths (nano-banana-pro vs nano-banana-2) for per-image cost
+   * tracking — provider alone can't, since both are "replicate".
+   * Optional to keep older callers working; absent = default per
+   * provider ($0.15 for replicate, $0.039 for fal).
+   */
+  model?: "google/nano-banana-pro" | "google/nano-banana-2" | "fal-nano-banana-pro";
   /** Replicate prediction id. Only set when provider="replicate". */
   predictionId?: string;
 }
@@ -47,9 +55,28 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
       imageInput: params.imageInput,
       aspectRatio: params.aspectRatio,
     });
+    // The direct-fal path uses openai/gpt-image-2 (see fal.ts), NOT
+    // nano-banana. Distinct model so pricing can price it separately
+    // if we ever add it to the table.
     return { imageUrl: r.image_url, provider };
   }
 
+  // Three-layer fallback chain — each layer only fires when the layer
+  // above hits Replicate's global rate-limit (E003) after exhausting
+  // its own in-provider retry budget. Non-rate-limit errors propagate
+  // immediately from the layer they hit.
+  //
+  //   Layer 1 · Replicate  google/nano-banana-pro   (best quality, $0.15)
+  //   Layer 2 · Replicate  google/nano-banana-2     (different rate-limit
+  //                        bucket at Replicate, ~$0.039 — dodges most
+  //                        E003 spells without paying the style-drift
+  //                        cost of a provider switch)
+  //   Layer 3 · fal.ai     nano-banana-pro          (different provider,
+  //                        different capacity pool, ~$0.039)
+  //
+  // On success we surface which layer produced the image via the
+  // returned provider field, so CSV / UI cost tracking attributes
+  // correctly.
   try {
     const r = await generateImage({
       prompt: params.prompt,
@@ -58,36 +85,63 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
       model: "google/nano-banana-pro",
       resumePredictionId: params.resumePredictionId,
     });
-    return { imageUrl: r.image_url, provider, predictionId: r.prediction_id };
+    return {
+      imageUrl: r.image_url,
+      provider,
+      model: "google/nano-banana-pro",
+      predictionId: r.prediction_id,
+    };
   } catch (err) {
-    // Replicate has nano-banana-pro globally rate-limited (E003) and
-    // even our 8-attempt / ~42-min backoff exhausted. Escape to fal.ai's
-    // nano-banana endpoint — different capacity pool, similar-enough
-    // style that the image slots into the run without looking obviously
-    // different next to its siblings. Only fires when FAL_KEY is set;
-    // otherwise the Replicate error rethrows unchanged.
-    if (!isReplicateRateLimitError(err) || !process.env.FAL_KEY) throw err;
+    if (!isReplicateRateLimitError(err)) throw err;
+
+    // Layer 2 — Replicate nano-banana-2. Replicate scopes E003 buckets
+    // per model, so the pro throttle usually doesn't apply to -2. Same
+    // provider means style stays close and CSV attribution is
+    // straightforward (still "replicate", just a different model).
+    // Skips resumePredictionId — that id belongs to the pro model and
+    // wouldn't resolve against -2.
     process.stderr.write(
-      `generate: Replicate E003 exhausted retry budget — falling back to fal.ai nano-banana\n`,
+      `generate: Replicate nano-banana-pro E003 exhausted — retrying on Replicate nano-banana-2\n`,
     );
     try {
-      const fb = await generateImageViaFalNanoBanana({
+      const r2 = await generateImage({
         prompt: params.prompt,
-        imageInput: params.imageInput,
         aspectRatio: params.aspectRatio,
+        imageInput: params.imageInput,
+        model: "google/nano-banana-2",
       });
-      process.stderr.write(`generate: fal.ai fallback succeeded\n`);
-      // provider="fal" so downstream (CSV, HTML report) records which
-      // path produced this image — helps diagnose style drift later.
-      return { imageUrl: fb.image_url, provider: "fal" };
-    } catch (fbErr) {
-      // Fallback also failed — throw the ORIGINAL Replicate error so
-      // the operator sees the real root cause (E003), not the fal
-      // downstream error which would obscure it.
+      process.stderr.write(`generate: Replicate nano-banana-2 succeeded\n`);
+      return {
+        imageUrl: r2.image_url,
+        provider,
+        model: "google/nano-banana-2",
+        predictionId: r2.prediction_id,
+      };
+    } catch (err2) {
+      if (!isReplicateRateLimitError(err2) || !process.env.FAL_KEY) throw err2;
+
+      // Layer 3 — fal.ai nano-banana-pro. Different provider, only fires
+      // when both Replicate models are throttled AND FAL_KEY is set.
       process.stderr.write(
-        `generate: fal.ai fallback ALSO failed (${(fbErr as Error).message}) — rethrowing original Replicate error\n`,
+        `generate: Replicate nano-banana-2 also E003 — falling back to fal.ai nano-banana-pro\n`,
       );
-      throw err;
+      try {
+        const fb = await generateImageViaFalNanoBanana({
+          prompt: params.prompt,
+          imageInput: params.imageInput,
+          aspectRatio: params.aspectRatio,
+        });
+        process.stderr.write(`generate: fal.ai fallback succeeded\n`);
+        return { imageUrl: fb.image_url, provider: "fal", model: "fal-nano-banana-pro" };
+      } catch (fbErr) {
+        // All three layers failed — throw the ORIGINAL pro-tier error
+        // so the operator sees the root cause (E003 on the primary
+        // path), not the fal downstream error which would obscure it.
+        process.stderr.write(
+          `generate: fal.ai fallback ALSO failed (${(fbErr as Error).message}) — rethrowing original nano-banana-pro error\n`,
+        );
+        throw err;
+      }
     }
   }
 }

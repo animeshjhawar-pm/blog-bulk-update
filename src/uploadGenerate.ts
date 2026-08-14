@@ -170,7 +170,7 @@ async function processOne(args: {
     process.stderr.write(`[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
-      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0" },
+      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0", model: "" },
     };
   }
 
@@ -204,7 +204,7 @@ async function processOne(args: {
     process.stderr.write(`[${rowNum}/${totalRows}] id=${record.imageId} status=failed error=${msg}\n`);
     return {
       status: "failed",
-      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0" },
+      row: { ...baseRow, prompt_used: "", image_url_new: "", image_local_path: "", status: "failed", error: msg, prediction_id: "", provider: "", cost_usd: "0", model: "" },
     };
   }
 
@@ -427,7 +427,8 @@ async function processOne(args: {
         error: "",
         prediction_id: gen.predictionId ?? "",
         provider: gen.provider,
-        cost_usd: unitCostUsd(gen.provider).toString(),
+        cost_usd: unitCostUsd(gen.provider, gen.model).toString(),
+        model: gen.model ?? "",
       },
     };
   } catch (err) {
@@ -451,6 +452,7 @@ async function processOne(args: {
         prediction_id: failedPredictionId ?? "",
         provider: "",
         cost_usd: "0",
+        model: "",
       },
     };
   }

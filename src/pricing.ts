@@ -7,28 +7,39 @@
 
 export type PricedProvider = "replicate" | "fal";
 
-/** USD per successful generation. Failed generations cost $0 in our
- *  cost accounting: providers don't bill for failed predictions and
- *  we don't want to distort the per-run total with retry noise. */
-const UNIT_COST_USD: Record<PricedProvider, number> = {
-  // google/nano-banana-pro on Replicate — 2K resolution, per prediction.
-  // Documented in CLAUDE.md and Replicate's model page.
+/** Per-model pricing. Preferred when the model is known — covers the
+ *  two Replicate paths separately (pro is ~4× more expensive than -2),
+ *  and lets fal endpoints price independently if we ever add more. */
+const MODEL_COST_USD: Record<string, number> = {
+  "google/nano-banana-pro": 0.15,
+  "google/nano-banana-2": 0.039,
+  "fal-nano-banana-pro": 0.039,
+};
+
+/** Fallback per-provider pricing for older CSV rows and any caller
+ *  that hasn't propagated the model field yet. Assumes "replicate" =
+ *  the historical primary path (nano-banana-pro), "fal" = fal
+ *  nano-banana-pro fallback. */
+const PROVIDER_COST_USD: Record<PricedProvider, number> = {
   replicate: 0.15,
-  // fal-ai/nano-banana-pro on fal.ai — text-to-image + image-to-image
-  // are the same headline unit price on fal's pricing page at the time
-  // of writing. If they diverge, split into two rows keyed by model.
   fal: 0.039,
 };
 
 /**
- * Cost in USD for one successful generation on the given provider.
- * Returns 0 for anything unknown so a stray provider string never
- * crashes CSV serialisation or the UI sum.
+ * Cost in USD for one successful generation. Prefers the exact model
+ * when available (accurate for the nano-banana-2 fallback layer);
+ * falls back to the per-provider default for older CSV rows that
+ * predate the model column. Returns 0 for anything unknown so a stray
+ * string never crashes CSV serialisation or the UI sum.
  */
-export function unitCostUsd(provider: string | null | undefined): number {
+export function unitCostUsd(
+  provider: string | null | undefined,
+  model?: string | null,
+): number {
+  if (model && MODEL_COST_USD[model] != null) return MODEL_COST_USD[model]!;
   if (!provider) return 0;
   const k = provider as PricedProvider;
-  return UNIT_COST_USD[k] ?? 0;
+  return PROVIDER_COST_USD[k] ?? 0;
 }
 
 /** Formatted USD string for display — 4 decimals so per-image fal

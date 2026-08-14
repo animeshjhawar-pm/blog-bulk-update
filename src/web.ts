@@ -6426,14 +6426,24 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
       ${(() => {
         // Per-image cost pill. Only shown when generation succeeded
         // (cost_usd > 0) — hides for failed/dry-run/upload-only rows
-        // that never billed. Provider labelled so an operator can
-        // spot fal fallbacks at a glance.
+        // that never billed. Model labelled so operators can spot the
+        // nano-banana-2 fallback and fal fallback at a glance.
         const rawCost = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
         const prov = ((r as unknown as { provider?: string }).provider ?? "").trim();
+        const model = ((r as unknown as { model?: string }).model ?? "").trim();
         if (!Number.isFinite(rawCost) || rawCost <= 0) return "";
-        const label = prov === "fal" ? "fal" : prov === "replicate" ? "replicate" : prov;
-        const cls = prov === "fal" ? "cost-pill cost-pill-fal" : "cost-pill";
-        return `<span class="${cls}" title="Generation cost via ${esc(label)}">${esc(label)} · ${esc(formatUsd(rawCost))}</span>`;
+        // Short label: prefer model when known, else provider.
+        const label =
+          model === "google/nano-banana-2" ? "replicate nb-2"
+          : model === "fal-nano-banana-pro" ? "fal"
+          : model === "google/nano-banana-pro" ? "replicate"
+          : prov || "unknown";
+        // Fallback layers get amber styling so they stand out.
+        const cls =
+          model === "google/nano-banana-2" || model === "fal-nano-banana-pro" || prov === "fal"
+            ? "cost-pill cost-pill-fal"
+            : "cost-pill";
+        return `<span class="${cls}" title="Generation cost via ${esc(model || prov)}">${esc(label)} · ${esc(formatUsd(rawCost))}</span>`;
       })()}
     </div>
     <div class="rc-id"><code>${esc(r.image_id)}</code></div>
@@ -6492,24 +6502,40 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
     <span class="sub">${rows.length} ${stage === "prepare" ? "slots awaiting files" : "new images"} across ${grouped.size} clusters${stage === "prepare" ? "" : ` · <strong style="color:var(--ok)">${totalCompleted} ready</strong>${totalFailed ? ` · <strong style="color:var(--err)">${totalFailed} failed</strong>` : ""}`}</span>
     ${(() => {
       // Run-level cost total. Sum cost_usd across all rows and break
-      // down by provider so the operator can see fal fallback spend
-      // separately from Replicate primary spend. Zero-cost rows
-      // (failed / dry-run / upload-only) contribute nothing.
+      // down by model — replicate pro / replicate -2 / fal — so the
+      // operator sees the fallback distribution at a glance. Zero-cost
+      // rows (failed / dry-run / upload-only) contribute nothing.
       if (stage === "prepare") return "";
-      let totalUsd = 0, replicateUsd = 0, falUsd = 0, replicateN = 0, falN = 0;
+      let totalUsd = 0;
+      const buckets: Record<string, { usd: number; n: number }> = {};
       for (const r of rows) {
         const c = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
         if (!Number.isFinite(c) || c <= 0) continue;
         totalUsd += c;
         const prov = ((r as unknown as { provider?: string }).provider ?? "").trim();
-        if (prov === "fal") { falUsd += c; falN++; }
-        else if (prov === "replicate") { replicateUsd += c; replicateN++; }
+        const model = ((r as unknown as { model?: string }).model ?? "").trim();
+        const key =
+          model === "google/nano-banana-2" ? "replicate nb-2"
+          : model === "google/nano-banana-pro" ? "replicate"
+          : model === "fal-nano-banana-pro" ? "fal"
+          : prov || "unknown";
+        const b = buckets[key] ?? { usd: 0, n: 0 };
+        b.usd += c;
+        b.n += 1;
+        buckets[key] = b;
       }
       if (totalUsd <= 0) return "";
+      // Present in fixed order so the run-header layout stays stable:
+      // primary path first, fallbacks after.
+      const order = ["replicate", "replicate nb-2", "fal", "unknown"];
       const parts: string[] = [];
-      if (replicateN > 0) parts.push(`${replicateN} × replicate ${formatUsd(replicateUsd)}`);
-      if (falN > 0) parts.push(`<span class="rct-fal">${falN} × fal ${formatUsd(falUsd)}</span>`);
-      return `<span class="run-cost-total" title="Sum of per-image generation costs — Replicate + fal fallback"><span class="rct-label">cost</span> ${esc(formatUsd(totalUsd))}${parts.length ? ` · <span class="rct-label">${parts.join(" + ")}</span>` : ""}</span>`;
+      for (const key of order) {
+        const b = buckets[key];
+        if (!b) continue;
+        const seg = `${b.n} × ${key} ${formatUsd(b.usd)}`;
+        parts.push(key === "replicate" ? seg : `<span class="rct-fal">${seg}</span>`);
+      }
+      return `<span class="run-cost-total" title="Sum of per-image generation costs — Replicate primary + nano-banana-2 + fal fallback"><span class="rct-label">cost</span> ${esc(formatUsd(totalUsd))}${parts.length ? ` · <span class="rct-label">${parts.join(" + ")}</span>` : ""}</span>`;
     })()}
     <span class="sub" id="picked-count" style="margin-left:auto"></span>
   </div>

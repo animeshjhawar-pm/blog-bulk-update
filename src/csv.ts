@@ -37,6 +37,11 @@ export const CSV_HEADER = [
   // "0" for failed / mocked / dry-run rows so a sum across the run
   // isn't polluted by retries that Replicate/fal didn't bill for.
   "cost_usd",
+  // Which specific model produced this image — distinguishes the
+  // two Replicate paths (nano-banana-pro vs nano-banana-2) that
+  // both report provider="replicate" but bill at very different
+  // rates (~4× spread). Absent for failed / mock / upload-only rows.
+  "model",
 ] as const;
 
 export type CsvHeader = (typeof CSV_HEADER)[number];
