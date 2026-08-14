@@ -8888,10 +8888,21 @@ async function openImageStream(
     // Skip the remote round-trip when the URL is almost certainly
     // expired. Replicate signs delivery URLs for roughly an hour;
     // requesting after that just costs us a 5–10s timeout per file.
-    const generatedMs = row.generated_at_utc ? Date.parse(row.generated_at_utc) : NaN;
-    if (Number.isFinite(generatedMs)) {
-      const ageH = (Date.now() - generatedMs) / 3600_000;
-      if (ageH > retentionCfg.replicateUrlTtlHours) return null;
+    //
+    // fal.media URLs live orders of magnitude longer (their storage
+    // is content-addressed, not signed) and don't have that TTL — so
+    // the same 1h skip would falsely 410 every fal-generated image
+    // older than an hour. Detect the host and bypass the age gate
+    // when it's not a Replicate delivery URL.
+    const isReplicateHost = /(^|\.)replicate\.(com|delivery)$/i.test(
+      (() => { try { return new URL(remote).hostname; } catch { return ""; } })(),
+    );
+    if (isReplicateHost) {
+      const generatedMs = row.generated_at_utc ? Date.parse(row.generated_at_utc) : NaN;
+      if (Number.isFinite(generatedMs)) {
+        const ageH = (Date.now() - generatedMs) / 3600_000;
+        if (ageH > retentionCfg.replicateUrlTtlHours) return null;
+      }
     }
     const stream = await fetchAsStream(remote);
     if (stream) return { stream, ext: extOf(new URL(remote).pathname) };

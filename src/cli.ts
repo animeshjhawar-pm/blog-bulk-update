@@ -148,7 +148,12 @@ program
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
   )
-  .option("--concurrency <n>", "parallel image generations", "5")
+  // Bumped 5 → 10 now that webhook mode eliminates the polling
+  // overhead per in-flight image. Each subprocess just fs.stats a
+  // cache file every 2s until Replicate calls us back — memory and
+  // CPU per slot are negligible. Higher concurrency finishes a
+  // typical run of 20-50 images 2× faster.
+  .option("--concurrency <n>", "parallel image generations", "10")
   .option(
     "--prompt-override-file <path>",
     "use the literal text in this file as the image-gen prompt instead of calling Portkey (used by the web UI's Regenerate button to skip the prompt-build step)",
@@ -465,7 +470,11 @@ program
   .addOption(
     new Option("--provider <name>", "override IMAGE_PROVIDER").choices(["replicate", "fal"]),
   )
-  .option("--concurrency <n>", "parallel images", "3")
+  // Bumped 3 → 6 — same rationale as the regen bump: webhook mode
+  // means the composite path spends less time per image in-flight,
+  // so we can safely fan out more without spawning subprocess-count
+  // pressure.
+  .option("--concurrency <n>", "parallel images", "6")
   .option(
     "--extra-instructions-file <path>",
     "merge this file's text into the per-image top-priority block (same shape as the regen flag)",
