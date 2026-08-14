@@ -559,9 +559,24 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     client: slug,
     client_name: project.name,
     project_id: project.id,
+    // Mode marker used by web.ts::reconcileOrphanedRuns to decide
+    // whether an orphaned run can be safely auto-resumed. "regen"
+    // runs are self-contained (all inputs recoverable from the DB);
+    // "upload-generate" needs operator-supplied product files that
+    // may not exist any more. Older manifests without this field are
+    // treated as "regen" (the historical default).
+    mode: "regen",
     asset_types: options.assetTypes ? [...options.assetTypes] : null,
     cluster_ids: options.clusterIds ? [...options.clusterIds] : null,
     image_ids: options.imageIds ? [...options.imageIds] : null,
+    // The FULL RESOLVED queue at start time — the exact image_ids
+    // this subprocess intends to process. Distinct from
+    // options.imageIds (the operator's filter, may be null).
+    // Reconciliation compares this to the CSV to find images that
+    // never got a row written (subprocess died before even reaching
+    // them), so they can be auto-resumed alongside the non-terminal
+    // rows.
+    queued_image_ids: records.map((r) => r.imageId),
     dry_run: options.dryRun,
     use_saved_token: options.useSavedToken,
     token_source: tokenSource,

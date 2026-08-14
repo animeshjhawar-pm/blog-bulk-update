@@ -559,6 +559,10 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     project_id: project.id,
     cluster_ids: options.clusterIds ? [...options.clusterIds] : null,
     image_ids: options.imageIds ? [...options.imageIds] : null,
+    // Full resolved queue at start — reconciliation uses this to
+    // detect images that were queued but never got a CSV row
+    // written (subprocess died before reaching them).
+    queued_image_ids: records.map((r) => r.imageId),
     token_source: tokenSource,
     provider: options.provider ?? loadEnv().IMAGE_PROVIDER,
     concurrency: options.concurrency,

@@ -5387,6 +5387,7 @@ async function updateParentCsvRow(
   csvPath: string,
   imageId: string,
   patch: Partial<Record<string, string>>,
+  opts: { appendIfMissing?: boolean } = {},
 ): Promise<void> {
   const { CSV_HEADER } = await import("./csv.js");
   const { stringify } = await import("csv-stringify/sync");
@@ -5405,10 +5406,23 @@ async function updateParentCsvRow(
     }
   }
   if (!touched) {
-    process.stderr.write(
-      `updateParentCsvRow: image_id=${imageId} not found in ${csvPath}\n`,
-    );
-    return;
+    // Two cases:
+    //   1. Normal per-image Regenerate (no appendIfMissing) — the parent
+    //      CSV should already have a row for every image the operator
+    //      can regenerate. Missing means the CSV/run is broken; log
+    //      loudly and no-op.
+    //   2. Orphan reconciliation (appendIfMissing=true) — the parent
+    //      subprocess died before it could write this row. Append a
+    //      fresh row so the reconciled result shows up in the UI.
+    if (!opts.appendIfMissing) {
+      process.stderr.write(
+        `updateParentCsvRow: image_id=${imageId} not found in ${csvPath}\n`,
+      );
+      return;
+    }
+    const fresh: Record<string, string> = { image_id: imageId };
+    Object.assign(fresh, patch);
+    rows.push(fresh);
   }
 
   // Normalise every row so every column from CSV_HEADER is present
@@ -5434,6 +5448,238 @@ async function updateParentCsvRow(
 function extractProviderFromArgs(args: string[]): string | undefined {
   const i = args.indexOf("--provider");
   return i >= 0 ? args[i + 1] : undefined;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Orphan reconciliation — the systemic fix for "container restart mid-run
+// leaves the operator staring at 'streaming…' forever."
+//
+// Runs are children of the web parent process. When Railway redeploys
+// (or the container OOMs / SIGTERMs), the parent dies and takes every
+// subprocess with it. On the next boot:
+//
+//   * Web parent starts fresh — RUNS map is empty
+//   * Subprocess is gone — nothing is generating anything
+//   * The run's CSV has rows for images that COMPLETED before death
+//   * Images that were in-flight OR still queued have no row at all
+//     (regen.ts appends per-image; nothing was written for images the
+//     subprocess never reached)
+//   * UI polls SSE, sees no updates, sits at "streaming…" indefinitely
+//
+// Fix: at boot, scan manifests, cross-reference queued_image_ids
+// against the CSV's terminal rows. Anything missing OR non-terminal is
+// an orphan. For regen mode, auto-spawn a resume subprocess scoped to
+// the orphaned image_ids — writes into a NEW child CSV, then patches
+// each result back into the parent CSV via updateParentCsvRow (same
+// pattern as the manual per-image Regenerate).
+//
+// upload-generate mode can't be auto-resumed: it needs the operator's
+// product files. Those files may or may not still be on the volume
+// (retention sweep, product-delete). Mark orphans as failed with a
+// clear message; operator hits Regenerate manually.
+// ────────────────────────────────────────────────────────────────────────
+
+const RESUME_MAX_AGE_MS = 24 * 60 * 60_000; // ignore ancient manifests
+const RESUME_TERMINAL_STATUSES = new Set<string>([
+  "completed", "failed", "dry-run", "mock", "skipped", "ready", "applied", "superseded",
+]);
+
+async function reconcileOrphanedRuns(): Promise<void> {
+  const dir = runOutDir();
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return; // outDir may not exist yet
+  }
+  const manifestNames = names.filter(
+    (n) => (n.startsWith("manifest-") || n.startsWith("manifest-upgen-")) && n.endsWith(".json"),
+  );
+  if (manifestNames.length === 0) return;
+
+  const now = Date.now();
+  let resumed = 0;
+  let markedFailed = 0;
+
+  for (const n of manifestNames) {
+    try {
+      const raw = await fs.readFile(path.join(dir, n), "utf8");
+      const m = JSON.parse(raw) as {
+        run_id?: unknown; client?: unknown; mode?: unknown;
+        started_at?: unknown; csv?: unknown;
+        queued_image_ids?: unknown; provider?: unknown;
+      };
+      const runId = typeof m.run_id === "string" ? m.run_id : null;
+      if (!runId) continue;
+
+      // Age gate — don't attempt to resume runs older than the cutoff.
+      // Anything older is either genuinely done or long-abandoned.
+      const startedAt = typeof m.started_at === "string" ? Date.parse(m.started_at) : NaN;
+      if (!Number.isFinite(startedAt) || now - startedAt > RESUME_MAX_AGE_MS) continue;
+
+      // Skip runs that are actively running in THIS process. RUNS is
+      // populated by startRegen / startUploadGenerate at spawn time,
+      // so a live entry means the current container owns that run.
+      const inMem = RUNS.get(runId);
+      if (inMem && !inMem.done) continue;
+
+      const csvPath = await rehydrateManifestPath(m.csv);
+      if (!csvPath) continue;
+
+      // Compute the orphan set.
+      //   queued  = manifest.queued_image_ids (full intended queue)
+      //   done    = CSV rows whose status is in RESUME_TERMINAL_STATUSES
+      //   orphan  = queued − done
+      // If queued isn't in the manifest (older run), fall back to
+      // "any CSV row with non-terminal status" — that catches
+      // in-flight rows but misses never-started ones.
+      const queued = Array.isArray(m.queued_image_ids)
+        ? (m.queued_image_ids as unknown[]).filter((x): x is string => typeof x === "string")
+        : null;
+      const rows = await readRunCsvOrEmpty(csvPath);
+      const doneIds = new Set<string>();
+      const nonTerminalIds: string[] = [];
+      for (const r of rows) {
+        if (RESUME_TERMINAL_STATUSES.has(r.status)) doneIds.add(r.image_id);
+        else nonTerminalIds.push(r.image_id);
+      }
+      const orphanedIds: string[] = queued
+        ? queued.filter((id) => !doneIds.has(id))
+        : nonTerminalIds;
+      if (orphanedIds.length === 0) continue;
+
+      const mode = typeof m.mode === "string" ? m.mode : "regen";
+      const client = typeof m.client === "string" ? m.client : "";
+
+      if (mode === "upload-generate") {
+        // Product files may have been deleted by retention or the
+        // /upload-generate/product-delete endpoint. Even if they're
+        // still there, auto-resume would silently reuse them — the
+        // operator may have re-uploaded a different file since. Mark
+        // failed with a clear message and let the operator drive the
+        // retry through the workspace UI, where they can re-drop
+        // whatever they meant to send.
+        await markOrphansAsFailed(csvPath, orphanedIds,
+          "container restarted mid-generation — re-drop the product file(s) and Regenerate");
+        markedFailed += orphanedIds.length;
+        process.stdout.write(
+          `resume: run ${runId} (upload-generate) — marked ${orphanedIds.length} orphan(s) failed for operator retry\n`,
+        );
+        continue;
+      }
+
+      // regen mode — auto-resume. Spawn a child subprocess scoped to
+      // just the orphaned image_ids; on completion, patch each result
+      // back into the parent CSV.
+      if (!client) {
+        process.stderr.write(
+          `resume: run ${runId} skipped — missing client in manifest\n`,
+        );
+        continue;
+      }
+      const provider = typeof m.provider === "string" ? m.provider : undefined;
+      const child = startRegen({
+        client,
+        clusterIds: [],
+        imageIds: orphanedIds,
+        dryRun: false,
+        mock: false,
+        useSavedToken: true,
+        // Match the same fan-out shape as manual per-image Regenerate:
+        // hand it all three page types so filters land regardless of
+        // the parent's original page_type. cluster_id + image_id
+        // filters in collectImageRecords narrow it precisely.
+        pageType: "blog,service,category",
+        provider,
+      });
+      resumed++;
+      process.stdout.write(
+        `resume: run ${runId} (regen) — orphans=${orphanedIds.length} client=${client} → child ${child.id}\n`,
+      );
+
+      // When the child completes, patch each result back into the
+      // parent CSV so the UI (which reads from parent) sees the
+      // reconciled state. Any per-image failure is left as-is in the
+      // parent CSV (already showing the original orphan-inflight
+      // status); the operator can hit Regenerate for whatever the
+      // resume didn't recover.
+      const parentCsvPath = csvPath;
+      const parentRunId = runId;
+      child.proc?.on("close", async (code) => {
+        try {
+          if (code !== 0 || !child.csvPath) {
+            process.stderr.write(
+              `resume: run ${parentRunId} child ${child.id} exited ${code} — orphans remain in parent CSV\n`,
+            );
+            return;
+          }
+          const childRows = await readRunCsvOrEmpty(child.csvPath);
+          let patched = 0;
+          for (const imageId of orphanedIds) {
+            const cr = childRows.find((r) => r.image_id === imageId);
+            if (!cr || cr.status !== "completed") continue;
+            try {
+              // Copy the whole row shape so appended-when-missing
+              // rows have a full set of columns, not just the patch
+              // fields. Skip image_id (already the key).
+              const fullRow: Record<string, string> = {};
+              for (const [k, v] of Object.entries(cr)) {
+                if (k === "image_id") continue;
+                if (v == null) continue;
+                fullRow[k] = String(v);
+              }
+              fullRow.status = "completed";
+              fullRow.error = "";
+              await updateParentCsvRow(parentCsvPath, imageId, fullRow, {
+                appendIfMissing: true,
+              });
+              patched++;
+            } catch (err) {
+              process.stderr.write(
+                `resume: parent-row patch failed for ${imageId} in ${parentRunId}: ${(err as Error).message}\n`,
+              );
+            }
+          }
+          process.stdout.write(
+            `resume: run ${parentRunId} child ${child.id} done — patched ${patched}/${orphanedIds.length} back to parent CSV\n`,
+          );
+        } catch (err) {
+          process.stderr.write(
+            `resume: run ${parentRunId} child-close handler failed: ${(err as Error).message}\n`,
+          );
+        }
+      });
+    } catch (err) {
+      process.stderr.write(
+        `reconcile: manifest ${n} skipped: ${(err as Error).message}\n`,
+      );
+    }
+  }
+
+  if (resumed > 0 || markedFailed > 0) {
+    process.stdout.write(
+      `reconcile: startup pass done — resumed ${resumed} run(s), marked ${markedFailed} orphan(s) failed\n`,
+    );
+  }
+}
+
+async function markOrphansAsFailed(
+  csvPath: string,
+  orphanedIds: string[],
+  errorMsg: string,
+): Promise<void> {
+  for (const imageId of orphanedIds) {
+    try {
+      await updateParentCsvRow(csvPath, imageId, {
+        status: "failed",
+        error: errorMsg,
+      });
+    } catch (err) {
+      process.stderr.write(
+        `resume: markOrphansAsFailed(${imageId}) failed: ${(err as Error).message}\n`,
+      );
+    }
+  }
 }
 
 async function saveBrandHandler(req: IncomingMessage, res: ServerResponse, slug: string) {
@@ -10487,6 +10733,15 @@ export function startWebServer(port: number): void {
     };
     runSweep();
     setInterval(runSweep, 30 * 60 * 1000).unref();
+
+    // Orphan reconciliation — if the previous container died mid-run
+    // (deploy, OOM, SIGTERM), find the runs whose subprocess never
+    // came back and auto-resume them here. Fire-and-forget: any
+    // reconciled child logs its own progress. Best-effort; failures
+    // don't block boot.
+    reconcileOrphanedRuns().catch((err) => {
+      process.stderr.write(`reconcile: startup pass crashed: ${(err as Error).message}\n`);
+    });
   });
 
   process.on("SIGINT", async () => {

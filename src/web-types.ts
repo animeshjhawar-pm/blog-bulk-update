@@ -30,4 +30,13 @@ export interface CsvRowParsed {
    * regenerate poll-and-recover instead of paying for a fresh call.
    * Undefined for rows from CSVs written before this column existed. */
   prediction_id?: string;
+  /** Which upstream produced this image ("replicate" | "fal" | ""). */
+  provider?: string;
+  /** USD cost of this image at generation time, from src/pricing.ts.
+   *  "0" for failed / dry-run / upload-only rows. */
+  cost_usd?: string;
+  /** Specific model that produced this image — distinguishes
+   *  "google/nano-banana-pro" from "google/nano-banana-2" (both
+   *  provider="replicate") for per-image cost pricing. */
+  model?: string;
 }
