@@ -5213,6 +5213,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     const childRunId = randomUUID().replace(/-/g, "").slice(0, 16);
     const productsManifestPath = path.join(tmpDir, `products-${childRunId}.json`);
     await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productEntry }, null, 2), "utf8");
+    await acquireSpawnSlot();
     child = startUploadGenerate({
       client: parent.client,
       runId: childRunId,
@@ -5237,6 +5238,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
       productBaseUrl: parent.productBaseUrl,
     });
   } else {
+    await acquireSpawnSlot();
     child = startRegen({
       client: parent.client,
       clusterIds: [clusterId],
@@ -5451,6 +5453,107 @@ function extractProviderFromArgs(args: string[]): string | undefined {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Multi-run coordination — protects Replicate's global capacity when
+// several operators run in parallel. Two knobs, both env-overridable:
+//
+//   MAX_CONCURRENT_RUNS  (default 3) — never spawn more than N CLI
+//     subprocesses at once. New spawns queue until a slot frees.
+//     Prevents the "5 operators × 5-concurrency = 25 in-flight"
+//     fan-out that used to trigger E003 all by itself.
+//
+//   E003_COOLDOWN_MS  (default 3 min) — when ANY subprocess reports
+//     E003, pause ALL new spawns for this window. Existing runs keep
+//     their in-subprocess retry backoff (unchanged). Stops the
+//     herd from restarting at the moment Replicate opens up.
+//
+// Both are best-effort throttles at the SPAWN boundary; they don't
+// touch replicate.ts's per-request backoff or the layer-2 /
+// fal fallback chain in generate.ts. Fully compatible with the
+// reconciliation flow — a resume spawn is just another subprocess.
+// ────────────────────────────────────────────────────────────────────────
+
+const MAX_CONCURRENT_RUNS = (() => {
+  const v = Number.parseInt(process.env.MAX_CONCURRENT_RUNS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 3;
+})();
+const E003_COOLDOWN_MS = (() => {
+  const v = Number.parseInt(process.env.E003_COOLDOWN_MS ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 3 * 60_000;
+})();
+
+let e003CooldownUntil = 0;
+let inFlightSlots = 0;
+const spawnQueue: Array<() => void> = [];
+
+/**
+ * Wait until (a) the concurrent-run cap has a free slot AND (b) we're
+ * past any E003 cooldown window. On success, atomically claims a slot
+ * (increments the counter) BEFORE returning — so concurrent callers
+ * see the updated count and don't all pass through at once. Used by
+ * startRegen / startUploadGenerate to gate new spawns without
+ * changing per-request retry semantics.
+ *
+ * Every successful acquireSpawnSlot() MUST be paired with exactly
+ * one releaseSpawnSlot() (called from the child close handler). No
+ * exceptions; the counter would drift otherwise.
+ */
+export async function acquireSpawnSlot(): Promise<void> {
+  const waitCooldown = async () => {
+    const remaining = e003CooldownUntil - Date.now();
+    if (remaining > 0) {
+      process.stderr.write(
+        `spawn: E003 cooldown active — deferring new run for ${Math.ceil(remaining / 1000)}s\n`,
+      );
+      await new Promise<void>((r) => setTimeout(r, remaining).unref());
+    }
+  };
+  // Try until we both clear cooldown AND claim a slot. The retry loop
+  // handles the case where cooldown ends but another spawn already
+  // grabbed the free slot in between our checks.
+  for (;;) {
+    await waitCooldown();
+    if (inFlightSlots < MAX_CONCURRENT_RUNS) {
+      // Claim the slot synchronously before any other awaiter runs.
+      inFlightSlots++;
+      return;
+    }
+    process.stderr.write(
+      `spawn: at cap (${inFlightSlots}/${MAX_CONCURRENT_RUNS}) — queueing new run\n`,
+    );
+    await new Promise<void>((resolve) => spawnQueue.push(resolve));
+    // Loop: re-check cooldown and re-attempt slot claim.
+  }
+}
+
+/**
+ * Called from subprocess close handlers — releases the slot this
+ * subprocess held. Drains one waiter from the spawn queue if any are
+ * waiting; the waiter re-runs the acquire flow (which will claim the
+ * newly-freed slot).
+ */
+function releaseSpawnSlot(): void {
+  if (inFlightSlots > 0) inFlightSlots--;
+  const next = spawnQueue.shift();
+  if (next) next();
+}
+
+/**
+ * Called from the subprocess data-listener when we see the E003
+ * marker line replicate.ts logs. Extends the cooldown so new spawns
+ * defer. Idempotent — a fresh E003 during an existing cooldown just
+ * pushes the deadline further out.
+ */
+function notifyE003Detected(): void {
+  const until = Date.now() + E003_COOLDOWN_MS;
+  if (until > e003CooldownUntil) {
+    e003CooldownUntil = until;
+    process.stderr.write(
+      `spawn: E003 observed — global cooldown extended to ${new Date(until).toISOString()}\n`,
+    );
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Orphan reconciliation — the systemic fix for "container restart mid-run
 // leaves the operator staring at 'streaming…' forever."
 //
@@ -5484,6 +5587,36 @@ const RESUME_TERMINAL_STATUSES = new Set<string>([
   "completed", "failed", "dry-run", "mock", "skipped", "ready", "applied", "superseded",
 ]);
 
+/**
+ * Reconcile a single manifest — either from the startup pass or from
+ * a subprocess `close` event where the child died unexpectedly. Kept
+ * as an internal helper so callers can be scoped ("this one run just
+ * died, catch it") without paying the O(manifests) scan cost.
+ * Returns "resumed" | "marked_failed" | "no_orphans" | "skipped".
+ */
+async function reconcileSingleManifest(
+  manifestName: string,
+  now: number,
+): Promise<"resumed" | "marked_failed" | "no_orphans" | "skipped"> {
+  const dir = runOutDir();
+  try {
+    const raw = await fs.readFile(path.join(dir, manifestName), "utf8");
+    const m = JSON.parse(raw) as {
+      run_id?: unknown; client?: unknown; mode?: unknown;
+      started_at?: unknown; csv?: unknown;
+      queued_image_ids?: unknown; provider?: unknown;
+    };
+    const runId = typeof m.run_id === "string" ? m.run_id : null;
+    if (!runId) return "skipped";
+    return await reconcileOne(m, runId, now);
+  } catch (err) {
+    process.stderr.write(
+      `reconcile: manifest ${manifestName} skipped: ${(err as Error).message}\n`,
+    );
+    return "skipped";
+  }
+}
+
 async function reconcileOrphanedRuns(): Promise<void> {
   const dir = runOutDir();
   let names: string[];
@@ -5502,164 +5635,159 @@ async function reconcileOrphanedRuns(): Promise<void> {
   let markedFailed = 0;
 
   for (const n of manifestNames) {
-    try {
-      const raw = await fs.readFile(path.join(dir, n), "utf8");
-      const m = JSON.parse(raw) as {
-        run_id?: unknown; client?: unknown; mode?: unknown;
-        started_at?: unknown; csv?: unknown;
-        queued_image_ids?: unknown; provider?: unknown;
-      };
-      const runId = typeof m.run_id === "string" ? m.run_id : null;
-      if (!runId) continue;
-
-      // Age gate — don't attempt to resume runs older than the cutoff.
-      // Anything older is either genuinely done or long-abandoned.
-      const startedAt = typeof m.started_at === "string" ? Date.parse(m.started_at) : NaN;
-      if (!Number.isFinite(startedAt) || now - startedAt > RESUME_MAX_AGE_MS) continue;
-
-      // Skip runs that are actively running in THIS process. RUNS is
-      // populated by startRegen / startUploadGenerate at spawn time,
-      // so a live entry means the current container owns that run.
-      const inMem = RUNS.get(runId);
-      if (inMem && !inMem.done) continue;
-
-      const csvPath = await rehydrateManifestPath(m.csv);
-      if (!csvPath) continue;
-
-      // Compute the orphan set.
-      //   queued  = manifest.queued_image_ids (full intended queue)
-      //   done    = CSV rows whose status is in RESUME_TERMINAL_STATUSES
-      //   orphan  = queued − done
-      // If queued isn't in the manifest (older run), fall back to
-      // "any CSV row with non-terminal status" — that catches
-      // in-flight rows but misses never-started ones.
-      const queued = Array.isArray(m.queued_image_ids)
-        ? (m.queued_image_ids as unknown[]).filter((x): x is string => typeof x === "string")
-        : null;
-      const rows = await readRunCsvOrEmpty(csvPath);
-      const doneIds = new Set<string>();
-      const nonTerminalIds: string[] = [];
-      for (const r of rows) {
-        if (RESUME_TERMINAL_STATUSES.has(r.status)) doneIds.add(r.image_id);
-        else nonTerminalIds.push(r.image_id);
-      }
-      const orphanedIds: string[] = queued
-        ? queued.filter((id) => !doneIds.has(id))
-        : nonTerminalIds;
-      if (orphanedIds.length === 0) continue;
-
-      const mode = typeof m.mode === "string" ? m.mode : "regen";
-      const client = typeof m.client === "string" ? m.client : "";
-
-      if (mode === "upload-generate") {
-        // Product files may have been deleted by retention or the
-        // /upload-generate/product-delete endpoint. Even if they're
-        // still there, auto-resume would silently reuse them — the
-        // operator may have re-uploaded a different file since. Mark
-        // failed with a clear message and let the operator drive the
-        // retry through the workspace UI, where they can re-drop
-        // whatever they meant to send.
-        await markOrphansAsFailed(csvPath, orphanedIds,
-          "container restarted mid-generation — re-drop the product file(s) and Regenerate");
-        markedFailed += orphanedIds.length;
-        process.stdout.write(
-          `resume: run ${runId} (upload-generate) — marked ${orphanedIds.length} orphan(s) failed for operator retry\n`,
-        );
-        continue;
-      }
-
-      // regen mode — auto-resume. Spawn a child subprocess scoped to
-      // just the orphaned image_ids; on completion, patch each result
-      // back into the parent CSV.
-      if (!client) {
-        process.stderr.write(
-          `resume: run ${runId} skipped — missing client in manifest\n`,
-        );
-        continue;
-      }
-      const provider = typeof m.provider === "string" ? m.provider : undefined;
-      const child = startRegen({
-        client,
-        clusterIds: [],
-        imageIds: orphanedIds,
-        dryRun: false,
-        mock: false,
-        useSavedToken: true,
-        // Match the same fan-out shape as manual per-image Regenerate:
-        // hand it all three page types so filters land regardless of
-        // the parent's original page_type. cluster_id + image_id
-        // filters in collectImageRecords narrow it precisely.
-        pageType: "blog,service,category",
-        provider,
-      });
-      resumed++;
-      process.stdout.write(
-        `resume: run ${runId} (regen) — orphans=${orphanedIds.length} client=${client} → child ${child.id}\n`,
-      );
-
-      // When the child completes, patch each result back into the
-      // parent CSV so the UI (which reads from parent) sees the
-      // reconciled state. Any per-image failure is left as-is in the
-      // parent CSV (already showing the original orphan-inflight
-      // status); the operator can hit Regenerate for whatever the
-      // resume didn't recover.
-      const parentCsvPath = csvPath;
-      const parentRunId = runId;
-      child.proc?.on("close", async (code) => {
-        try {
-          if (code !== 0 || !child.csvPath) {
-            process.stderr.write(
-              `resume: run ${parentRunId} child ${child.id} exited ${code} — orphans remain in parent CSV\n`,
-            );
-            return;
-          }
-          const childRows = await readRunCsvOrEmpty(child.csvPath);
-          let patched = 0;
-          for (const imageId of orphanedIds) {
-            const cr = childRows.find((r) => r.image_id === imageId);
-            if (!cr || cr.status !== "completed") continue;
-            try {
-              // Copy the whole row shape so appended-when-missing
-              // rows have a full set of columns, not just the patch
-              // fields. Skip image_id (already the key).
-              const fullRow: Record<string, string> = {};
-              for (const [k, v] of Object.entries(cr)) {
-                if (k === "image_id") continue;
-                if (v == null) continue;
-                fullRow[k] = String(v);
-              }
-              fullRow.status = "completed";
-              fullRow.error = "";
-              await updateParentCsvRow(parentCsvPath, imageId, fullRow, {
-                appendIfMissing: true,
-              });
-              patched++;
-            } catch (err) {
-              process.stderr.write(
-                `resume: parent-row patch failed for ${imageId} in ${parentRunId}: ${(err as Error).message}\n`,
-              );
-            }
-          }
-          process.stdout.write(
-            `resume: run ${parentRunId} child ${child.id} done — patched ${patched}/${orphanedIds.length} back to parent CSV\n`,
-          );
-        } catch (err) {
-          process.stderr.write(
-            `resume: run ${parentRunId} child-close handler failed: ${(err as Error).message}\n`,
-          );
-        }
-      });
-    } catch (err) {
-      process.stderr.write(
-        `reconcile: manifest ${n} skipped: ${(err as Error).message}\n`,
-      );
-    }
+    const outcome = await reconcileSingleManifest(n, now);
+    if (outcome === "resumed") resumed++;
+    else if (outcome === "marked_failed") markedFailed++;
   }
 
   if (resumed > 0 || markedFailed > 0) {
     process.stdout.write(
       `reconcile: startup pass done — resumed ${resumed} run(s), marked ${markedFailed} orphan(s) failed\n`,
     );
+  }
+}
+
+async function reconcileOne(
+  m: {
+    run_id?: unknown; client?: unknown; mode?: unknown;
+    started_at?: unknown; csv?: unknown;
+    queued_image_ids?: unknown; provider?: unknown;
+  },
+  runId: string,
+  now: number,
+): Promise<"resumed" | "marked_failed" | "no_orphans" | "skipped"> {
+  // Age gate — anything older than the cutoff is either done or
+  // long-abandoned.
+  const startedAt = typeof m.started_at === "string" ? Date.parse(m.started_at) : NaN;
+  if (!Number.isFinite(startedAt) || now - startedAt > RESUME_MAX_AGE_MS) return "skipped";
+
+  // Skip runs that are actively running in THIS process.
+  const inMem = RUNS.get(runId);
+  if (inMem && !inMem.done) return "skipped";
+
+  const csvPath = await rehydrateManifestPath(m.csv);
+  if (!csvPath) return "skipped";
+
+  // Compute the orphan set — queued − done, or non-terminal rows as
+  // a fallback when the manifest predates queued_image_ids.
+  const queued = Array.isArray(m.queued_image_ids)
+    ? (m.queued_image_ids as unknown[]).filter((x): x is string => typeof x === "string")
+    : null;
+  const rows = await readRunCsvOrEmpty(csvPath);
+  const doneIds = new Set<string>();
+  const nonTerminalIds: string[] = [];
+  for (const r of rows) {
+    if (RESUME_TERMINAL_STATUSES.has(r.status)) doneIds.add(r.image_id);
+    else nonTerminalIds.push(r.image_id);
+  }
+  const orphanedIds: string[] = queued
+    ? queued.filter((id) => !doneIds.has(id))
+    : nonTerminalIds;
+  if (orphanedIds.length === 0) return "no_orphans";
+
+  const mode = typeof m.mode === "string" ? m.mode : "regen";
+  const client = typeof m.client === "string" ? m.client : "";
+
+  if (mode === "upload-generate") {
+    // Can't safely auto-resume: needs operator products which may
+    // have been swept or deleted. Mark failed for operator retry.
+    await markOrphansAsFailed(csvPath, orphanedIds,
+      "container restarted mid-generation — re-drop the product file(s) and Regenerate");
+    process.stdout.write(
+      `resume: run ${runId} (upload-generate) — marked ${orphanedIds.length} orphan(s) failed for operator retry\n`,
+    );
+    return "marked_failed";
+  }
+
+  if (!client) {
+    process.stderr.write(`resume: run ${runId} skipped — missing client in manifest\n`);
+    return "skipped";
+  }
+
+  const provider = typeof m.provider === "string" ? m.provider : undefined;
+  await acquireSpawnSlot();
+  const child = startRegen({
+    client, clusterIds: [], imageIds: orphanedIds,
+    dryRun: false, mock: false, useSavedToken: true,
+    pageType: "blog,service,category",
+    provider,
+  });
+  process.stdout.write(
+    `resume: run ${runId} (regen) — orphans=${orphanedIds.length} client=${client} → child ${child.id}\n`,
+  );
+
+  // Patch results back into parent CSV on child close.
+  const parentCsvPath = csvPath;
+  const parentRunId = runId;
+  child.proc?.on("close", async (code) => {
+    try {
+      if (code !== 0 || !child.csvPath) {
+        process.stderr.write(
+          `resume: run ${parentRunId} child ${child.id} exited ${code} — orphans remain in parent CSV\n`,
+        );
+        return;
+      }
+      const childRows = await readRunCsvOrEmpty(child.csvPath);
+      let patched = 0;
+      for (const imageId of orphanedIds) {
+        const cr = childRows.find((r) => r.image_id === imageId);
+        if (!cr || cr.status !== "completed") continue;
+        try {
+          const fullRow: Record<string, string> = {};
+          for (const [k, v] of Object.entries(cr)) {
+            if (k === "image_id") continue;
+            if (v == null) continue;
+            fullRow[k] = String(v);
+          }
+          fullRow.status = "completed";
+          fullRow.error = "";
+          await updateParentCsvRow(parentCsvPath, imageId, fullRow, {
+            appendIfMissing: true,
+          });
+          patched++;
+        } catch (err) {
+          process.stderr.write(
+            `resume: parent-row patch failed for ${imageId} in ${parentRunId}: ${(err as Error).message}\n`,
+          );
+        }
+      }
+      process.stdout.write(
+        `resume: run ${parentRunId} child ${child.id} done — patched ${patched}/${orphanedIds.length} back to parent CSV\n`,
+      );
+    } catch (err) {
+      process.stderr.write(
+        `resume: run ${parentRunId} child-close handler failed: ${(err as Error).message}\n`,
+      );
+    }
+  });
+  return "resumed";
+}
+
+/**
+ * Reconcile a single known run — used by subprocess crash handlers.
+ * Locates the manifest for `runId` and passes it to reconcileOne.
+ * O(manifests) worst case, but scoped to one run so we don't have to
+ * touch every manifest on every subprocess exit.
+ */
+async function reconcileRunById(runId: string): Promise<void> {
+  const dir = runOutDir();
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch { return; }
+  for (const n of names) {
+    if (!(n.startsWith("manifest-") || n.startsWith("manifest-upgen-"))) continue;
+    if (!n.endsWith(".json")) continue;
+    try {
+      const raw = await fs.readFile(path.join(dir, n), "utf8");
+      const m = JSON.parse(raw);
+      if (m?.run_id !== runId) continue;
+      const outcome = await reconcileOne(m, runId, Date.now());
+      if (outcome === "resumed" || outcome === "marked_failed") {
+        process.stdout.write(`resume: on-close reconcile for ${runId} → ${outcome}\n`);
+      }
+      return;
+    } catch { /* skip */ }
   }
 }
 
@@ -6004,6 +6132,10 @@ function startRegen(opts: {
     if (csv && csv[1]) state.csvPath = csv[1].trim();
     const html = text.match(/regen: html=(.+?)\n/);
     if (html && html[1]) state.htmlPath = html[1].trim();
+    // E003 detector — replicate.ts logs a "E003 rate-limit (attempt …)"
+    // line the moment it hits the rate-limit backoff schedule. Feed
+    // that to the global cooldown so new spawns defer.
+    if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
   proc.stdout?.on("data", ondata);
@@ -6016,6 +6148,22 @@ function startRegen(opts: {
       l.end();
     }
     state.listeners.clear();
+    // Free the concurrent-run slot for any queued spawn.
+    releaseSpawnSlot();
+    // Unexpected exit → check for orphans this subprocess left behind
+    // and auto-resume them. Non-zero code = crash (OOM, unhandled
+    // throw); code 0 with orphans = filtered early exit, still worth a
+    // reconcile pass in case the CSV shows anything non-terminal.
+    // Delay slightly so any final CSV flush lands first.
+    if (code !== 0) {
+      setTimeout(() => {
+        reconcileRunById(state.id).catch((err) => {
+          process.stderr.write(
+            `resume: on-close reconcile of ${state.id} crashed: ${(err as Error).message}\n`,
+          );
+        });
+      }, 2000).unref();
+    }
   });
   return state;
 }
@@ -6081,6 +6229,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
+  await acquireSpawnSlot();
   const state = startRegen({
     client,
     clusterIds,
@@ -9059,8 +9208,19 @@ async function runDownloadZip(req: IncomingMessage, res: ServerResponse, runId: 
 
 function serveFile(res: ServerResponse, fsPath: string) {
   const abs = path.resolve(fsPath);
-  const root = path.resolve(process.cwd());
-  if (!abs.startsWith(root)) { send(res, 400, "text/plain", "path outside project root"); return; }
+  // Allow anything under cwd (dev) OR the configured runOutDir
+  // (Railway volume — /data/runs). Before this, static reports on
+  // the volume 404'd with "path outside project root" because the
+  // allowlist was cwd-only, and on Railway cwd is /app while
+  // reports live on /data. Both are trusted server-controlled
+  // roots, so the check remains a defence against arbitrary
+  // ../../etc/passwd probes without blocking legitimate reports.
+  const cwdRoot = path.resolve(process.cwd());
+  const outRoot = path.resolve(runOutDir());
+  if (!abs.startsWith(cwdRoot) && !abs.startsWith(outRoot)) {
+    send(res, 400, "text/plain", "path outside project root");
+    return;
+  }
   let stat;
   try { stat = statSync(abs); } catch { send(res, 404, "text/plain", "not found"); return; }
   const ext = path.extname(abs).toLowerCase();
@@ -10166,6 +10326,8 @@ function startUploadGenerate(opts: {
     if (csv && csv[1]) state.csvPath = csv[1].trim();
     const html = text.match(/upload-generate: html=(.+?)\n/);
     if (html && html[1]) state.htmlPath = html[1].trim();
+    // Feed E003 markers into the global cooldown — same as regen.
+    if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
   proc.stdout?.on("data", ondata);
@@ -10178,6 +10340,7 @@ function startUploadGenerate(opts: {
       l.end();
     }
     state.listeners.clear();
+    releaseSpawnSlot();
   });
   return state;
 }
@@ -10345,6 +10508,7 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
     );
   }
 
+  await acquireSpawnSlot();
   const state = startUploadGenerate({
     client: session.client,
     runId,
@@ -10397,6 +10561,30 @@ export function startWebServer(port: number): void {
       // failure. /healthz sidesteps that entirely.
       if (method === "GET" && (p === "/healthz" || p === "/_health")) {
         return sendJson(res, 200, { ok: true });
+      }
+
+      // Diagnostic for ops: "is anything mid-run right now?" Deploys
+      // during in-flight runs SIGTERM the subprocess; reconciliation
+      // is automatic but adds 2-10 min of resume delay. Curl this
+      // before deploying to know.
+      if (method === "GET" && p === "/healthz/inflight") {
+        const inflight: Array<{ run_id: string; client: string; started_at: string; mode: string }> = [];
+        for (const [runId, state] of RUNS.entries()) {
+          if (state.done) continue;
+          inflight.push({
+            run_id: runId,
+            client: state.client,
+            started_at: state.startedAt,
+            mode: state.mode ?? "regen",
+          });
+        }
+        return sendJson(res, 200, {
+          inflight_count: inflight.length,
+          inflight,
+          hint: inflight.length > 0
+            ? "Runs in flight — deploying now will SIGTERM their subprocesses. Auto-reconciliation on next boot will resume them, but that adds a few minutes."
+            : "No in-flight runs. Safe to deploy.",
+        });
       }
 
       // Diagnostic: shows whether webhook mode is wired end-to-end
@@ -10744,8 +10932,40 @@ export function startWebServer(port: number): void {
     });
   });
 
-  process.on("SIGINT", async () => {
-    await closePool();
+  // Graceful shutdown — Railway sends SIGTERM before killing the
+  // container on deploy. Log every in-flight run explicitly so the
+  // reconciliation pass on the NEXT boot has a clear breadcrumb, and
+  // signal each subprocess with SIGTERM so it can flush any in-flight
+  // CSV writes before dying. Best-effort — if we don't finish in the
+  // Railway shutdown-grace window (usually ~10s), Kubernetes SIGKILLs
+  // us and reconciliation still catches everything from disk state.
+  const shutdown = async (signal: NodeJS.Signals) => {
+    process.stderr.write(`web: ${signal} received — starting graceful shutdown\n`);
+    const inFlight: string[] = [];
+    for (const [runId, state] of RUNS.entries()) {
+      if (state.done) continue;
+      inFlight.push(runId);
+      try {
+        // Signal the CLI subprocess to shut down. Node forwards SIGTERM
+        // by default; the child gets a chance to close its CSV stream
+        // atomically. If it doesn't respond, the platform SIGKILL takes
+        // care of it and reconciliation picks it up on next boot.
+        state.proc?.kill?.("SIGTERM");
+      } catch { /* subprocess may already be gone */ }
+    }
+    if (inFlight.length > 0) {
+      process.stderr.write(
+        `web: ${inFlight.length} in-flight run(s) at shutdown — reconcile on next boot will resume:\n`,
+      );
+      for (const id of inFlight) process.stderr.write(`  in-flight: ${id}\n`);
+    }
+    try { await closePool(); } catch { /* */ }
     server.close(() => process.exit(0));
-  });
+    // Backstop: if server.close hangs (open SSE listeners refusing to
+    // drain), exit anyway after 5s. Railway's grace window is short
+    // and we'd rather exit clean than get SIGKILL'd mid-cleanup.
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
