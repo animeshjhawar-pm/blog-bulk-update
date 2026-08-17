@@ -134,18 +134,27 @@ const MAX_RETRIES   = 3;
 // 30s, doubled per attempt, ±20% jitter) with a bigger retry budget.
 // Jitter prevents two concurrent operators from retrying on the same
 // tick and thundering-herding Replicate at the moment it opens up.
-// Budget bumped 5 → 8 after ops observed images still failing with
-// E003 despite the initial fix — Replicate's nano-banana-pro throttle
-// windows exceeded the previous ~7.5 min ceiling. 8 attempts of
-// jittered doubling gives ~30 min worst-case (30/60/120/240/480/960/
-// 1920 s), which covers the longest sustained throttle we've seen.
-const RATE_LIMIT_MAX_RETRIES = 8;
+// Retry budget for E003 rate-limits. Tightened 8 → 3 after ops
+// reported single-image runs taking 10+ min during Replicate's
+// sustained global throttle windows: even with layer-2 nano-banana-2
+// and fal.ai fallback available in generate.ts, images were burning
+// through nano-banana-pro's full 8-attempt retry budget (~42 min
+// worst-case) before falling through. 3 attempts gives ~4 min max
+// per layer, so an image that Replicate genuinely can't serve
+// spills to layer-2 nano-banana-2 within minutes; if that also
+// throttles, it lands on fal within another few minutes. Total
+// worst-case across all three layers: ~15 min instead of ~90+.
+// generate.ts's layer chain (see src/generate.ts) is what makes
+// this budget cut safe — a lower budget without the fallback would
+// just fail more; with the fallback, it just falls through faster.
+const RATE_LIMIT_MAX_RETRIES = 3;
 const RATE_LIMIT_BASE_DELAY_MS = 30_000;
-// Individual sleep cap. Without this, attempt 7 → 8 grows to 32 min
-// then 64 min per sleep, longer than most operators are willing to
-// wait staring at a "Regenerating…" spinner. Cap at 10 min per sleep
-// so the schedule flattens into a long polling cadence instead of
-// exponential blowout, while the retry budget still adds up.
+// Individual sleep cap. Even with a smaller retry budget, keep the
+// per-sleep cap so a single attempt can't blow past a reasonable
+// operator-watching wait. Only kicks in from attempt 6+ which we no
+// longer reach, but leaves the cap in place for env-tunable
+// scenarios (RATE_LIMIT_MAX_RETRIES could be raised via a future
+// env knob).
 const RATE_LIMIT_MAX_SLEEP_MS = 10 * 60_000;
 
 function isReplicateRateLimit(err: unknown): boolean {
