@@ -8769,6 +8769,50 @@ es.addEventListener('end', (ev) => {
 });
 es.onerror = () => {};
 `}
+
+// Auto-refresh watchdog — covers cases where the page state on disk
+// changes without the current tab knowing:
+//   * container restart kills the subprocess mid-run → reconciliation
+//     later patches missing rows into the parent CSV
+//   * a per-image Regenerate spawned a child that finished
+//   * another operator applied cards from a different tab
+//
+// Polls a tiny /mtime endpoint every 15s; when the CSV mtime advances
+// past what this tab rendered from, reload silently. No SSE needed
+// (SSE dies with the subprocess anyway), and it handles the
+// done=true case the SSE block above intentionally skips.
+(function () {
+  const RUN_ID_FOR_WATCH = ${JSON.stringify(id)};
+  const POLL_INTERVAL_MS = 15000;
+  let baselineMtime = null;
+  let inFlight = false;
+  async function poll() {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const r = await fetch('/runs/' + encodeURIComponent(RUN_ID_FOR_WATCH) + '/mtime', {
+        cache: 'no-store',
+      });
+      if (!r.ok) return;
+      const { csv_mtime_ms } = await r.json();
+      if (baselineMtime == null) { baselineMtime = csv_mtime_ms; return; }
+      if (csv_mtime_ms && csv_mtime_ms > baselineMtime) {
+        // Silent reload — no confirm, no flash; operator just sees the
+        // new cards appear as if they were always there. Timers etc.
+        // are all state we don't try to preserve.
+        window.location.reload();
+      }
+    } catch { /* transient network — try again next tick */ }
+    finally { inFlight = false; }
+  }
+  setInterval(poll, POLL_INTERVAL_MS);
+  // Also poll immediately when the tab regains focus — operator
+  // switching back from Slack expects to see the latest state.
+  window.addEventListener('focus', poll);
+  // First poll AFTER a small delay so we don't race the initial
+  // page-render mtime read on the server.
+  setTimeout(poll, 2000);
+})();
 </script>`));
 }
 
@@ -8788,6 +8832,29 @@ function runEvents(res: ServerResponse, id: string) {
   }
   state.listeners.add(res);
   res.on("close", () => state.listeners.delete(res));
+}
+
+/**
+ * Poll target for the run page's auto-refresh watchdog. Returns the
+ * CSV's mtime as a millisecond timestamp so a client-side script can
+ * detect background writes (orphan reconciliation, per-image child
+ * regenerate, another tab's apply) and reload silently.
+ *
+ * Cheap: one fs.stat call, no CSV parsing. If the run's manifest
+ * is gone from RUNS in-memory (post-restart), rehydrate from disk.
+ * Returns 0 when neither RUNS nor a matching manifest is findable.
+ */
+async function runMtimeHandler(res: ServerResponse, id: string) {
+  let state = RUNS.get(id) ?? null;
+  if (!state) state = await tryReconstructRunFromDisk(id);
+  const csvPath = state?.csvPath;
+  if (!csvPath) return sendJson(res, 200, { csv_mtime_ms: 0 });
+  try {
+    const st = await fs.stat(csvPath);
+    return sendJson(res, 200, { csv_mtime_ms: Math.floor(st.mtimeMs) });
+  } catch {
+    return sendJson(res, 200, { csv_mtime_ms: 0 });
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -10935,6 +11002,16 @@ export function startWebServer(port: number): void {
       const runPreviewMatch = /^\/runs\/([a-f0-9]+)\/preview\/(.+)$/.exec(p);
       if ((method === "GET" || method === "HEAD") && runPreviewMatch && runPreviewMatch[1] && runPreviewMatch[2]) {
         return await runPreviewOne(req, res, runPreviewMatch[1], decodeURIComponent(runPreviewMatch[2]));
+      }
+      // Lightweight polling target for the run page's auto-refresh
+      // watchdog. Returns just the CSV's mtime so the client can
+      // detect a background write (reconciliation patch, child
+      // regenerate, another operator's apply) and reload silently.
+      // Kept separate from the /events SSE stream because SSE dies
+      // with the subprocess, but the CSV keeps changing after that.
+      const runMtimeMatch = /^\/runs\/([a-f0-9]+)\/mtime$/.exec(p);
+      if (method === "GET" && runMtimeMatch && runMtimeMatch[1]) {
+        return await runMtimeHandler(res, runMtimeMatch[1]);
       }
       const runMatch = /^\/runs\/([a-f0-9]+)(\/events)?$/.exec(p);
       if (method === "GET" && runMatch) {
