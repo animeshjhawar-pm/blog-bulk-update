@@ -10574,6 +10574,124 @@ export function startWebServer(port: number): void {
         return sendJson(res, 200, { ok: true });
       }
 
+      // Historic image counts per project — walks every recent run
+      // manifest, groups CSV rows by project_id, returns
+      // successful-image counts. Query with ?project_id=<uuid> to
+      // filter to one project, or omit for all.
+      //
+      // ?since=<iso> filters to runs started after a date, default
+      // is the full retention window (150 runs / 336h).
+      //
+      // ?detail=runs adds a per-run breakdown for each project;
+      // omit for just aggregate totals.
+      if (method === "GET" && p === "/stats/images-by-project") {
+        const projectFilter = url.searchParams.get("project_id");
+        const sinceParam = url.searchParams.get("since");
+        const wantRuns = url.searchParams.get("detail") === "runs";
+        const sinceMs = sinceParam ? Date.parse(sinceParam) : NaN;
+
+        const dir = runOutDir();
+        let names: string[];
+        try { names = await fs.readdir(dir); }
+        catch { return sendJson(res, 200, { by_project: {}, note: "runOutDir empty" }); }
+        const manifestNames = names.filter(
+          (n) => (n.startsWith("manifest-") || n.startsWith("manifest-upgen-")) && n.endsWith(".json"),
+        );
+
+        // { [project_id]: { project_name, total_completed, total_failed,
+        //                   runs: [{run_id, started_at, completed, failed, cost_usd}] } }
+        const acc = new Map<string, {
+          project_name: string;
+          total_completed: number;
+          total_failed: number;
+          total_cost_usd: number;
+          runs: Array<{
+            run_id: string; started_at: string;
+            completed: number; failed: number; cost_usd: number;
+            csv_path: string;
+          }>;
+        }>();
+
+        for (const n of manifestNames) {
+          try {
+            const raw = await fs.readFile(path.join(dir, n), "utf8");
+            const m = JSON.parse(raw) as {
+              run_id?: unknown; started_at?: unknown; csv?: unknown;
+              client?: unknown; client_name?: unknown; project_id?: unknown;
+            };
+            const runId = typeof m.run_id === "string" ? m.run_id : "";
+            const startedAt = typeof m.started_at === "string" ? m.started_at : "";
+            if (sinceParam && Number.isFinite(sinceMs)) {
+              const runStart = Date.parse(startedAt);
+              if (Number.isFinite(runStart) && runStart < sinceMs) continue;
+            }
+            const csvPath = await rehydrateManifestPath(m.csv);
+            if (!csvPath) continue;
+            const rows = await readRunCsvOrEmpty(csvPath);
+
+            // Group this run's rows by project_id — runs can span
+            // multiple projects (rare, but possible via multi-select).
+            const byProj = new Map<string, { name: string; completed: number; failed: number; cost: number }>();
+            for (const r of rows) {
+              const pid = (r.project_id ?? "").trim();
+              if (!pid) continue;
+              if (projectFilter && pid !== projectFilter) continue;
+              const bucket = byProj.get(pid) ?? {
+                name: typeof m.client_name === "string" ? m.client_name : "",
+                completed: 0, failed: 0, cost: 0,
+              };
+              if (r.status === "completed") bucket.completed++;
+              else if (r.status === "failed") bucket.failed++;
+              const c = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
+              if (Number.isFinite(c) && c > 0) bucket.cost += c;
+              byProj.set(pid, bucket);
+            }
+
+            for (const [pid, s] of byProj) {
+              const entry = acc.get(pid) ?? {
+                project_name: s.name,
+                total_completed: 0, total_failed: 0, total_cost_usd: 0,
+                runs: [],
+              };
+              entry.total_completed += s.completed;
+              entry.total_failed += s.failed;
+              entry.total_cost_usd += s.cost;
+              if (wantRuns) {
+                entry.runs.push({
+                  run_id: runId,
+                  started_at: startedAt,
+                  completed: s.completed,
+                  failed: s.failed,
+                  cost_usd: Math.round(s.cost * 10000) / 10000,
+                  csv_path: csvPath,
+                });
+              }
+              acc.set(pid, entry);
+            }
+          } catch { /* skip corrupt / unreadable manifest */ }
+        }
+
+        const by_project: Record<string, unknown> = {};
+        for (const [pid, entry] of acc) {
+          by_project[pid] = {
+            project_name: entry.project_name,
+            total_completed: entry.total_completed,
+            total_failed: entry.total_failed,
+            total_cost_usd: Math.round(entry.total_cost_usd * 10000) / 10000,
+            ...(wantRuns ? {
+              runs: entry.runs.sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? "")),
+            } : {}),
+          };
+        }
+        return sendJson(res, 200, {
+          window: {
+            since: sinceParam ?? null,
+            note: "Aggregates over run manifests currently on the volume. Retention bounds this to 150 runs / 336h by default.",
+          },
+          by_project,
+        });
+      }
+
       // Diagnostic for ops: "is anything mid-run right now?" Deploys
       // during in-flight runs SIGTERM the subprocess; reconciliation
       // is automatic but adds 2-10 min of resume delay. Curl this
