@@ -4974,21 +4974,46 @@ function m_safe(s: string): string { return s; }
  * single atomic PUT. Body: { run_id, cluster_id, dry_run }.
  */
 async function applyClusterHandler(req: IncomingMessage, res: ServerResponse) {
-  const body = (await readApplyBody(req)) as { run_id?: string; cluster_id?: string; dry_run?: boolean } | null;
+  const body = (await readApplyBody(req)) as {
+    run_id?: string;
+    cluster_id?: string;
+    // Optional: restrict the apply to just this subset of the
+    // cluster's images. Bulk-apply groups cards by cluster and
+    // passes only the SELECTED image_ids, so a deselected image in
+    // an otherwise-applied cluster is preserved. If omitted, the
+    // handler applies every image in the cluster (legacy behaviour
+    // for the "Upload + Repoint this cluster" per-cluster button).
+    image_ids?: string[];
+    dry_run?: boolean;
+  } | null;
   if (!body) return sendJson(res, 400, { error: "invalid JSON body" });
   const runId = body.run_id ?? "";
   const clusterId = body.cluster_id ?? "";
   const dryRun = body.dry_run === true;
+  const imageIdsFilter = Array.isArray(body.image_ids)
+    ? new Set(body.image_ids.filter((x): x is string => typeof x === "string" && x.length > 0))
+    : null;
   if (!runId || !clusterId) return sendJson(res, 400, { error: "run_id and cluster_id required" });
   const tk = requireApiToken(req);
   if (!tk.ok) return sendJson(res, 400, { error: tk.error });
 
   const r = await resolveRunRows(runId);
   if ("error" in r) return sendJson(res, r.code, { error: r.error });
-  const scope = r.rows.filter((x) => x.cluster_id === clusterId);
-  if (scope.length === 0)
-    return sendJson(res, 404, { error: `no rows for cluster ${clusterId} in run ${runId}` });
-  return runRepointPipeline(req, res, scope, dryRun, `cluster ${clusterId}`, runId);
+  const clusterRows = r.rows.filter((x) => x.cluster_id === clusterId);
+  const scope = imageIdsFilter
+    ? clusterRows.filter((x) => imageIdsFilter.has(x.image_id))
+    : clusterRows;
+  if (scope.length === 0) {
+    return sendJson(res, 404, {
+      error: imageIdsFilter
+        ? `no rows matching image_ids filter (${imageIdsFilter.size} requested) in cluster ${clusterId}`
+        : `no rows for cluster ${clusterId} in run ${runId}`,
+    });
+  }
+  const label = imageIdsFilter
+    ? `cluster ${clusterId} (${scope.length}/${clusterRows.length} image(s))`
+    : `cluster ${clusterId}`;
+  return runRepointPipeline(req, res, scope, dryRun, label, runId);
 }
 
 /**
@@ -8032,32 +8057,91 @@ async function applyAllPicked() {
   const btn = document.getElementById('apply-all-btn');
   const origLabel = btn ? btn.textContent : '';
   try {
-    // Iterate CARDS (not just image_ids) so each card's cluster_id
-    // rides along. Shared image_ids across clusters used to dedupe
-    // down to one id here, which caused one card click to cascade
-    // into N apply attempts on the server. Now each card becomes its
-    // own narrowly-scoped apply.
-    const cards = pickedCards
+    // Filter to genuinely-applicable cards (drop synthetic, unsupported,
+    // upload-mode-with-no-file, already-applied, currently-applying).
+    const applicableCards = pickedCards
       .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
       .filter((c) => !(c.dataset.upload === '1' && c.dataset.needsFile === '1'))
       .filter((c) => {
         const s = stateOf.get(c.dataset.imageId) ?? 'pending';
         return s !== 'applied' && s !== 'applying';
       });
-    // Bounded pool — see BULK_APPLY_CONCURRENCY. Before this, the map
-    // fed straight into Promise.allSettled and every card fired
-    // in parallel; prod RCA showed 25 selected → 25 concurrent hits
-    // to Gushwork's processMedia. With BULK_APPLY_CONCURRENCY=4 the
-    // ceiling on outbound bursts is 4 regardless of selection size.
-    const { failed } = await runWithConcurrency(
-      cards,
-      (c) => applyOne(c.dataset.imageId, { bulk: true, card: c }),
+
+    // GROUP BY CLUSTER — one PUT per cluster covering all its picked
+    // images, not one PUT per image. Before this fix, the bulk pool
+    // fired /api/apply/image once per card. When a cluster had N
+    // picked images we did N concurrent PUTs against the same
+    // cluster's page_info, and the reads-modify-writes RACED: each
+    // PUT read the same starting state, mutated its 1 image, wrote
+    // back — whichever PUT landed last overwrote the others'
+    // changes. Result: "8 of 10 apply, 2 miss" reports from ops.
+    // Now each cluster gets ONE PUT with ALL its picked swaps,
+    // atomic to Gushwork's /file endpoint. Uploads are still
+    // per-image inside the pipeline (each image needs its own
+    // media_registry row), but repoint collapses to one PUT.
+    const byCluster = new Map();
+    const cardByImageId = new Map();
+    for (const c of applicableCards) {
+      const cid = c.dataset.clusterId;
+      const iid = c.dataset.imageId;
+      if (!cid || !iid) continue;
+      cardByImageId.set(iid, c);
+      let bucket = byCluster.get(cid);
+      if (!bucket) { bucket = []; byCluster.set(cid, bucket); }
+      bucket.push(iid);
+    }
+    const clusters = [...byCluster.entries()]; // [clusterId, imageIds[]][]
+
+    // Paint applying-state per card BEFORE fanning out so operators
+    // see the whole selection change at once. Each cluster call
+    // updates its own cards' states on completion.
+    for (const c of applicableCards) {
+      const iid = c.dataset.imageId;
+      if (iid) { stateOf.set(iid, 'applying'); paintCard(iid, { clusterId: c.dataset.clusterId }); }
+    }
+
+    // Pool by CLUSTER, not by image — BULK_APPLY_CONCURRENCY governs
+    // concurrent PUTs to Gushwork's /file endpoint.
+    let failedClusters = 0;
+    let doneImages = 0;
+    const totalImages = applicableCards.length;
+    await runWithConcurrency(
+      clusters,
+      async ([clusterId, imageIds]) => {
+        try {
+          const r = await fetch('/api/apply/cluster', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              run_id: RUN_ID,
+              cluster_id: clusterId,
+              image_ids: imageIds,
+              dry_run: false,
+            }),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+          // Same reconciler applyCluster + applyRun use — iterates
+          // per-image results and paints each card by image_id_old.
+          if (Array.isArray(j.results)) applyServerResults(j.results, { dryRun: false });
+          doneImages += imageIds.length;
+        } catch (err) {
+          failedClusters++;
+          for (const iid of imageIds) {
+            stateOf.set(iid, 'failed');
+            paintCard(iid, { error: 'apply failed: ' + err.message });
+          }
+        }
+      },
       BULK_APPLY_CONCURRENCY,
       (done, total) => {
-        if (btn) btn.textContent = 'Applying ' + done + '/' + total + '…';
+        if (btn) btn.textContent = 'Applying ' + doneImages + '/' + totalImages + ' images (' + done + '/' + total + ' clusters)…';
       },
     );
-    if (failed > 0) alert(failed + ' of ' + cards.length + ' picked applies failed. Check the failed cards for details.');
+    if (failedClusters > 0) {
+      alert(failedClusters + ' of ' + clusters.length + ' cluster apply attempts failed. Check the failed cards for details.');
+    }
+    refreshTotals();
   } finally {
     if (btn) btn.textContent = origLabel || 'Upload + Repoint selected →';
     setApplyBusy(false);
