@@ -4,14 +4,34 @@ import { loadEnv } from "./env.js";
 
 export type Provider = "replicate" | "fal";
 
-// Recognise Replicate's global model rate-limit shape so we can escape
-// to fal.ai on the far side of Replicate's own retry budget. Same
-// classifier that replicate.ts uses internally — factored here so
-// generate.ts can see errors that have already exhausted all 8 of
-// replicate.ts's rate-limit retries.
+// The E003 shape specifically — Replicate telling us the model is
+// globally throttled. Distinct from generic infra flakiness because
+// the retry inside replicate.ts uses a longer schedule for this one.
 function isReplicateRateLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? "");
   return /ModelRateLimitError|\(E003\)|currently unavailable due to high demand/i.test(msg);
+}
+
+// Broader "Replicate is having a bad time, try the next layer"
+// classifier. Includes E003 PLUS the non-rate-limit infrastructure
+// errors ops actually see in the wild — connection resets, upstream
+// gateway timeouts, Cloudflare 5xx, and Replicate's own async pred
+// wrapper wrapping any of those in HTTPStatusError / ReadTimeout.
+//
+// The fallback chain in generate() only escapes to layer-2 /
+// fal.ai on rate-limit errors before this. Adding these shapes so
+// transient infra flakes (ops report: "8 of 10 apply, 2 miss") also
+// fall through instead of dying at the pro layer with a red X.
+function isReplicateTransientInfraError(err: unknown): boolean {
+  if (isReplicateRateLimitError(err)) return true;
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  // Prefix guard so we don't accidentally fall back on genuine
+  // caller-side errors (missing prompt, auth 401, malformed input);
+  // only messages that came from Replicate's async prediction
+  // wrapper qualify. Replicate wraps upstream failures as
+  // "Async prediction failed: <type>: …" — that's the tell.
+  if (!/Async prediction failed|Replicate prediction failed|Replicate error/.test(msg)) return false;
+  return /HTTPStatusError|ReadTimeout|ConnectTimeout|ECONNRESET|ETIMEDOUT|Client error '499|Client error '502|Client error '503|Client error '504|Server error '5\d\d/i.test(msg);
 }
 
 export interface GenerateParams {
@@ -92,7 +112,7 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
       predictionId: r.prediction_id,
     };
   } catch (err) {
-    if (!isReplicateRateLimitError(err)) throw err;
+    if (!isReplicateTransientInfraError(err)) throw err;
 
     // Layer 2 — Replicate nano-banana-2. Replicate scopes E003 buckets
     // per model, so the pro throttle usually doesn't apply to -2. Same
@@ -118,7 +138,7 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
         predictionId: r2.prediction_id,
       };
     } catch (err2) {
-      if (!isReplicateRateLimitError(err2) || !process.env.FAL_KEY) throw err2;
+      if (!isReplicateTransientInfraError(err2) || !process.env.FAL_KEY) throw err2;
 
       // Layer 3 — fal.ai nano-banana-pro. Different provider, only fires
       // when both Replicate models are throttled AND FAL_KEY is set.
