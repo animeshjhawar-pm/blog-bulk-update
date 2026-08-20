@@ -429,7 +429,7 @@ export async function repointMappingRows(
       limit(async () => {
         if (abortBox.err) return;
         try {
-          const oc = await repointCluster({
+          let oc = await repointCluster({
             clusterId,
             rows,
             opts: { ...opts, csvPath: "", apply: opts.apply },
@@ -437,6 +437,46 @@ export async function repointMappingRows(
             backupDir,
             previewDir,
           });
+          // Cluster-level auto-retry — one more shot after 30s if the
+          // cluster failed. Complementary to the PUT-attempt retry
+          // (per-attempt) and verify-backoff (per-cluster read window)
+          // that already live in repointCluster: THIS retry catches
+          // the "everything above genuinely gave up, but the next
+          // attempt 30s later succeeds" case (Gushwork briefly slow,
+          // stormbreaker DB replication catching up, network blip
+          // outside all inner retry windows). Skipped for non-apply
+          // (dry-run) and non-failed outcomes.
+          if (opts.apply && oc.status === "failed") {
+            process.stderr.write(
+              `[retry] cluster=${clusterId} :: cluster-level auto-retry after 30s (previous: ${oc.reason.slice(0, 120)})\n`,
+            );
+            await new Promise((r) => setTimeout(r, 30_000));
+            try {
+              const oc2 = await repointCluster({
+                clusterId,
+                rows,
+                opts: { ...opts, csvPath: "", apply: opts.apply },
+                base,
+                backupDir,
+                previewDir,
+              });
+              if (oc2.status === "applied" || oc2.status === "superseded") {
+                oc = oc2;
+                process.stderr.write(
+                  `[retry-recovered] cluster=${clusterId} :: cluster-level retry succeeded\n`,
+                );
+              } else {
+                oc = oc2;
+                process.stderr.write(
+                  `[retry-failed] cluster=${clusterId} :: ${oc2.reason.slice(0, 200)}\n`,
+                );
+              }
+            } catch (retryErr) {
+              process.stderr.write(
+                `[retry-crashed] cluster=${clusterId} :: ${(retryErr as Error).message}\n`,
+              );
+            }
+          }
           outcomes.push(oc);
           // Log every non-applied/non-dry-run outcome — those paths
           // (gate 1 skip, cluster-not-found, project mismatch) were

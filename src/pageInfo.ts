@@ -596,13 +596,37 @@ function mdxToRecords(
       source: "page_info.blog_text.md<Image>[0]" as ImageSource,
     };
   });
+  // Bump a per-process counter instead of logging one line per
+  // cluster. Every workspace render calls mdxToRecords N times (N ≈
+  // 100+ on a big project) — that used to emit 100+ log lines per
+  // page load. Now the counter is flushed via flushMdxRecordSummary()
+  // by the caller (workspace render-data path) at the end of the
+  // batch, yielding a single summary line like:
+  //   "mdxToRecords: description-from-context on N cluster(s) (M images)"
   if (derivedCount > 0) {
-    process.stderr.write(
-      `mdxToRecords: description from blog section context for ${derivedCount} inline ` +
-        `image(s) for cluster=${cluster.id}\n`,
-    );
+    mdxRecordSummary.clusters++;
+    mdxRecordSummary.images += derivedCount;
   }
   return records;
+}
+
+// Batch-summary state for the log-spam mitigation above. Shared
+// module-level so mdxToRecords can bump silently and the caller
+// can drain at end-of-request.
+const mdxRecordSummary = { clusters: 0, images: 0 };
+
+/** Emit the accumulated mdxToRecords batch summary and reset the
+ *  counter. Safe to call from any caller — no-op when nothing was
+ *  batched since the last drain. */
+export function flushMdxRecordSummary(context: string = ""): void {
+  const { clusters, images } = mdxRecordSummary;
+  if (clusters === 0) return;
+  mdxRecordSummary.clusters = 0;
+  mdxRecordSummary.images = 0;
+  const ctx = context ? ` (${context})` : "";
+  process.stderr.write(
+    `mdxToRecords: description-from-context on ${clusters} cluster(s) (${images} image(s))${ctx}\n`,
+  );
 }
 
 async function inlineRecordsForCluster(

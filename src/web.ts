@@ -22,7 +22,12 @@ import {
   type ProjectRow,
   type PageType,
 } from "./db.js";
-import { collectImageRecords, prefetchBlogMarkdowns, type ImageRecord } from "./pageInfo.js";
+import {
+  collectImageRecords,
+  prefetchBlogMarkdowns,
+  flushMdxRecordSummary,
+  type ImageRecord,
+} from "./pageInfo.js";
 import { pickLogoUrl } from "./regen.js";
 import { loadEnv } from "./env.js";
 import {
@@ -2249,6 +2254,11 @@ async function workspacePage(
     `workspace: render-data for ${clusters.length} clusters in ${Date.now() - t0}ms ` +
       `(prefetch ${tPrefetch - t0}ms, cache hits ${cacheHits}/${clusters.length})\n`,
   );
+  // Drain the mdxToRecords summary counter — a batch of collectImageRecords
+  // over N clusters would otherwise emit N lines (one per cluster).
+  // The summary line is scoped to the workspace context so grepping
+  // by workspace-render is straightforward.
+  flushMdxRecordSummary(`workspace render, ${clusters.length} clusters`);
   const recordsByCluster: Record<string, ImageRecord[]> = {};
   for (const r of allRecords) {
     if (!recordsByCluster[r.cluster.id]) recordsByCluster[r.cluster.id] = [];
@@ -6874,7 +6884,23 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
     </label>
     <div style="flex:1">
       <div style="font-weight:600;font-size:14px">${esc(g.topic || "(no topic)")}</div>
-      <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images</div>
+      <div class="sub"><code>${esc(clusterId)}</code> · ${g.rows.length} new images${(() => {
+        // Cluster-level cost + status pill inline in the sub line.
+        // Sums cost_usd across this cluster's rows and counts
+        // completed/failed for at-a-glance progress ("cluster is
+        // 3/5 done, spent $0.47").
+        let usd = 0, done = 0, fail = 0;
+        for (const r of g.rows) {
+          const c = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
+          if (Number.isFinite(c) && c > 0) usd += c;
+          if (r.status === "completed") done++;
+          else if (r.status === "failed") fail++;
+        }
+        const parts: string[] = [];
+        if (done > 0 || fail > 0) parts.push(`${done}/${g.rows.length} ready${fail > 0 ? `, ${fail} failed` : ""}`);
+        if (usd > 0) parts.push(esc(formatUsd(usd)));
+        return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
+      })()}</div>
     </div>
     <div class="cs-actions">
       ${publishedUrl ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Open the live page in a new tab">View current page →</a>` : ""}
@@ -7826,6 +7852,59 @@ async function applyAll() {
   refreshTotals();
 }
 
+// Pick-state persistence — sessionStorage keyed by runId + imageId.
+// Survives soft-navigation, tab-focus loss, hard-refresh — everything
+// short of closing the tab. Records only DESELECTIONS: the default
+// on every card is checked, so storing "unpicked" is compact and
+// makes it easy to detect "operator has explicitly touched picks
+// on this run" by set size > 0.
+const PICK_STATE_KEY = 'imgtool.picks.' + (typeof RUN_ID !== 'undefined' ? RUN_ID : 'no-run');
+function loadPickState() {
+  try {
+    const raw = sessionStorage.getItem(PICK_STATE_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch { return new Set(); }
+}
+function savePickState(deselected) {
+  try {
+    sessionStorage.setItem(PICK_STATE_KEY, JSON.stringify([...deselected]));
+  } catch { /* quota / disabled — nothing to fall back to */ }
+}
+function collectDeselected() {
+  const out = new Set();
+  for (const cb of document.querySelectorAll('.rc-pick-cb')) {
+    if (cb.disabled) continue;
+    const card = cb.closest('.result-card');
+    const id = card && card.dataset ? card.dataset.imageId : null;
+    if (id && !cb.checked) out.add(id);
+  }
+  return out;
+}
+function applyPickState() {
+  const desel = loadPickState();
+  if (desel.size === 0) return;
+  for (const cb of document.querySelectorAll('.rc-pick-cb')) {
+    if (cb.disabled) continue;
+    const card = cb.closest('.result-card');
+    const id = card && card.dataset ? card.dataset.imageId : null;
+    if (id && desel.has(id)) cb.checked = false;
+  }
+  // Re-sync cluster + all checkboxes to reflect restored state.
+  for (const cb of document.querySelectorAll('.cs-pick-cb')) {
+    const cid = cb.getAttribute('onchange');
+    const m = cid && cid.match(/onClusterPick\(this,\s*'([^']+)'\)/);
+    if (m && m[1]) syncClusterPickFor(m[1]);
+  }
+  syncAllPick();
+  refreshPickedCount();
+}
+// Restore ONCE at first-paint idle so all cards are in the DOM.
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', () => setTimeout(applyPickState, 0));
+}
+
 // Per-image / per-cluster / all checkbox tree on the runs page. Synthetic
 // cards have their checkbox disabled, but they still count toward
 // cluster/all "checked" rendering — we filter them at apply time.
@@ -7835,6 +7914,7 @@ function onCardPick(cb) {
   syncClusterPickFor(card.dataset.clusterId);
   syncAllPick();
   refreshPickedCount();
+  savePickState(collectDeselected());
 }
 function onClusterPick(cb, clusterId) {
   const cards = document.querySelectorAll('.result-card[data-cluster-id="' + CSS.escape(clusterId) + '"]');
@@ -7845,6 +7925,7 @@ function onClusterPick(cb, clusterId) {
   }
   syncAllPick();
   refreshPickedCount();
+  savePickState(collectDeselected());
 }
 function onAllPick(cb) {
   for (const x of document.querySelectorAll('.rc-pick-cb')) {
@@ -7855,6 +7936,7 @@ function onAllPick(cb) {
     x.indeterminate = false;
   }
   refreshPickedCount();
+  savePickState(collectDeselected());
 }
 function syncClusterPickFor(clusterId) {
   if (!clusterId) return;
