@@ -134,20 +134,28 @@ const MAX_RETRIES   = 3;
 // 30s, doubled per attempt, ±20% jitter) with a bigger retry budget.
 // Jitter prevents two concurrent operators from retrying on the same
 // tick and thundering-herding Replicate at the moment it opens up.
-// Retry budget for E003 rate-limits. Tightened 8 → 3 after ops
-// reported single-image runs taking 10+ min during Replicate's
-// sustained global throttle windows: even with layer-2 nano-banana-2
-// and fal.ai fallback available in generate.ts, images were burning
-// through nano-banana-pro's full 8-attempt retry budget (~42 min
-// worst-case) before falling through. 3 attempts gives ~4 min max
-// per layer, so an image that Replicate genuinely can't serve
-// spills to layer-2 nano-banana-2 within minutes; if that also
-// throttles, it lands on fal within another few minutes. Total
-// worst-case across all three layers: ~15 min instead of ~90+.
-// generate.ts's layer chain (see src/generate.ts) is what makes
-// this budget cut safe — a lower budget without the fallback would
-// just fail more; with the fallback, it just falls through faster.
-const RATE_LIMIT_MAX_RETRIES = 3;
+// Retry budget for E003 rate-limits. Middle-ground default of 6 —
+// enough to ride out a typical 3-5 min Replicate throttle spike and
+// keep the image on nano-banana-pro (style-consistent primary), but
+// not so long that a full-day throttle wastes 40+ min per image.
+//
+// Trade-off:
+//   lower N  → images fall through to layer-2 nano-banana-2 faster,
+//              which uses a different model and produces a subtly
+//              different aesthetic (ops noticed this after the 8→3
+//              cut and reported "images look different than before")
+//   higher N → primary stays on pro, style is consistent, but during
+//              sustained throttles a single image can take 20+ min
+//
+// Env-tunable via E003_MAX_RETRIES so we can dial per-outage without
+// redeploying:
+//   E003_MAX_RETRIES=3   fast fallback (previous default)
+//   E003_MAX_RETRIES=6   middle ground (current default)
+//   E003_MAX_RETRIES=8   original — favours style consistency over speed
+const RATE_LIMIT_MAX_RETRIES = (() => {
+  const v = Number.parseInt(process.env.E003_MAX_RETRIES ?? "", 10);
+  return Number.isFinite(v) && v > 0 && v <= 12 ? v : 6;
+})();
 const RATE_LIMIT_BASE_DELAY_MS = 30_000;
 // Individual sleep cap. Even with a smaller retry budget, keep the
 // per-sleep cap so a single attempt can't blow past a reasonable

@@ -8770,24 +8770,46 @@ es.addEventListener('end', (ev) => {
 es.onerror = () => {};
 `}
 
-// Auto-refresh watchdog — covers cases where the page state on disk
-// changes without the current tab knowing:
-//   * container restart kills the subprocess mid-run → reconciliation
-//     later patches missing rows into the parent CSV
-//   * a per-image Regenerate spawned a child that finished
-//   * another operator applied cards from a different tab
-//
-// Polls a tiny /mtime endpoint every 15s; when the CSV mtime advances
-// past what this tab rendered from, reload silently. No SSE needed
-// (SSE dies with the subprocess anyway), and it handles the
-// done=true case the SSE block above intentionally skips.
+// Background-change watchdog — same detection as the previous
+// auto-reloader, but no forced reload. Silent reload was too
+// destructive: it wiped operator state (checkbox deselections,
+// in-flight file picker dialogs, custom instructions). Now we
+// surface a click-to-refresh banner so the operator decides when
+// to give up local state. Watchdog fires on:
+//   * container restart mid-run → reconciliation completes → CSV
+//     grows → banner appears
+//   * per-image Regenerate child completes → banner appears
+//   * another operator's Apply mutated status columns → banner
 (function () {
   const RUN_ID_FOR_WATCH = ${JSON.stringify(id)};
   const POLL_INTERVAL_MS = 15000;
   let baselineMtime = null;
   let inFlight = false;
+  let bannerShown = false;
+
+  function showBanner() {
+    if (bannerShown) return;
+    bannerShown = true;
+    const bar = document.createElement('div');
+    bar.setAttribute('role', 'status');
+    bar.style.cssText =
+      'position:fixed;left:50%;transform:translateX(-50%);bottom:88px;' +
+      'z-index:9999;background:#1e293b;color:#fff;padding:10px 18px;' +
+      'border-radius:999px;font:600 13px -apple-system,system-ui,sans-serif;' +
+      'box-shadow:0 8px 24px rgba(0,0,0,.25);display:flex;gap:10px;align-items:center;';
+    bar.innerHTML =
+      '<span>New updates on this run</span>' +
+      '<button style="background:#6366f1;color:#fff;border:0;padding:6px 12px;' +
+      'border-radius:999px;font:inherit;cursor:pointer" ' +
+      'onclick="window.location.reload()">Refresh</button>' +
+      '<button style="background:transparent;color:#94a3b8;border:0;padding:6px 8px;' +
+      'font:inherit;cursor:pointer" title="Dismiss" ' +
+      'onclick="this.parentElement.remove()">×</button>';
+    document.body.appendChild(bar);
+  }
+
   async function poll() {
-    if (inFlight) return;
+    if (inFlight || bannerShown) return;
     inFlight = true;
     try {
       const r = await fetch('/runs/' + encodeURIComponent(RUN_ID_FOR_WATCH) + '/mtime', {
@@ -8796,21 +8818,12 @@ es.onerror = () => {};
       if (!r.ok) return;
       const { csv_mtime_ms } = await r.json();
       if (baselineMtime == null) { baselineMtime = csv_mtime_ms; return; }
-      if (csv_mtime_ms && csv_mtime_ms > baselineMtime) {
-        // Silent reload — no confirm, no flash; operator just sees the
-        // new cards appear as if they were always there. Timers etc.
-        // are all state we don't try to preserve.
-        window.location.reload();
-      }
+      if (csv_mtime_ms && csv_mtime_ms > baselineMtime) showBanner();
     } catch { /* transient network — try again next tick */ }
     finally { inFlight = false; }
   }
   setInterval(poll, POLL_INTERVAL_MS);
-  // Also poll immediately when the tab regains focus — operator
-  // switching back from Slack expects to see the latest state.
   window.addEventListener('focus', poll);
-  // First poll AFTER a small delay so we don't race the initial
-  // page-render mtime read on the server.
   setTimeout(poll, 2000);
 })();
 </script>`));
