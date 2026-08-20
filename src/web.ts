@@ -8111,7 +8111,14 @@ async function applyAllPicked() {
         try {
           const r = await fetch('/api/apply/cluster', {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            // authHeader() attaches the operator's bearer token from
+            // sessionStorage — same pattern every other apply call
+            // uses. Missing this header trips requireApiToken on the
+            // server → "no bearer token set" even when the operator
+            // clearly set it via the token panel. Ops report on
+            // 2026-08-21 traced back to me shipping this call
+            // without authHeader in 97e0a38 — regression fixed here.
+            headers: Object.assign({ 'content-type': 'application/json' }, authHeader()),
             body: JSON.stringify({
               run_id: RUN_ID,
               cluster_id: clusterId,
