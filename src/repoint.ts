@@ -286,39 +286,85 @@ async function repointCluster(args: {
   //
   // Writer: `/file` PUT only. It is the platform publish surface and
   // the only path allowed to mutate page_info from this tool.
+  // Verify with a short retry window — Gushwork's write to the
+  // stormbreaker DB isn't always synchronous with the PUT response.
+  // Ops saw "8 of 10 apply, 2 miss" where the PUT returned 200 but
+  // the immediate re-read of page_info didn't have our new UUIDs.
+  // Waiting up to 6s (12 × 500ms) with an eager first attempt bridges
+  // the gap without slowing the happy path.
   const verifyApplied = async (): Promise<boolean> => {
-    const fresh = await getClusterForApply(clusterId);
-    if (!fresh || !fresh.page_info) return false;
-    const live = JSON.stringify(fresh.page_info);
-    for (const p of pairs) {
-      if (p.old !== p.neu && live.includes(p.old)) return false; // old survived
-      if (!live.includes(p.neu)) return false;                   // new missing
+    const VERIFY_MAX_ATTEMPTS = 12;
+    const VERIFY_INTERVAL_MS = 500;
+    for (let attempt = 1; attempt <= VERIFY_MAX_ATTEMPTS; attempt++) {
+      const fresh = await getClusterForApply(clusterId);
+      if (fresh?.page_info) {
+        const live = JSON.stringify(fresh.page_info);
+        let allPresent = true;
+        for (const p of pairs) {
+          if (p.old !== p.neu && live.includes(p.old)) { allPresent = false; break; }
+          if (!live.includes(p.neu)) { allPresent = false; break; }
+        }
+        if (allPresent) return true;
+      }
+      if (attempt < VERIFY_MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, VERIFY_INTERVAL_MS));
+      }
     }
-    return true;
+    return false;
   };
 
+  // PUT with timeout + retry on transient network / 5xx errors.
+  // Previously: unbounded default fetch timeout + zero retries; one
+  // hiccup and the cluster was marked failed even though a second
+  // attempt would have succeeded. Now: 30s per attempt, 3 tries with
+  // 1s/2s/4s backoff, only retrying on network errors + 5xx (4xx auth
+  // / validation errors stop immediately — retrying them doesn't help).
+  const PUT_MAX_ATTEMPTS = 3;
+  const PUT_TIMEOUT_MS = 30_000;
+  const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
   let putNote = "";
-  try {
-    const resp = await fetch(`${base}/${projectId}/file`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${opts.token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        file_id: clusterId,
-        type: "PAGE",
-        file_type: "page_info",
-        file_content: reparsed,
-      }),
-    });
-    const bodyText = (await resp.text()).slice(0, 300);
-    putNote = `PUT /file HTTP ${resp.status}${bodyText ? ` ${bodyText}` : ""}`;
-  } catch (err) {
-    putNote = `PUT /file threw: ${err instanceof Error ? err.message : String(err)}`;
+  let putSucceeded = false;
+  for (let attempt = 1; attempt <= PUT_MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), PUT_TIMEOUT_MS);
+    try {
+      const resp = await fetch(`${base}/${projectId}/file`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: clusterId,
+          type: "PAGE",
+          file_type: "page_info",
+          file_content: reparsed,
+        }),
+        signal: controller.signal,
+      });
+      const bodyText = (await resp.text()).slice(0, 300);
+      putNote = `PUT /file HTTP ${resp.status}${bodyText ? ` ${bodyText}` : ""}${attempt > 1 ? ` (attempt ${attempt}/${PUT_MAX_ATTEMPTS})` : ""}`;
+      if (resp.ok) { putSucceeded = true; break; }
+      // 4xx (auth, validation) never retry — burning attempts on a
+      // client error just delays the operator's actual fix.
+      if (!RETRYABLE_STATUS.has(resp.status)) break;
+      if (attempt < PUT_MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      putNote = `PUT /file threw: ${msg} (attempt ${attempt}/${PUT_MAX_ATTEMPTS})`;
+      if (attempt < PUT_MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
+      }
+    } finally {
+      clearTimeout(to);
+    }
   }
 
-  // Verify the PUT actually persisted.
+  // Even when PUT returned a non-2xx, verify anyway — Gushwork
+  // occasionally returns 500 with the write actually persisted.
+  // The DB is the source of truth; if it has our UUIDs, we're good.
   if (await verifyApplied()) {
     out.status = "applied";
     out.reason = `applied via /file PUT — ${out.replacements} occurrence(s) repointed: ${perPair}`;
@@ -330,7 +376,8 @@ async function repointCluster(args: {
 
   out.reason =
     `page_info write did not verify after ${putNote}. ` +
-    `No direct DB fallback was attempted; /file is the only allowed publish path. ` +
+    `Verified across ${putSucceeded ? "1" : PUT_MAX_ATTEMPTS} PUT attempt(s) + 12 read-back tries over 6s. ` +
+    `No direct DB fallback attempted; /file is the only allowed publish path. ` +
     `Nothing reliable can be reported as applied.`;
   process.stderr.write(`[failed] cluster=${clusterId} client=${clientSlug} :: ${out.reason}\n`);
   return out;
