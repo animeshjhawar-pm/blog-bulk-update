@@ -311,7 +311,10 @@ program
   .option("--base-url <url>", "override the API base (default: prod seo-v2 project base)")
   .option("--no-refine", "send refine=false to the presign call (default: refine=true)")
   .option("--fail-fast", "abort the whole run on the first row failure (default: record + continue)", false)
-  .option("--concurrency <n>", "parallel uploads", "4")
+  // Bumped 4 → 8 to halve wall-clock on big applies. Gushwork's
+  // media API handles this comfortably; PUT retry + verify-backoff
+  // (added in 1b39360) absorb any per-request flakes.
+  .option("--concurrency <n>", "parallel uploads", "8")
   .action(
     async (opts: {
       csv: string;
@@ -360,7 +363,9 @@ program
   .option("--out <path>", "report CSV output path (default: alongside the input CSV)")
   .option("--base-url <url>", "override the API base (default: prod seo-v2 project base)")
   .option("--fail-fast", "abort the whole run on the first skipped/failed cluster", false)
-  .option("--concurrency <n>", "parallel clusters", "4")
+  // Bumped 4 → 8. Each cluster is one PUT to Gushwork /file + one
+  // DB verify read; both are fast and Gushwork handles the parallelism.
+  .option("--concurrency <n>", "parallel clusters", "8")
   .action(
     async (opts: {
       csv: string;

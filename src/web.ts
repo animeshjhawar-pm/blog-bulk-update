@@ -7014,7 +7014,8 @@ ${stage === "prepare" ? `
     <a class="btn" id="download-all-btn" href="/runs/${esc(id)}/download.zip" title="Stream a ZIP of every generated image, organised by cluster topic. Images are not re-encoded." download>⬇ Download all (ZIP)</a>
     <span id="tok-chip" title="Bearer token used for upload + repoint. Pasted here, held in server memory until it expires (~1h) or the process restarts." style="font:12px/1 ui-sans-serif,system-ui;padding:6px 10px;border:1px solid var(--border);border-radius:6px;color:#a33;">🔑 no token</span>
     <button id="tok-set-btn" onclick="setToken()" title="Paste a fresh bearer token from https://platform.gushwork.ai/api/auth/token">🔑 Set token</button>
-    ${state.mode === "upload" ? "" : `<button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>`}
+    ${state.mode === "upload" ? "" : `<button id="regen-all-btn" onclick="regenAllPicked()" title="Re-roll every selected image in parallel">↻ Regenerate selected</button>
+    <button id="regen-failed-btn" onclick="regenAllFailed()" title="Re-roll ONLY the cards currently marked failed (skip completed + pending)" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d">↻ Regenerate failed</button>`}
     <button id="revert-all-btn" onclick="revertRun()" title="Restore EVERY cluster in this run from its latest repoint backup. Dry-run previews; each current state is snapshotted first.">↩ Revert run</button>
     <button class="primary" id="apply-all-btn" onclick="applyAllPicked()">Upload + Repoint selected →</button>
   </div>
@@ -8173,6 +8174,39 @@ async function regenAllPicked() {
     );
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate selected'; }
+  }
+}
+
+// One-click bulk regenerate for every card currently in the "failed"
+// state. Bypasses the checkbox scope (operator was staring at 5 red
+// cards on a bad-throttle day — they don't want to first check
+// every red checkbox, then click Regenerate; they want ONE click).
+async function regenAllFailed() {
+  const failed = [];
+  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+    if (card.dataset.state !== 'failed') continue;
+    const id = card.dataset.imageId;
+    if (!id) continue;
+    failed.push(id);
+  }
+  if (failed.length === 0) {
+    alert('No failed cards on this run.');
+    return;
+  }
+  if (!confirm('Regenerate ' + failed.length + ' failed card' + (failed.length === 1 ? '' : 's') + '?')) return;
+  const btn = document.getElementById('regen-failed-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating 0/' + failed.length + '…'; }
+  try {
+    await runWithConcurrency(
+      failed,
+      (id) => regenOne(id),
+      BULK_APPLY_CONCURRENCY,
+      (done, total) => {
+        if (btn) btn.innerHTML = '<span class="spinner"></span> Regenerating ' + done + '/' + total + '…';
+      },
+    );
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate failed'; }
   }
 }
 

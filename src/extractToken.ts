@@ -108,6 +108,26 @@ export interface ResolveTokenParams {
  * every regen for the 2 projects missing a token, when the correct
  * fix is to backfill the DB row once.
  */
+// In-memory cache for the DB layer of graphic_token lookups. Ops
+// scenarios that hit this: a big batch run finishes → operator
+// immediately kicks off per-image Regenerates on a few cards → each
+// child subprocess would otherwise re-hit stormbreaker for the SAME
+// graphic_token bytes it just used. 5-min TTL is long enough to
+// cover the "iterate on the run" window but short enough that a
+// backfill update lands within the same coffee break.
+//
+// Operator overrides (loadOperatorToken) are NOT cached — those are
+// meant to reflect edits made in the workspace UI in real time.
+const DB_TOKEN_CACHE = new Map<string, { token: unknown; cachedAt: number }>();
+const DB_TOKEN_TTL_MS = 5 * 60_000;
+
+/** Invalidate the DB token cache for a project — call after any
+ *  workspace action that changes what the DB would return. Safe
+ *  to call even when the entry is absent. */
+export function invalidateGraphicTokenCache(projectId: string): void {
+  DB_TOKEN_CACHE.delete(projectId);
+}
+
 export async function resolveGraphicToken(
   params: ResolveTokenParams,
 ): Promise<{ token: GraphicToken; source: TokenSource }> {
@@ -126,10 +146,20 @@ export async function resolveGraphicToken(
     );
   }
 
-  // 2. DB.
+  // 2. DB — with a short-TTL cache to spare stormbreaker on rapid
+  // regen churn (one operator iterating on a run in the workspace
+  // can otherwise fire N identical DB reads back-to-back).
+  const cached = DB_TOKEN_CACHE.get(params.projectId);
+  if (cached && Date.now() - cached.cachedAt < DB_TOKEN_TTL_MS) {
+    process.stderr.write(
+      `regen: graphic_token=db-cached (${params.projectId})\n`,
+    );
+    return { token: cached.token as GraphicToken, source: "db" };
+  }
   try {
     const fromDb = await lookupProjectGraphicToken(params.projectId);
     if (fromDb) {
+      DB_TOKEN_CACHE.set(params.projectId, { token: fromDb, cachedAt: Date.now() });
       process.stderr.write(
         `regen: graphic_token=db (projects.graphic_token for ${params.projectId})\n`,
       );
