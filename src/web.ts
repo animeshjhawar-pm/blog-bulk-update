@@ -389,21 +389,59 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 
   /* Tables */
   table { width: 100%; border-collapse: collapse; }
-  table.cluster-list th, table.cluster-list td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
+  table.cluster-list th, table.cluster-list td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
   table.cluster-list th { background: #f8fafc; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-muted); position: sticky; top: 49px; z-index: 5; }
   table.cluster-list tr.row-hidden { display: none; }
   table.cluster-list tr.row-matched { background: #fefce8; }
   table.cluster-list tr:hover { background: #f8fafc; }
-  table.cluster-list td.topic { max-width: 360px; }
+  table.cluster-list td.topic { max-width: 420px; }
   table.cluster-list td.topic .t { font-weight: 500; line-height: 1.35; }
-  table.cluster-list td.topic .cid { font-size: 10.5px; color: var(--ink-muted); margin-top: 2px; word-break: break-all; }
+  table.cluster-list td.topic .cid { font-size: 11px; color: var(--ink-muted); margin-top: 4px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  table.cluster-list td.topic .cid code { font-size: 10.5px; padding: 1px 5px; background: #f1f5f9; border-radius: 3px; }
   table.cluster-list td.preview img,
   table.cluster-list td.preview .placeholder { object-fit: cover; border-radius: 4px; border: 1px solid var(--border); display: block; background: #f1f5f9; }
   table.cluster-list td.preview .placeholder { border-style: dashed; background: #f8fafc; border-color: var(--border-strong); }
-  /* Aspect-ratio variants — width fixed, height computed. */
-  table.cluster-list td.preview .ar-16x9 { width: 64px; height: 36px; }
-  table.cluster-list td.preview .ar-1x1  { width: 48px; height: 48px; }
+  /* Aspect-ratio variants — width fixed, height computed. Bumped
+     from 64/48 to 80/56 so the thumbnail is legible without hovering. */
+  table.cluster-list td.preview .ar-16x9 { width: 80px; height: 45px; }
+  table.cluster-list td.preview .ar-1x1  { width: 56px; height: 56px; }
   table.cluster-list td.types .pills-wrap { display: flex; flex-wrap: wrap; gap: 3px; }
+  /* Action column: reserve enough width so the button never wraps. */
+  table.cluster-list td.actions { width: 1%; white-space: nowrap; text-align: right; }
+  table.cluster-list td.actions .btn { white-space: nowrap; }
+
+  /* Custom UI select — replaces <select> so the popup matches the
+     app's design (no OS-native dark tooltip). Behaves like a native
+     select: click to open, click again to close, click outside to
+     dismiss, ESC to close. */
+  .ui-select { position: relative; display: inline-block; }
+  .ui-select-btn {
+    font: inherit; font-size: 12.5px; padding: 5px 10px;
+    background: #fff; border: 1px solid var(--border-strong); border-radius: 6px;
+    color: var(--ink); cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+    min-width: 220px; justify-content: space-between;
+  }
+  .ui-select-btn:hover { background: #f9fafb; }
+  .ui-select[data-open="1"] .ui-select-btn { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12); }
+  .ui-select-caret { font-size: 10px; color: var(--ink-muted); transition: transform .15s; }
+  .ui-select[data-open="1"] .ui-select-caret { transform: rotate(180deg); }
+  .ui-select-menu {
+    display: none; position: absolute; top: calc(100% + 4px); right: 0;
+    background: #fff; border: 1px solid var(--border-strong); border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(15, 23, 42, .10);
+    list-style: none; padding: 4px; margin: 0; z-index: 100;
+    min-width: 100%;
+  }
+  .ui-select[data-open="1"] .ui-select-menu { display: block; }
+  .ui-select-menu li {
+    padding: 8px 12px; border-radius: 4px; cursor: pointer;
+    font-size: 13px; color: var(--ink); white-space: nowrap;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .ui-select-menu li:hover { background: #f1f5f9; }
+  .ui-select-menu li[aria-selected="true"] { color: var(--brand); font-weight: 500; }
+  .ui-select-menu li[aria-selected="true"]::before { content: "✓"; color: var(--brand); }
+  .ui-select-menu li:not([aria-selected="true"])::before { content: ""; width: 12px; }
 
   /* Recent-runs table — dedicated tweaks on top of the .cluster-list
      base styles. Tabular nums for the numeric columns; a slightly
@@ -2336,15 +2374,15 @@ async function workspacePage(
   </td>
   <td class="preview">${cover}</td>
   <td class="types"><div class="pills-wrap">${pills}</div></td>
-  <td style="text-align:right" onclick="event.stopPropagation()">
+  <td class="actions" onclick="event.stopPropagation()">
     ${publishedUrl
       ? (c.page_status === "PUBLISHED"
-          ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View current page →</a>`
+          ? `<a class="btn btn-published" href="${esc(publishedUrl)}" target="_blank" rel="noopener">View page →</a>`
           // GENERATED clusters resolve to a URL but the page isn't actually
           // live yet — visiting it returns 404. Keep the link so the
           // operator can confirm that for themselves if needed, but
           // re-label it so they aren't promised a working page.
-          : `<a class="btn" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Page not published yet — this URL will 404 until Stormbreaker pushes it live.">Preview URL ↗</a>`)
+          : `<a class="btn" href="${esc(publishedUrl)}" target="_blank" rel="noopener" title="Page not published yet — this URL will 404 until Stormbreaker pushes it live.">Preview ↗</a>`)
       : `<span class="sub" style="font-size:11px">no slug</span>`}
   </td>
 </tr>`;
@@ -2633,11 +2671,17 @@ async function saveToken(e) {
       <label for="all-clusters">Select all (visible)</label>
     </div>
     <div class="check-row" style="flex:0 0 auto;gap:6px">
-      <label for="cluster-sort" style="font-size:12px;color:var(--muted)">Sort:</label>
-      <select id="cluster-sort" class="select-compact" onchange="onSortChange(this.value)">
-        <option value="created"${sortBy === "created" ? " selected" : ""}>Created date (newest first)</option>
-        <option value="modified"${sortBy === "modified" ? " selected" : ""}>Last modified (newest first)</option>
-      </select>
+      <span style="font-size:12px;color:var(--muted)">Sort:</span>
+      <div class="ui-select" data-value="${sortBy}">
+        <button type="button" class="ui-select-btn" onclick="uiSelectToggle(this)" aria-haspopup="listbox">
+          <span class="ui-select-label">${sortBy === "modified" ? "Last modified (newest first)" : "Created date (newest first)"}</span>
+          <span class="ui-select-caret" aria-hidden="true">▾</span>
+        </button>
+        <ul class="ui-select-menu" role="listbox">
+          <li role="option" data-value="created"${sortBy === "created" ? ' aria-selected="true"' : ""} onclick="uiSelectPick(this, 'onSortChange')">Created date (newest first)</li>
+          <li role="option" data-value="modified"${sortBy === "modified" ? ' aria-selected="true"' : ""} onclick="uiSelectPick(this, 'onSortChange')">Last modified (newest first)</li>
+        </ul>
+      </div>
     </div>
     <div class="meta" style="flex:0 0 auto">Showing <strong id="visible-count">${clusters.length}</strong> / ${clusters.length}</div>
   </div>
@@ -3023,6 +3067,44 @@ function onSortChange(val) {
   u.searchParams.set('sort', v);
   window.location.href = u.toString();
 }
+
+// Custom UI select — click to open, ESC / outside-click to close.
+// Handler is bound to the trigger button; picks call back via
+// window[dispatchName] for consistency with the old <select> onchange.
+function uiSelectToggle(btn) {
+  const wrap = btn.closest('.ui-select');
+  if (!wrap) return;
+  const wasOpen = wrap.dataset.open === '1';
+  // Close any other open selects first — one at a time.
+  document.querySelectorAll('.ui-select[data-open="1"]').forEach((el) => el.removeAttribute('data-open'));
+  if (!wasOpen) wrap.dataset.open = '1';
+}
+function uiSelectPick(li, dispatchName) {
+  const wrap = li.closest('.ui-select');
+  if (!wrap) return;
+  const v = li.dataset.value;
+  wrap.dataset.value = v;
+  // Update the label + aria-selected marks visually so if the caller
+  // navigates instead of re-rendering, feedback is instant.
+  const lbl = wrap.querySelector('.ui-select-label');
+  if (lbl) lbl.textContent = li.textContent.trim();
+  wrap.querySelectorAll('li[role="option"]').forEach((el) => {
+    if (el === li) el.setAttribute('aria-selected', 'true');
+    else el.removeAttribute('aria-selected');
+  });
+  wrap.removeAttribute('data-open');
+  if (dispatchName && typeof window[dispatchName] === 'function') window[dispatchName](v);
+}
+document.addEventListener('click', (ev) => {
+  if (!(ev.target instanceof Element)) return;
+  if (ev.target.closest('.ui-select')) return;
+  document.querySelectorAll('.ui-select[data-open="1"]').forEach((el) => el.removeAttribute('data-open'));
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    document.querySelectorAll('.ui-select[data-open="1"]').forEach((el) => el.removeAttribute('data-open'));
+  }
+});
 (function restoreSortPref(){
   try {
     const u = new URL(window.location.href);
@@ -6451,33 +6533,91 @@ ${sections}
 `));
 }
 
-function runListPage(res: ServerResponse) {
-  const items = [...RUNS.values()]
-    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
-    .map((r) => `
+async function runListPage(res: ServerResponse) {
+  // Build per-run cost + status from the run's CSV. Also detect
+  // "stale running" — a subprocess that died without emitting a close
+  // event (SIGKILL, container jam) leaves state.done=false forever.
+  // If the CSV rowcount matches the manifest's queued_image_ids
+  // total, OR mtime hasn't advanced in >10 min, we treat the run as
+  // effectively done (and show it that way) even if the in-memory
+  // state disagrees.
+  const STALE_THRESHOLD_MS = 10 * 60_000;
+  const now = Date.now();
+
+  const enriched = await Promise.all(
+    [...RUNS.values()].map(async (r) => {
+      let cost = 0;
+      let completed = 0;
+      let failed = 0;
+      let effectiveDone = r.done;
+      let inferredReason: string | null = null;
+      try {
+        if (r.csvPath) {
+          const stat = await fs.stat(r.csvPath).catch(() => null);
+          const rows = await readRunCsvOrEmpty(r.csvPath);
+          for (const row of rows) {
+            const c = Number.parseFloat((row as unknown as { cost_usd?: string }).cost_usd ?? "0");
+            if (Number.isFinite(c) && c > 0) cost += c;
+            if (row.status === "completed") completed++;
+            else if (row.status === "failed") failed++;
+          }
+          // Stale detection — only when in-memory says "running"
+          // (r.done=false). If CSV hasn't advanced in >10 min AND
+          // it has SOME rows, the subprocess is almost certainly gone.
+          if (!r.done && stat && rows.length > 0 && now - stat.mtimeMs > STALE_THRESHOLD_MS) {
+            effectiveDone = true;
+            inferredReason = "stale (no CSV write in " + Math.round((now - stat.mtimeMs) / 60_000) + "m)";
+          }
+        }
+      } catch { /* soft — leave counters at 0 */ }
+      return { r, cost, completed, failed, effectiveDone, inferredReason };
+    }),
+  );
+
+  const items = enriched
+    .sort((a, b) => b.r.startedAt.localeCompare(a.r.startedAt))
+    .map(({ r, cost, completed, failed, effectiveDone, inferredReason }) => {
+      let statusHtml;
+      if (effectiveDone) {
+        if (r.done && r.exitCode === 0) {
+          statusHtml = `<span class="pill internal">done</span>`;
+        } else if (r.done) {
+          statusHtml = `<span class="pill external" title="Subprocess exit code ${r.exitCode}">exit ${r.exitCode}</span>`;
+        } else if (inferredReason) {
+          statusHtml = `<span class="pill external" title="${esc(inferredReason)} — subprocess likely gone. Reconciliation may auto-resume orphans on next boot.">stale</span>`;
+        } else {
+          statusHtml = `<span class="pill internal">done</span>`;
+        }
+      } else {
+        statusHtml = `<span class="pill infographic">running</span>`;
+      }
+      const costCell = cost > 0
+        ? `<span title="Sum of cost_usd across this run's rows (only successful generations bill).">${esc(formatUsd(cost))}</span>`
+        : `<span class="sub" style="font-size:11px">—</span>`;
+      const countsCell = (completed + failed) > 0
+        ? `<span class="sub" style="font-size:11px">${completed} done${failed > 0 ? " · " + failed + " failed" : ""}</span>`
+        : `<span class="sub" style="font-size:11px">—</span>`;
+      return `
 <tr>
   <td><a href="/runs/${esc(r.id)}"><code>${esc(r.id)}</code></a></td>
   <td>${esc(r.client)}</td>
   <td><code style="font-size:11px">${esc(r.startedAt)}</code></td>
-  <td>${
-    r.done
-      ? r.exitCode === 0
-        ? `<span class="pill internal">done</span>`
-        : `<span class="pill external">exit ${r.exitCode}</span>`
-      : `<span class="pill infographic">running</span>`
-  }</td>
-  <td>${r.csvPath ? `<a href="/files?p=${encodeURIComponent(r.csvPath)}">CSV</a>` : ""} ${r.htmlPath ? `<a href="/files?p=${encodeURIComponent(r.htmlPath)}" target="_blank">report</a>` : ""}</td>
-</tr>`).join("");
+  <td>${statusHtml}</td>
+  <td>${countsCell}</td>
+  <td style="text-align:right;font-variant-numeric:tabular-nums">${costCell}</td>
+  <td class="actions">${r.csvPath ? `<a class="btn" href="/files?p=${encodeURIComponent(r.csvPath)}" style="padding:4px 10px;font-size:12px">CSV</a>` : ""}</td>
+</tr>`;
+    }).join("");
 
   sendHtml(res, 200, shell("Runs", `
 <section class="card">
   <h1>Runs <span style="color:var(--ink-faint);font-weight:400;font-size:14px">(this server session)</span></h1>
-  <div class="sub">In-memory list of regen jobs spawned by this UI; cleared when the server restarts.</div>
+  <div class="sub">In-memory list of regen jobs spawned by this UI; cleared when the server restarts. "stale" = subprocess died without emitting close; CSV hasn't been written in &gt;10 min. Reconciliation resumes orphans automatically on the next container boot.</div>
 </section>
 <section class="card" style="padding:0">
 ${RUNS.size === 0
   ? `<div style="padding:24px;text-align:center;color:var(--ink-muted)">No runs yet. <a href="/">Start one →</a></div>`
-  : `<table class="cluster-list"><thead><tr><th>id</th><th>client</th><th>started</th><th>status</th><th>output</th></tr></thead><tbody>${items}</tbody></table>`}
+  : `<table class="cluster-list"><thead><tr><th>id</th><th>client</th><th>started</th><th>status</th><th>images</th><th style="text-align:right">cost</th><th></th></tr></thead><tbody>${items}</tbody></table>`}
 </section>`));
 }
 
@@ -11210,7 +11350,7 @@ export function startWebServer(port: number): void {
         return sendJson(res, 200, { groups: out });
       }
       if (method === "GET" && p === "/flows") return await flowsPage(res);
-      if (method === "GET" && p === "/runs") return runListPage(res);
+      if (method === "GET" && p === "/runs") return await runListPage(res);
       const runZipMatch = /^\/runs\/([a-f0-9]+)\/download\.zip$/.exec(p);
       if ((method === "GET" || method === "HEAD") && runZipMatch && runZipMatch[1]) {
         return await runDownloadZip(req, res, runZipMatch[1]);
