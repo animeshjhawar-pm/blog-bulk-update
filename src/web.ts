@@ -1068,6 +1068,12 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
   .result-card .cost-pill.cost-pill-fal {
     background: #fef3c7; color: #92400e; border-color: #fcd34d;
   }
+  /* Flex (Google direct) — green so it visually rewards the
+     cheap-path success. If a card shows amber (fal) or the default
+     indigo (replicate), Flex fell through. */
+  .result-card .cost-pill.cost-pill-flex {
+    background: #dcfce7; color: #166534; border-color: #86efac;
+  }
   .run-cost-total {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 3px 10px; border-radius: 999px;
@@ -1290,6 +1296,7 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
     <a href="/">Home</a>
     <a href="/flows" target="_blank">Flows ↗</a>
     <a href="/runs">Runs</a>
+    <a href="/flex-dashboard">Flex</a>
   </nav>
 </header>
 <main>
@@ -7001,19 +7008,30 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
         const rawCost = Number.parseFloat((r as unknown as { cost_usd?: string }).cost_usd ?? "0");
         const prov = ((r as unknown as { provider?: string }).provider ?? "").trim();
         const model = ((r as unknown as { model?: string }).model ?? "").trim();
+        const route = ((r as unknown as { route?: string }).route ?? "").trim();
+        const flexMs = ((r as unknown as { flex_elapsed_ms?: string }).flex_elapsed_ms ?? "").trim();
+        const flexOut = ((r as unknown as { flex_outcome?: string }).flex_outcome ?? "").trim();
         if (!Number.isFinite(rawCost) || rawCost <= 0) return "";
-        // Short label: prefer model when known, else provider.
+        // Short label: prefer route when the 2026-08-22 chain is
+        // present (so operators can distinguish flex from replicate
+        // at a glance); fall back to older model-based labelling.
         const label =
-          model === "google/nano-banana-2" ? "replicate nb-2"
+          route === "flex" ? (flexOut === "503_retried_success" ? "flex ⚠retried" : "flex")
+          : route === "replicate" ? "replicate"
+          : route === "fal" ? "fal"
+          : model === "google/nano-banana-2" ? "replicate nb-2"
           : model === "fal-nano-banana-pro" ? "fal"
           : model === "google/nano-banana-pro" ? "replicate"
           : prov || "unknown";
-        // Fallback layers get amber styling so they stand out.
         const cls =
-          model === "google/nano-banana-2" || model === "fal-nano-banana-pro" || prov === "fal"
+          route === "flex" ? "cost-pill cost-pill-flex"
+          : route === "fal" || model === "google/nano-banana-2" || model === "fal-nano-banana-pro" || prov === "fal"
             ? "cost-pill cost-pill-fal"
             : "cost-pill";
-        return `<span class="${cls}" title="Generation cost via ${esc(model || prov)}">${esc(label)} · ${esc(formatUsd(rawCost))}</span>`;
+        const flexTitle = route === "flex" && flexMs
+          ? ` · flex ${(Number(flexMs)/1000).toFixed(1)}s`
+          : "";
+        return `<span class="${cls}" title="Generation cost via ${esc(model || route || prov)}${flexTitle}">${esc(label)} · ${esc(formatUsd(rawCost))}${route === "flex" && flexMs ? ` · ${(Number(flexMs)/1000).toFixed(1)}s` : ""}</span>`;
       })()}
     </div>
     <div class="rc-id"><code>${esc(r.image_id)}</code></div>
@@ -11117,6 +11135,267 @@ export function startWebServer(port: number): void {
           },
           by_project,
         });
+      }
+
+      // /flex-dashboard — human-readable monitoring page. Aggregates
+      // out/runs/flex-attempts.jsonl into a filterable table + summary
+      // tiles. All filtering is client-side (JS on the page) so operators
+      // can slice by run/outcome/project/asset without hitting the
+      // server again.
+      if (method === "GET" && p === "/flex-dashboard") {
+        const { readFlexAttemptsLog, FLEX_UNIT_COST_USD, FLEX_MODEL } =
+          await import("./gemini.js");
+        const hours = Math.max(1, Number(url.searchParams.get("hours") ?? "168"));
+        const cutoff = Date.now() - hours * 3600_000;
+        const attempts = (await readFlexAttemptsLog()).filter(
+          (a) => Date.parse(a.ts_sent) >= cutoff,
+        );
+        const flexEnabled = (process.env.FLEX_ENABLED ?? "").toLowerCase() === "true";
+        const flexKeySet = !!process.env.GEMINI_API_KEY;
+
+        // Compute aggregates for the tiles.
+        let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0;
+        let retryFired = 0;
+        const elapsedSuccess: number[] = [];
+        let costBilled = 0, costWasted = 0;
+        const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costBilled: number }>();
+        for (const a of attempts) {
+          if (a.outcome === "success") successCount++;
+          else if (a.outcome === "503_retried_success") { retriedSuccess++; successCount++; }
+          else if (a.outcome === "timeout") timeoutCount++;
+          else if (a.outcome === "429") rateLimit429++;
+          else if (a.outcome === "503") unavail503++;
+          else errorCount++;
+          if (a.attempt === 2) retryFired++;
+          if (a.outcome === "success" || a.outcome === "503_retried_success") {
+            elapsedSuccess.push(a.elapsed_ms);
+            costBilled += FLEX_UNIT_COST_USD;
+          }
+          if (a.outcome === "timeout") costWasted += FLEX_UNIT_COST_USD;
+          const key = a.run_id ?? "(no-run-id)";
+          const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costBilled: 0 };
+          rec.total++;
+          if (a.outcome === "success" || a.outcome === "503_retried_success") { rec.success++; rec.costBilled += FLEX_UNIT_COST_USD; }
+          else if (a.outcome === "timeout") rec.timeout++;
+          else rec.failed++;
+          perRun.set(key, rec);
+        }
+        elapsedSuccess.sort((a, b) => a - b);
+        const total = attempts.length;
+        const successRate = total > 0 ? (successCount / total) : null;
+        const avgLatency = elapsedSuccess.length > 0
+          ? Math.round(elapsedSuccess.reduce((s, n) => s + n, 0) / elapsedSuccess.length)
+          : null;
+        const p50 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.5)] : null;
+        const p95 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.95)] : null;
+        const savedVsReplicate = successCount * (0.15 - FLEX_UNIT_COST_USD) - costWasted;
+
+        const runsSorted = [...perRun.entries()]
+          .map(([run_id, s]) => ({ run_id, ...s }))
+          .sort((a, b) => b.total - a.total);
+
+        // Concurrency snapshot — for each attempt window, how many
+        // Flex requests were "in flight" (sent-not-returned) when it
+        // started. Peak = the max simultaneous load Google saw from us.
+        const events: Array<{ t: number; delta: number }> = [];
+        for (const a of attempts) {
+          events.push({ t: Date.parse(a.ts_sent), delta: 1 });
+          events.push({ t: Date.parse(a.ts_returned), delta: -1 });
+        }
+        events.sort((a, b) => a.t - b.t || a.delta - b.delta);
+        let live = 0, peakConcurrency = 0;
+        for (const e of events) { live += e.delta; if (live > peakConcurrency) peakConcurrency = live; }
+
+        const cfg = {
+          FLEX_ENABLED: flexEnabled,
+          FLEX_TIMEOUT_MS: Number(process.env.FLEX_TIMEOUT_MS ?? "300000"),
+          FLEX_MODEL,
+          FLEX_UNIT_COST_USD,
+          GEMINI_API_KEY_SET: flexKeySet,
+          window_hours: hours,
+        };
+
+        const html = `<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flex Dashboard — Image Regen</title>
+<style>
+  :root {
+    --bg:#0b1220; --panel:#111a2e; --panel2:#0f172a; --border:#1e293b;
+    --ink:#e2e8f0; --ink2:#94a3b8; --brand:#7c83ff; --ok:#22c55e;
+    --warn:#f59e0b; --err:#ef4444; --flex:#10b981;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; font:14px/1.5 system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--ink); }
+  h1 { margin:0 0 4px; font-size:22px; font-weight:600; }
+  .sub { color:var(--ink2); font-size:13px; margin-bottom:20px; }
+  .sub a { color:var(--brand); }
+  .banner { padding:10px 14px; border-radius:8px; margin-bottom:16px; font-weight:500; }
+  .banner-ok { background:rgba(34,197,94,.1); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+  .banner-warn { background:rgba(245,158,11,.1); color:#fbbf24; border:1px solid rgba(245,158,11,.3); }
+  .banner-err { background:rgba(239,68,68,.1); color:#f87171; border:1px solid rgba(239,68,68,.3); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:24px; }
+  .tile { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+  .tile-label { font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink2); margin-bottom:4px; }
+  .tile-value { font-size:24px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .tile-sub { font-size:11px; color:var(--ink2); margin-top:2px; }
+  .tile-good .tile-value { color:var(--ok); }
+  .tile-warn .tile-value { color:var(--warn); }
+  .tile-err .tile-value { color:var(--err); }
+  .tile-flex .tile-value { color:var(--flex); }
+  .row { display:grid; grid-template-columns:1fr 380px; gap:16px; margin-bottom:24px; }
+  @media (max-width:900px) { .row { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .card h2 { margin:0; padding:12px 16px; font-size:14px; font-weight:600; border-bottom:1px solid var(--border); }
+  .filters { padding:12px 16px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel2); border-bottom:1px solid var(--border); }
+  .filters label { font-size:12px; color:var(--ink2); }
+  .filters select, .filters input {
+    background:var(--panel2); color:var(--ink); border:1px solid var(--border); border-radius:6px;
+    padding:5px 8px; font-size:12px; font-family:inherit;
+  }
+  .filters input[type=text] { min-width:180px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; }
+  th { position:sticky; top:0; background:var(--panel2); color:var(--ink2); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.4px; z-index:1; }
+  tbody tr:hover { background:rgba(124,131,255,.05); }
+  .pill { display:inline-block; padding:2px 7px; border-radius:99px; font-size:10.5px; font-weight:500; }
+  .pill-success { background:rgba(34,197,94,.15); color:#4ade80; }
+  .pill-503_retried_success { background:rgba(16,185,129,.15); color:#34d399; }
+  .pill-timeout { background:rgba(239,68,68,.15); color:#f87171; }
+  .pill-429 { background:rgba(245,158,11,.15); color:#fbbf24; }
+  .pill-503 { background:rgba(245,158,11,.15); color:#fbbf24; }
+  .pill-error { background:rgba(148,163,184,.15); color:#cbd5e1; }
+  .table-scroll { max-height:520px; overflow:auto; }
+  .runs-scroll { max-height:520px; overflow:auto; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; color:var(--ink2); }
+  .empty { padding:40px 20px; text-align:center; color:var(--ink2); }
+  .kbd { font-family:ui-monospace,monospace; font-size:11px; background:var(--panel2); padding:2px 6px; border-radius:4px; border:1px solid var(--border); }
+  .cfg-strip { padding:8px 16px; background:var(--panel2); border-top:1px solid var(--border); font-size:11px; color:var(--ink2); }
+  .cfg-strip code { color:var(--ink); }
+</style>
+</head><body>
+<h1>Flex Dashboard</h1>
+<div class="sub">
+  Window: last ${hours}h · Model: <code>${esc(FLEX_MODEL)}</code> · Unit cost: $${FLEX_UNIT_COST_USD}/img
+  · <a href="/flex-dashboard?hours=24">24h</a> · <a href="/flex-dashboard?hours=168">7d</a> · <a href="/flex-dashboard?hours=720">30d</a>
+  · <a href="/stats/flex?hours=${hours}">raw JSON</a> · <a href="/runs">← back to runs</a>
+</div>
+
+${!flexEnabled
+  ? `<div class="banner banner-warn">FLEX_ENABLED is <code>${esc(String(process.env.FLEX_ENABLED ?? ""))}</code> — Layer 0 is disabled, all traffic goes to Replicate. Set FLEX_ENABLED=true on Railway to activate.</div>`
+  : !flexKeySet
+    ? `<div class="banner banner-err">GEMINI_API_KEY not set — Flex will silently skip even though FLEX_ENABLED=true.</div>`
+    : total === 0
+      ? `<div class="banner banner-ok">Flex is ARMED. No attempts logged in the last ${hours}h yet — trigger a regen from the workspace and refresh.</div>`
+      : (successRate !== null && successRate < 0.5 && total >= 20)
+        ? `<div class="banner banner-err">Success rate ${(successRate*100).toFixed(1)}% over ${total} attempts — kill-switch recommended (set FLEX_ENABLED=false).</div>`
+        : `<div class="banner banner-ok">Flex is HEALTHY — ${(successRate!*100).toFixed(1)}% success over ${total} attempts.</div>`}
+
+<div class="tiles">
+  <div class="tile"><div class="tile-label">Attempts</div><div class="tile-value">${total}</div><div class="tile-sub">peak concurrency ${peakConcurrency}</div></div>
+  <div class="tile tile-good"><div class="tile-label">Success</div><div class="tile-value">${successCount}</div><div class="tile-sub">${retriedSuccess} via 503 retry</div></div>
+  <div class="tile tile-err"><div class="tile-label">Timeouts (${(cfg.FLEX_TIMEOUT_MS/1000)|0}s)</div><div class="tile-value">${timeoutCount}</div><div class="tile-sub">fell to Replicate</div></div>
+  <div class="tile tile-warn"><div class="tile-label">429 (rate-limited)</div><div class="tile-value">${rateLimit429}</div><div class="tile-sub">fell to Replicate</div></div>
+  <div class="tile tile-warn"><div class="tile-label">503 (capacity)</div><div class="tile-value">${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
+  <div class="tile"><div class="tile-label">Latency avg / p50 / p95</div><div class="tile-value" style="font-size:15px">${avgLatency!=null?`${(avgLatency/1000).toFixed(1)}s / ${(p50!/1000).toFixed(1)}s / ${(p95!/1000).toFixed(1)}s`:'—'}</div><div class="tile-sub">success only</div></div>
+  <div class="tile tile-flex"><div class="tile-label">Flex billed (est.)</div><div class="tile-value">$${costBilled.toFixed(2)}</div><div class="tile-sub">success × $${FLEX_UNIT_COST_USD}</div></div>
+  <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">vs Replicate baseline</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">saved vs all-Replicate</div></div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h2>Per-attempt log</h2>
+    <div class="filters">
+      <label>Outcome: <select id="f-outcome"><option value="">all</option><option value="success">success</option><option value="503_retried_success">503_retried_success</option><option value="timeout">timeout</option><option value="429">429</option><option value="503">503</option><option value="error">error</option></select></label>
+      <label>Run: <select id="f-run"><option value="">all</option>${runsSorted.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id.slice(0,8))} (${r.total})</option>`).join("")}</select></label>
+      <label>Filter: <input type="text" id="f-text" placeholder="project_id / cluster_id / asset / error"></label>
+      <span id="f-count" style="margin-left:auto;color:var(--ink2);font-size:12px"></span>
+    </div>
+    <div class="table-scroll">
+      <table id="attempts-table">
+        <thead>
+          <tr>
+            <th>ts_sent</th><th>elapsed</th><th>outcome</th><th>attempt</th>
+            <th>run</th><th>image</th><th>asset</th><th>ref</th>
+            <th>bytes</th><th>error</th>
+          </tr>
+        </thead>
+        <tbody id="attempts-tbody">
+${attempts.slice().reverse().map(a=>`
+          <tr data-outcome="${esc(a.outcome)}" data-run="${esc(a.run_id ?? "")}" data-search="${esc([a.run_id,a.project_id,a.cluster_id,a.asset_type,a.image_id,a.error_message].filter(Boolean).join(" ").toLowerCase())}">
+            <td>${esc(a.ts_sent.replace("T"," ").slice(0,19))}</td>
+            <td>${(a.elapsed_ms/1000).toFixed(1)}s</td>
+            <td><span class="pill pill-${esc(a.outcome)}">${esc(a.outcome)}</span></td>
+            <td>${a.attempt}</td>
+            <td><code>${esc((a.run_id ?? "").slice(0,8))}</code></td>
+            <td><code>${esc((a.image_id ?? "").slice(0,20))}</code></td>
+            <td><code>${esc(a.asset_type ?? "")}</code></td>
+            <td>${a.ref_images}</td>
+            <td>${a.bytes ? (a.bytes/1024).toFixed(0)+" KB" : "-"}</td>
+            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--err)" title="${esc(a.error_message ?? "")}">${esc((a.error_message ?? "").slice(0,80))}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      ${attempts.length===0?`<div class="empty">No attempts in this window. Trigger a regen from the <a href="/">workspace</a> to see requests here.</div>`:""}
+    </div>
+    <div class="cfg-strip">
+      Config: FLEX_ENABLED=<code>${esc(String(cfg.FLEX_ENABLED))}</code>
+      · FLEX_TIMEOUT_MS=<code>${cfg.FLEX_TIMEOUT_MS}</code>
+      · FLEX_MODEL=<code>${esc(cfg.FLEX_MODEL)}</code>
+      · GEMINI_API_KEY set=<code>${cfg.GEMINI_API_KEY_SET}</code>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Per-run rollup</h2>
+    <div class="runs-scroll">
+      <table>
+        <thead><tr><th>run_id</th><th>total</th><th>ok</th><th>t/o</th><th>fail</th><th>cost</th></tr></thead>
+        <tbody>
+${runsSorted.map(r=>`          <tr>
+            <td><a href="/runs/${esc(r.run_id)}" style="color:var(--brand);font-family:ui-monospace,monospace;font-size:11px">${esc(r.run_id.slice(0,10))}…</a></td>
+            <td>${r.total}</td>
+            <td style="color:var(--ok)">${r.success}</td>
+            <td style="color:var(--err)">${r.timeout}</td>
+            <td style="color:var(--warn)">${r.failed}</td>
+            <td>$${r.costBilled.toFixed(3)}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      ${runsSorted.length===0?`<div class="empty">—</div>`:""}
+    </div>
+  </div>
+</div>
+
+<script>
+  const tbody = document.getElementById('attempts-tbody');
+  const fOut  = document.getElementById('f-outcome');
+  const fRun  = document.getElementById('f-run');
+  const fText = document.getElementById('f-text');
+  const fCount= document.getElementById('f-count');
+  function applyFilters() {
+    const o = fOut.value, r = fRun.value, t = fText.value.trim().toLowerCase();
+    let visible = 0;
+    for (const row of tbody.querySelectorAll('tr')) {
+      const okO = !o || row.dataset.outcome === o;
+      const okR = !r || row.dataset.run === r;
+      const okT = !t || row.dataset.search.includes(t);
+      const show = okO && okR && okT;
+      row.style.display = show ? '' : 'none';
+      if (show) visible++;
+    }
+    fCount.textContent = visible + ' visible';
+  }
+  fOut.addEventListener('change', applyFilters);
+  fRun.addEventListener('change', applyFilters);
+  fText.addEventListener('input', applyFilters);
+  applyFilters();
+</script>
+</body></html>`;
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
       }
 
       // Flex-tier attribution — every attempt (success, timeout, 429,

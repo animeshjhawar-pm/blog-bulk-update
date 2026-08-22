@@ -22,6 +22,7 @@ import { GoogleGenAI } from "@google/genai";
 import axios from "axios";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { runOutDir } from "./runOutDir.js";
 
 const FLEX_MODEL = process.env.FLEX_MODEL ?? "gemini-3-pro-image";
 const FLEX_TIMEOUT_MS = Number(process.env.FLEX_TIMEOUT_MS ?? "300000");
@@ -91,8 +92,12 @@ interface AttemptLog {
   cost_estimated_usd: number;
 }
 
-const RUNS_ROOT = path.resolve(process.cwd(), "out", "runs");
-const ATTEMPTS_LOG = path.join(RUNS_ROOT, "flex-attempts.jsonl");
+// Journal on the mounted VOLUME so /stats/flex + /flex-dashboard
+// survive redeploys. The image bytes still land under cwd/out/runs/
+// (matching rehost.ts's ephemeral layout) — only this ledger is
+// persistent. On Railway runOutDir() = /data/runs; local it's
+// <cwd>/out.
+const ATTEMPTS_LOG = path.join(runOutDir(), "flex-attempts.jsonl");
 
 async function appendLog(entry: AttemptLog): Promise<void> {
   try {
@@ -313,6 +318,9 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
     outcome = "503_retried_success";
   }
 
+  // Match rehost.ts EXACTLY — same ephemeral cwd/out layout — so the
+  // subsequent downloadImage() no-op's the copy (source === target).
+  const RUNS_ROOT = path.resolve(process.cwd(), "out", "runs");
   const dir = params.runId
     ? path.join(RUNS_ROOT, params.runId, "images")
     : path.join(process.cwd(), "out", "images", params.slug);
