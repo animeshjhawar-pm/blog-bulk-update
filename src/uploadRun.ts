@@ -400,7 +400,7 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
   const csv = await openCsv(csvPath);
   const generatedAt = new Date().toISOString();
   for (const r of records) {
-    const row: CsvRow = {
+    const row: Partial<CsvRow> = {
       image_id: r.imageId,
       asset_type: r.asset,
       cluster_id: r.cluster.id,

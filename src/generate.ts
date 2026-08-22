@@ -1,8 +1,9 @@
 import { generateImage } from "./replicate.js";
 import { generateImageViaFal, generateImageViaFalNanoBanana } from "./fal.js";
+import { generateImageViaFlex, isFlexEnabled, FlexError } from "./gemini.js";
 import { loadEnv } from "./env.js";
 
-export type Provider = "replicate" | "fal";
+export type Provider = "replicate" | "fal" | "flex";
 
 // The E003 shape specifically — Replicate telling us the model is
 // globally throttled. Distinct from generic infra flakiness because
@@ -48,21 +49,41 @@ export interface GenerateParams {
    * generation. Ignored for fal.
    */
   resumePredictionId?: string;
+  // Below fields are for Flex (Layer 0) — used for per-attempt
+  // journaling to out/runs/flex-attempts.jsonl and for writing the
+  // returned bytes to out/runs/<runId>/images/<imageId>.<ext> in one
+  // step (avoids a second HTTP hop through rehost).
+  runId?: string;
+  imageId?: string;
+  slug?: string;
+  projectId?: string;
+  clusterId?: string;
+  assetType?: string;
 }
 
 export interface GenerateResult {
   imageUrl: string;
   provider: Provider;
   /**
-   * Which model produced the image. Distinguishes the two Replicate
-   * paths (nano-banana-pro vs nano-banana-2) for per-image cost
-   * tracking — provider alone can't, since both are "replicate".
-   * Optional to keep older callers working; absent = default per
-   * provider ($0.15 for replicate, $0.039 for fal).
+   * Which model produced the image. Distinguishes:
+   *   - "gemini-3-pro-image-flex" (Layer 0, Google Flex tier, $0.067)
+   *   - "google/nano-banana-pro"   (Layer 1, Replicate, $0.15)
+   *   - "fal-nano-banana-pro"      (Layer 2, fal.ai, $0.039)
+   * provider alone can't distinguish these — Flex and Replicate
+   * primary are the same underlying model at different providers.
    */
-  model?: "google/nano-banana-pro" | "google/nano-banana-2" | "fal-nano-banana-pro";
+  model?:
+    | "gemini-3-pro-image-flex"
+    | "google/nano-banana-pro"
+    | "fal-nano-banana-pro";
   /** Replicate prediction id. Only set when provider="replicate". */
   predictionId?: string;
+  /** Which fallback tier served the request. Flex=0, Replicate=1, fal=2. */
+  route?: "flex" | "replicate" | "fal";
+  /** For Flex only — elapsed ms of the successful attempt. */
+  flexElapsedMs?: number;
+  /** For Flex only — "success" or "503_retried_success". */
+  flexOutcome?: "success" | "503_retried_success";
 }
 
 export async function generate(params: GenerateParams): Promise<GenerateResult> {
@@ -81,22 +102,67 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
     return { imageUrl: r.image_url, provider };
   }
 
-  // Three-layer fallback chain — each layer only fires when the layer
-  // above hits Replicate's global rate-limit (E003) after exhausting
-  // its own in-provider retry budget. Non-rate-limit errors propagate
-  // immediately from the layer they hit.
+  // Three-layer fallback chain, all serving the same underlying model
+  // (Gemini 3 Pro Image = Nano Banana Pro) through three providers so
+  // one provider's throttle / capacity drop doesn't sink the run.
   //
-  //   Layer 1 · Replicate  google/nano-banana-pro   (best quality, $0.15)
-  //   Layer 2 · Replicate  google/nano-banana-2     (different rate-limit
-  //                        bucket at Replicate, ~$0.039 — dodges most
-  //                        E003 spells without paying the style-drift
-  //                        cost of a provider switch)
-  //   Layer 3 · fal.ai     nano-banana-pro          (different provider,
-  //                        different capacity pool, ~$0.039)
+  //   Layer 0 · Google Flex  gemini-3-pro-image  ($0.067)  ← cheapest,
+  //             synchronous, best-effort. 300s timeout, 1 retry on 503,
+  //             no retry on 429 / timeout / other errors (fall through
+  //             immediately to Layer 1 — capacity blips rarely clear
+  //             within our budget). Skipped entirely when FLEX_ENABLED
+  //             ≠ "true" or GEMINI_API_KEY absent.
   //
-  // On success we surface which layer produced the image via the
-  // returned provider field, so CSV / UI cost tracking attributes
-  // correctly.
+  //   Layer 1 · Replicate    google/nano-banana-pro  ($0.15)  ← existing
+  //             primary. Own in-provider retry budget for E003.
+  //
+  //   Layer 2 · fal.ai       nano-banana-pro  ($0.039)  ← different
+  //             capacity pool. Only fires when Replicate exhausts AND
+  //             FAL_KEY is set.
+  //
+  // The prior Replicate nano-banana-2 tier was removed 2026-08-22 in
+  // favour of Flex — same model everywhere now, no style drift risk.
+  const flexOn = isFlexEnabled() && !params.resumePredictionId;
+  if (flexOn) {
+    if (!params.imageId || !params.slug) {
+      // Guard for the plumbing — /regen call-sites always set these,
+      // one-shot CLIs may not. Skip Flex when we can't attribute the
+      // attempt in flex-attempts.jsonl.
+      process.stderr.write(`generate: skipping Flex (missing imageId/slug)\n`);
+    } else {
+      try {
+        const flex = await generateImageViaFlex({
+          prompt: params.prompt,
+          aspectRatio: params.aspectRatio,
+          imageInput: params.imageInput,
+          runId: params.runId,
+          imageId: params.imageId,
+          slug: params.slug,
+          projectId: params.projectId,
+          clusterId: params.clusterId,
+          assetType: params.assetType,
+        });
+        process.stderr.write(
+          `generate: Flex served (${flex.outcome}, ${flex.elapsed_ms}ms)\n`,
+        );
+        return {
+          imageUrl: flex.image_url,
+          provider: "flex",
+          model: "gemini-3-pro-image-flex",
+          route: "flex",
+          flexElapsedMs: flex.elapsed_ms,
+          flexOutcome: flex.outcome,
+        };
+      } catch (err) {
+        const outcome = err instanceof FlexError ? err.outcome : "error";
+        process.stderr.write(
+          `generate: Flex fell through (${outcome}) — going to Replicate\n`,
+        );
+        // Fall through to Layer 1 unconditionally.
+      }
+    }
+  }
+
   try {
     const r = await generateImage({
       prompt: params.prompt,
@@ -110,58 +176,36 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
       provider,
       model: "google/nano-banana-pro",
       predictionId: r.prediction_id,
+      route: "replicate",
     };
   } catch (err) {
-    if (!isReplicateTransientInfraError(err)) throw err;
+    if (!isReplicateTransientInfraError(err) || !process.env.FAL_KEY) throw err;
 
-    // Layer 2 — Replicate nano-banana-2. Replicate scopes E003 buckets
-    // per model, so the pro throttle usually doesn't apply to -2. Same
-    // provider means style stays close and CSV attribution is
-    // straightforward (still "replicate", just a different model).
-    // Skips resumePredictionId — that id belongs to the pro model and
-    // wouldn't resolve against -2.
+    // Layer 2 — fal.ai nano-banana-pro. Different provider, only fires
+    // when Replicate is throttled AND FAL_KEY is set.
     process.stderr.write(
-      `generate: Replicate nano-banana-pro E003 exhausted — retrying on Replicate nano-banana-2\n`,
+      `generate: Replicate nano-banana-pro E003 exhausted — falling back to fal.ai nano-banana-pro\n`,
     );
     try {
-      const r2 = await generateImage({
+      const fb = await generateImageViaFalNanoBanana({
         prompt: params.prompt,
-        aspectRatio: params.aspectRatio,
         imageInput: params.imageInput,
-        model: "google/nano-banana-2",
+        aspectRatio: params.aspectRatio,
       });
-      process.stderr.write(`generate: Replicate nano-banana-2 succeeded\n`);
+      process.stderr.write(`generate: fal.ai fallback succeeded\n`);
       return {
-        imageUrl: r2.image_url,
-        provider,
-        model: "google/nano-banana-2",
-        predictionId: r2.prediction_id,
+        imageUrl: fb.image_url,
+        provider: "fal",
+        model: "fal-nano-banana-pro",
+        route: "fal",
       };
-    } catch (err2) {
-      if (!isReplicateTransientInfraError(err2) || !process.env.FAL_KEY) throw err2;
-
-      // Layer 3 — fal.ai nano-banana-pro. Different provider, only fires
-      // when both Replicate models are throttled AND FAL_KEY is set.
+    } catch (fbErr) {
+      // Both layers failed — throw the ORIGINAL Replicate error so the
+      // operator sees the root cause, not the fal downstream error.
       process.stderr.write(
-        `generate: Replicate nano-banana-2 also E003 — falling back to fal.ai nano-banana-pro\n`,
+        `generate: fal.ai fallback ALSO failed (${(fbErr as Error).message}) — rethrowing original Replicate error\n`,
       );
-      try {
-        const fb = await generateImageViaFalNanoBanana({
-          prompt: params.prompt,
-          imageInput: params.imageInput,
-          aspectRatio: params.aspectRatio,
-        });
-        process.stderr.write(`generate: fal.ai fallback succeeded\n`);
-        return { imageUrl: fb.image_url, provider: "fal", model: "fal-nano-banana-pro" };
-      } catch (fbErr) {
-        // All three layers failed — throw the ORIGINAL pro-tier error
-        // so the operator sees the root cause (E003 on the primary
-        // path), not the fal downstream error which would obscure it.
-        process.stderr.write(
-          `generate: fal.ai fallback ALSO failed (${(fbErr as Error).message}) — rethrowing original nano-banana-pro error\n`,
-        );
-        throw err;
-      }
+      throw err;
     }
   }
 }

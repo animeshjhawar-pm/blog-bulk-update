@@ -26,7 +26,7 @@ export interface HtmlReportParams {
   clientName: string;
   projectId: string;
   startedAt: string;
-  rows: CsvRow[];
+  rows: readonly Partial<CsvRow>[];
   /**
    * The runId this HTML report belongs to. When set, previews and
    * downloads route through /runs/<runId>/preview/<image_id> and
@@ -64,7 +64,22 @@ export async function writeHtmlReport(params: HtmlReportParams): Promise<void> {
     params.runId ? `/runs/${encodeURIComponent(params.runId)}/download/${encodeURIComponent(imageId)}` : "";
 
   const tableRows = rows
-    .map((r) => {
+    .map((raw) => {
+      // Coerce to a defined-string view — CsvRow is now Partial to
+      // accommodate call-sites that predate later columns; html
+      // doesn't care about the new fields, so default missing ones to "".
+      const r = {
+        image_id: raw.image_id ?? "",
+        asset_type: raw.asset_type ?? "",
+        cluster_id: raw.cluster_id ?? "",
+        page_topic: raw.page_topic ?? "",
+        image_url_new: raw.image_url_new ?? "",
+        image_local_path: raw.image_local_path ?? "",
+        description_used: raw.description_used ?? "",
+        aspect_ratio: raw.aspect_ratio ?? "",
+        status: raw.status ?? "",
+        error: raw.error ?? "",
+      };
       const hasImage = Boolean(r.image_url_new || r.image_local_path);
       const preview = hasImage && params.runId
         ? `<img src="${escapeAttr(previewSrc(r.image_id))}" alt="${escapeAttr(r.image_id)}" loading="lazy">`

@@ -11119,6 +11119,86 @@ export function startWebServer(port: number): void {
         });
       }
 
+      // Flex-tier attribution — every attempt (success, timeout, 429,
+      // 503, error) is journalled to out/runs/flex-attempts.jsonl by
+      // src/gemini.ts. This endpoint aggregates the tail so ops can
+      // answer "is Flex worth keeping on?" without grepping the file.
+      //
+      // ?hours=<n> to scope to a window (default 168 = 7d).
+      if (method === "GET" && p === "/stats/flex") {
+        const { readFlexAttemptsLog, FLEX_UNIT_COST_USD, FLEX_MODEL } =
+          await import("./gemini.js");
+        const hours = Math.max(1, Number(url.searchParams.get("hours") ?? "168"));
+        const cutoff = Date.now() - hours * 3600_000;
+        const attempts = (await readFlexAttemptsLog()).filter(
+          (a) => Date.parse(a.ts_sent) >= cutoff,
+        );
+
+        const outcomes = { success: 0, timeout: 0, "429": 0, "503": 0, "503_retried_success": 0, error: 0 } as Record<string, number>;
+        let successElapsedSum = 0;
+        const successElapsedList: number[] = [];
+        let retryCount = 0;
+        let costEstimated = 0;
+        let costWastedOnTimeout = 0;
+
+        for (const a of attempts) {
+          outcomes[a.outcome] = (outcomes[a.outcome] ?? 0) + 1;
+          if (a.attempt === 2) retryCount++;
+          if (a.outcome === "success" || a.outcome === "503_retried_success") {
+            successElapsedSum += a.elapsed_ms;
+            successElapsedList.push(a.elapsed_ms);
+            costEstimated += FLEX_UNIT_COST_USD;
+          }
+          if (a.outcome === "timeout") {
+            costWastedOnTimeout += FLEX_UNIT_COST_USD;
+          }
+        }
+        successElapsedList.sort((a, b) => a - b);
+        const p95 =
+          successElapsedList.length > 0
+            ? successElapsedList[Math.floor(successElapsedList.length * 0.95)]
+            : null;
+        const avg =
+          successElapsedList.length > 0
+            ? Math.round(successElapsedSum / successElapsedList.length)
+            : null;
+        const total = attempts.length;
+        const successTotal = (outcomes.success ?? 0) + (outcomes["503_retried_success"] ?? 0);
+        const fellThrough =
+          (outcomes.timeout ?? 0) + (outcomes["429"] ?? 0) + (outcomes["503"] ?? 0) + (outcomes.error ?? 0);
+
+        // How much we would have paid on the Replicate primary
+        // ($0.15/img) for the images Flex successfully served. Positive
+        // number = money saved vs the all-Replicate baseline.
+        const savedVsReplicate = successTotal * (0.15 - FLEX_UNIT_COST_USD) - costWastedOnTimeout;
+
+        return sendJson(res, 200, {
+          window_hours: hours,
+          model: FLEX_MODEL,
+          service_tier: "flex",
+          attempts_total: total,
+          success_total: successTotal,
+          success_rate: total > 0 ? Math.round((successTotal / total) * 10000) / 10000 : null,
+          fell_through_total: fellThrough,
+          retry_attempts: retryCount,
+          outcomes,
+          latency_ms: {
+            avg_success: avg,
+            p95_success: p95,
+          },
+          cost_usd: {
+            unit: FLEX_UNIT_COST_USD,
+            estimated_flex_billed: Math.round(costEstimated * 10000) / 10000,
+            wasted_on_timeout_estimate: Math.round(costWastedOnTimeout * 10000) / 10000,
+            saved_vs_replicate_baseline: Math.round(savedVsReplicate * 10000) / 10000,
+          },
+          kill_switch_hint:
+            total >= 20 && successTotal / total < 0.5
+              ? "success_rate below 50% over the window — consider FLEX_ENABLED=false"
+              : "healthy",
+        });
+      }
+
       // Diagnostic for ops: "is anything mid-run right now?" Deploys
       // during in-flight runs SIGTERM the subprocess; reconciliation
       // is automatic but adds 2-10 min of resume delay. Curl this

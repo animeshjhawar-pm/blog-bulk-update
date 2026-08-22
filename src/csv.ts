@@ -42,13 +42,27 @@ export const CSV_HEADER = [
   // both report provider="replicate" but bill at very different
   // rates (~4× spread). Absent for failed / mock / upload-only rows.
   "model",
+  // Attribution across the 3-layer chain (flex | replicate | fal).
+  // Broader than `provider` because "flex" is Google-direct, not one
+  // of the historical provider enums. Empty for rows that predate
+  // the 2026-08-22 Flex rollout.
+  "route",
+  // For route="flex" only: how long the Flex call took to return
+  // successfully (ms). Empty otherwise. Powers /stats/flex latency
+  // aggregates that need a per-image, not per-attempt, view.
+  "flex_elapsed_ms",
+  // For route="flex" only: "success" or "503_retried_success".
+  // Empty otherwise. A "503_retried_success" here means Flex's first
+  // attempt hit sheddable capacity and the single-retry saved us
+  // from falling through to the pricier Replicate tier.
+  "flex_outcome",
 ] as const;
 
 export type CsvHeader = (typeof CSV_HEADER)[number];
 export type CsvRow = Record<CsvHeader, string>;
 
 export interface CsvWriter {
-  write(row: CsvRow): Promise<void>;
+  write(row: Partial<CsvRow>): Promise<void>;
   close(): Promise<void>;
   path: string;
 }
@@ -62,9 +76,15 @@ export async function openCsv(filePath: string): Promise<CsvWriter> {
 
   return {
     path: filePath,
-    write(row: CsvRow): Promise<void> {
+    // Accept Partial<CsvRow> so callers that predate a new column
+    // (e.g. the 2026-08-22 flex_* additions in uploadGenerate.ts /
+    // uploadRun.ts) still compile; missing keys are coerced to "" here.
+    write(row: Partial<CsvRow>): Promise<void> {
+      const filled: Record<CsvHeader, string> = Object.fromEntries(
+        CSV_HEADER.map((k) => [k, row[k] ?? ""]),
+      ) as Record<CsvHeader, string>;
       return new Promise((resolve, reject) => {
-        const ok = stringifier.write(row, (err) => (err ? reject(err) : resolve()));
+        const ok = stringifier.write(filled, (err) => (err ? reject(err) : resolve()));
         if (!ok) stringifier.once("drain", () => resolve());
       });
     },

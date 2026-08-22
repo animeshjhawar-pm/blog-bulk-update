@@ -50,6 +50,18 @@ export async function downloadImage(params: {
   const filename = `${safeBasename(params.imageId)}.${ext}`;
   const target = path.join(dir, filename);
 
+  // Flex adapter writes bytes directly to disk and hands back a file://
+  // URL. In that case the file is ALREADY at the same layout we'd
+  // download to — no HTTP needed. Copy only if the source path differs
+  // from the target (belt-and-braces; today they collide).
+  if (params.url.startsWith("file://")) {
+    const src = params.url.slice("file://".length);
+    if (src !== target) {
+      await fs.copyFile(src, target);
+    }
+    return target;
+  }
+
   const response = await axios.get<ArrayBuffer>(params.url, {
     responseType: "arraybuffer",
     timeout: 60_000,

@@ -5,14 +5,15 @@
 // pricing changes upstream.
 // ---------------------------------------------------------------------------
 
-export type PricedProvider = "replicate" | "fal";
+export type PricedProvider = "replicate" | "fal" | "flex";
 
 /** Per-model pricing. Preferred when the model is known — covers the
  *  two Replicate paths separately (pro is ~4× more expensive than -2),
  *  and lets fal endpoints price independently if we ever add more. */
 const MODEL_COST_USD: Record<string, number> = {
+  "gemini-3-pro-image-flex": 0.067, // Google Flex tier, 1K/2K image (2026-08 pricing page)
   "google/nano-banana-pro": 0.15,
-  "google/nano-banana-2": 0.039,
+  "google/nano-banana-2": 0.039, // legacy row; layer removed 2026-08-22
   "fal-nano-banana-pro": 0.039,
 };
 
@@ -23,6 +24,7 @@ const MODEL_COST_USD: Record<string, number> = {
 const PROVIDER_COST_USD: Record<PricedProvider, number> = {
   replicate: 0.15,
   fal: 0.039,
+  flex: 0.067,
 };
 
 /**

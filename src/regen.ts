@@ -221,7 +221,7 @@ function buildBaseRow(args: {
 }
 
 interface RowResult {
-  row: CsvRow;
+  row: Partial<CsvRow>;
   status: "completed" | "failed" | "dry-run";
 }
 
@@ -283,6 +283,9 @@ async function processOne(args: {
         provider: "",
         cost_usd: "0",
         model: "",
+        route: "",
+        flex_elapsed_ms: "",
+        flex_outcome: "",
       },
     };
   }
@@ -365,6 +368,9 @@ async function processOne(args: {
           provider: "",
           cost_usd: "0",
           model: "",
+          route: "",
+          flex_elapsed_ms: "",
+          flex_outcome: "",
         },
       };
     }
@@ -390,6 +396,14 @@ async function processOne(args: {
       imageInput,
       provider: options.provider,
       resumePredictionId: options.resumePredictionId,
+      // Flex attribution fields — written into out/runs/flex-attempts.jsonl
+      // per attempt, so /stats/flex can slice by project / cluster / asset.
+      runId: options.runId,
+      imageId: record.imageId,
+      slug,
+      projectId: project.id,
+      clusterId: record.cluster.id,
+      assetType: record.asset,
     });
 
     const localPath = await downloadImage({
@@ -416,6 +430,9 @@ async function processOne(args: {
         provider: gen.provider,
         cost_usd: unitCostUsd(gen.provider, gen.model).toString(),
         model: gen.model ?? "",
+        route: gen.route ?? "",
+        flex_elapsed_ms: gen.flexElapsedMs != null ? String(gen.flexElapsedMs) : "",
+        flex_outcome: gen.flexOutcome ?? "",
       },
     };
   } catch (err) {
@@ -444,6 +461,9 @@ async function processOne(args: {
         provider: "",
         cost_usd: "0",
         model: "",
+        route: "",
+        flex_elapsed_ms: "",
+        flex_outcome: "",
       },
     };
   }
@@ -605,7 +625,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   const limit = makeLimiter(options.concurrency);
   const total = records.length;
 
-  const allRows: CsvRow[] = new Array(total);
+  const allRows: Partial<CsvRow>[] = new Array(total);
   const tasks = records.map((record, i) =>
     limit(async () => {
       const result = await processOne({

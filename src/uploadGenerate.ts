@@ -131,7 +131,7 @@ function safeBasename(s: string): string {
 }
 
 interface RowResult {
-  row: CsvRow;
+  row: Partial<CsvRow>;
   status: "completed" | "failed";
 }
 
@@ -592,7 +592,7 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
 
   const limit = makeLimiter(options.concurrency);
   const total = records.length;
-  const allRows: CsvRow[] = new Array(total);
+  const allRows: Partial<CsvRow>[] = new Array(total);
 
   const tasks = records.map((record, i) =>
     limit(async () => {
