@@ -11266,9 +11266,35 @@ export function startWebServer(port: number): void {
   .pill-429 { background:rgba(245,158,11,.15); color:#fbbf24; }
   .pill-503 { background:rgba(245,158,11,.15); color:#fbbf24; }
   .pill-error { background:rgba(148,163,184,.15); color:#cbd5e1; }
-  .table-scroll { max-height:520px; overflow:auto; }
-  .runs-scroll { max-height:520px; overflow:auto; }
+  .table-scroll { max-height:640px; overflow:auto; }
+  .runs-scroll { max-height:640px; overflow:auto; }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; color:var(--ink2); }
+  /* Expandable per-attempt rows. Click a row → detail row appears
+     underneath with full metadata (sent/returned ts, all IDs,
+     request stats, response stats, cost, error, raw JSON). */
+  tr.main-row { cursor:pointer; }
+  tr.main-row:hover { background:rgba(124,131,255,.08); }
+  tr.main-row.open { background:rgba(124,131,255,.12); }
+  tr.main-row .caret { display:inline-block; width:12px; color:var(--ink2); transition:transform .12s; }
+  tr.main-row.open .caret { transform:rotate(90deg); color:var(--brand); }
+  tr.detail-row td { background:var(--panel2); padding:0; border-bottom:2px solid var(--border); }
+  .detail-panel { padding:14px 20px; display:grid; grid-template-columns:repeat(3, 1fr); gap:20px 24px; }
+  .detail-panel .group h4 { margin:0 0 6px; font-size:10.5px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink2); font-weight:500; }
+  .detail-panel .kv { display:grid; grid-template-columns:110px 1fr; gap:2px 10px; font-size:12px; }
+  .detail-panel .kv dt { color:var(--ink2); }
+  .detail-panel .kv dd { margin:0; color:var(--ink); font-variant-numeric:tabular-nums; word-break:break-all; }
+  .detail-panel .kv dd.ok  { color:var(--ok); }
+  .detail-panel .kv dd.err { color:var(--err); }
+  .detail-panel .kv dd.warn { color:var(--warn); }
+  .detail-raw {
+    grid-column: 1 / -1; margin-top:8px;
+    background:var(--bg); border:1px solid var(--border); border-radius:6px;
+    padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px; color:var(--ink); white-space:pre-wrap; word-break:break-all;
+    max-height:200px; overflow:auto;
+  }
+  .detail-panel a { color:var(--brand); text-decoration:none; }
+  .detail-panel a:hover { text-decoration:underline; }
   .empty { padding:40px 20px; text-align:center; color:var(--ink2); }
   .kbd { font-family:ui-monospace,monospace; font-size:11px; background:var(--panel2); padding:2px 6px; border-radius:4px; border:1px solid var(--border); }
   .cfg-strip { padding:8px 16px; background:var(--panel2); border-top:1px solid var(--border); font-size:11px; color:var(--ink2); }
@@ -11316,14 +11342,21 @@ ${!flexEnabled
       <table id="attempts-table">
         <thead>
           <tr>
-            <th>ts_sent</th><th>elapsed</th><th>outcome</th><th>attempt</th>
+            <th style="width:14px"></th>
+            <th>ts_sent</th><th>elapsed</th><th>outcome</th><th>att</th>
             <th>run</th><th>image</th><th>asset</th><th>ref</th>
-            <th>bytes</th><th>error</th>
+            <th>bytes</th><th>http</th><th>error</th>
           </tr>
         </thead>
         <tbody id="attempts-tbody">
-${attempts.slice().reverse().map(a=>`
-          <tr data-outcome="${esc(a.outcome)}" data-run="${esc(a.run_id ?? "")}" data-search="${esc([a.run_id,a.project_id,a.cluster_id,a.asset_type,a.image_id,a.error_message].filter(Boolean).join(" ").toLowerCase())}">
+${attempts.slice().reverse().map((a, i) => {
+  const gapMs = Date.parse(a.ts_returned) - Date.parse(a.ts_sent);
+  const outcomeClass = (a.outcome === "success" || a.outcome === "503_retried_success") ? "ok"
+    : (a.outcome === "timeout" || a.outcome === "error") ? "err" : "warn";
+  const raw = JSON.stringify(a, null, 2);
+  return `
+          <tr class="main-row" data-outcome="${esc(a.outcome)}" data-run="${esc(a.run_id ?? "")}" data-search="${esc([a.run_id,a.project_id,a.cluster_id,a.asset_type,a.image_id,a.error_message].filter(Boolean).join(" ").toLowerCase())}" data-idx="${i}">
+            <td><span class="caret">▸</span></td>
             <td>${esc(a.ts_sent.replace("T"," ").slice(0,19))}</td>
             <td>${(a.elapsed_ms/1000).toFixed(1)}s</td>
             <td><span class="pill pill-${esc(a.outcome)}">${esc(a.outcome)}</span></td>
@@ -11333,8 +11366,53 @@ ${attempts.slice().reverse().map(a=>`
             <td><code>${esc(a.asset_type ?? "")}</code></td>
             <td>${a.ref_images}</td>
             <td>${a.bytes ? (a.bytes/1024).toFixed(0)+" KB" : "-"}</td>
-            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--err)" title="${esc(a.error_message ?? "")}">${esc((a.error_message ?? "").slice(0,80))}</td>
-          </tr>`).join("")}
+            <td><code>${esc(String(a.http_status ?? "-"))}</code></td>
+            <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--err)" title="${esc(a.error_message ?? "")}">${esc((a.error_message ?? "").slice(0,60))}</td>
+          </tr>
+          <tr class="detail-row" data-idx="${i}" style="display:none">
+            <td colspan="12">
+              <div class="detail-panel">
+                <div class="group">
+                  <h4>Timing</h4>
+                  <dl class="kv">
+                    <dt>sent</dt><dd>${esc(a.ts_sent)}</dd>
+                    <dt>returned</dt><dd>${esc(a.ts_returned)}</dd>
+                    <dt>elapsed</dt><dd class="${outcomeClass}">${a.elapsed_ms} ms · ${(a.elapsed_ms/1000).toFixed(2)}s</dd>
+                    <dt>wall gap</dt><dd>${gapMs} ms</dd>
+                    <dt>attempt</dt><dd>${a.attempt}${a.attempt===2?' <span class="warn">(retry)</span>':''}</dd>
+                  </dl>
+                </div>
+                <div class="group">
+                  <h4>Attribution</h4>
+                  <dl class="kv">
+                    <dt>run_id</dt><dd><a href="/runs/${esc(a.run_id ?? "")}">${esc(a.run_id ?? "-")}</a></dd>
+                    <dt>slug</dt><dd>${esc(a.slug ?? "-")}</dd>
+                    <dt>project_id</dt><dd>${esc(a.project_id ?? "-")}</dd>
+                    <dt>cluster_id</dt><dd>${esc(a.cluster_id ?? "-")}</dd>
+                    <dt>image_id</dt><dd>${esc(a.image_id ?? "-")}</dd>
+                    <dt>asset_type</dt><dd>${esc(a.asset_type ?? "-")}</dd>
+                  </dl>
+                </div>
+                <div class="group">
+                  <h4>Request / Response</h4>
+                  <dl class="kv">
+                    <dt>model</dt><dd>${esc(a.model)}</dd>
+                    <dt>service_tier</dt><dd>${esc(a.service_tier)}</dd>
+                    <dt>outcome</dt><dd class="${outcomeClass}">${esc(a.outcome)}</dd>
+                    <dt>http_status</dt><dd>${esc(String(a.http_status ?? "-"))}</dd>
+                    <dt>prompt_len</dt><dd>${a.prompt_len} chars</dd>
+                    <dt>ref_images</dt><dd>${a.ref_images}</dd>
+                    <dt>bytes</dt><dd>${a.bytes ? `${a.bytes} B · ${(a.bytes/1024).toFixed(1)} KB` : "-"}</dd>
+                    <dt>mime</dt><dd>${esc(a.mime ?? "-")}</dd>
+                    <dt>cost est.</dt><dd>$${(a.cost_estimated_usd ?? 0).toFixed(4)}</dd>
+                  </dl>
+                </div>
+                ${a.error_message ? `<div class="group" style="grid-column: 1 / -1"><h4>Error</h4><dl class="kv"><dt>message</dt><dd class="err">${esc(a.error_message)}</dd></dl></div>` : ""}
+                <div class="detail-raw">${esc(raw)}</div>
+              </div>
+            </td>
+          </tr>`;
+}).join("")}
         </tbody>
       </table>
       ${attempts.length===0?`<div class="empty">No attempts in this window. Trigger a regen from the <a href="/">workspace</a> to see requests here.</div>`:""}
@@ -11374,15 +11452,38 @@ ${runsSorted.map(r=>`          <tr>
   const fRun  = document.getElementById('f-run');
   const fText = document.getElementById('f-text');
   const fCount= document.getElementById('f-count');
+
+  // Click-to-expand: main-row toggles the detail-row that follows.
+  // Detail rows are laid out immediately after their main-row so
+  // matching by data-idx is unambiguous.
+  const detailRowFor = (idx) => tbody.querySelector('tr.detail-row[data-idx="' + idx + '"]');
+  tbody.addEventListener('click', (ev) => {
+    const row = ev.target.closest('tr.main-row');
+    if (!row) return;
+    const idx = row.dataset.idx;
+    const detail = detailRowFor(idx);
+    if (!detail) return;
+    const open = row.classList.toggle('open');
+    detail.style.display = open ? '' : 'none';
+  });
+
   function applyFilters() {
     const o = fOut.value, r = fRun.value, t = fText.value.trim().toLowerCase();
     let visible = 0;
-    for (const row of tbody.querySelectorAll('tr')) {
+    for (const row of tbody.querySelectorAll('tr.main-row')) {
       const okO = !o || row.dataset.outcome === o;
       const okR = !r || row.dataset.run === r;
       const okT = !t || row.dataset.search.includes(t);
       const show = okO && okR && okT;
       row.style.display = show ? '' : 'none';
+      const detail = detailRowFor(row.dataset.idx);
+      if (detail) {
+        // If the main row is hidden, always hide its detail row.
+        // If the main row is visible, keep the detail row's current
+        // open/closed state (based on the .open class on main-row).
+        if (!show) detail.style.display = 'none';
+        else if (!row.classList.contains('open')) detail.style.display = 'none';
+      }
       if (show) visible++;
     }
     fCount.textContent = visible + ' visible';
