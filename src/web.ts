@@ -11157,9 +11157,13 @@ export function startWebServer(port: number): void {
         let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0;
         let retryFired = 0;
         const elapsedSuccess: number[] = [];
-        let costBilled = 0, costWasted = 0;
-        const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costBilled: number }>();
+        let costAuthoritative = 0, costEstimated = 0, costWasted = 0;
+        let authoritativeCount = 0; // how many attempts had usageMetadata (older log rows won't)
+        const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number }>();
         for (const a of attempts) {
+          const auth = (a as any).cost_authoritative_usd as number | null | undefined;
+          const est = a.cost_estimated_usd ?? FLEX_UNIT_COST_USD;
+          const perAttemptCost = typeof auth === "number" ? auth : est;
           if (a.outcome === "success") successCount++;
           else if (a.outcome === "503_retried_success") { retriedSuccess++; successCount++; }
           else if (a.outcome === "timeout") timeoutCount++;
@@ -11169,14 +11173,19 @@ export function startWebServer(port: number): void {
           if (a.attempt === 2) retryFired++;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             elapsedSuccess.push(a.elapsed_ms);
-            costBilled += FLEX_UNIT_COST_USD;
+            costEstimated += est;
+            if (typeof auth === "number") { costAuthoritative += auth; authoritativeCount++; }
+            else costAuthoritative += est; // fall back to estimate for pre-usageMetadata rows
           }
-          if (a.outcome === "timeout") costWasted += FLEX_UNIT_COST_USD;
+          if (a.outcome === "timeout") costWasted += est;
           const key = a.run_id ?? "(no-run-id)";
-          const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costBilled: 0 };
+          const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costActual: 0, costEstimated: 0 };
           rec.total++;
-          if (a.outcome === "success" || a.outcome === "503_retried_success") { rec.success++; rec.costBilled += FLEX_UNIT_COST_USD; }
-          else if (a.outcome === "timeout") rec.timeout++;
+          if (a.outcome === "success" || a.outcome === "503_retried_success") {
+            rec.success++;
+            rec.costActual += perAttemptCost;
+            rec.costEstimated += est;
+          } else if (a.outcome === "timeout") rec.timeout++;
           else rec.failed++;
           perRun.set(key, rec);
         }
@@ -11188,7 +11197,7 @@ export function startWebServer(port: number): void {
           : null;
         const p50 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.5)] : null;
         const p95 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.95)] : null;
-        const savedVsReplicate = successCount * (0.15 - FLEX_UNIT_COST_USD) - costWasted;
+        const savedVsReplicate = successCount * 0.15 - costAuthoritative - costWasted;
 
         const runsSorted = [...perRun.entries()]
           .map(([run_id, s]) => ({ run_id, ...s }))
@@ -11295,6 +11304,13 @@ export function startWebServer(port: number): void {
   }
   .detail-panel a { color:var(--brand); text-decoration:none; }
   .detail-panel a:hover { text-decoration:underline; }
+  .copy-btn {
+    background:transparent; border:1px solid var(--border); color:var(--ink2);
+    border-radius:4px; padding:0 5px; font-size:10px; cursor:pointer; margin-left:4px;
+    vertical-align:baseline; line-height:1.4;
+  }
+  .copy-btn:hover { color:var(--brand); border-color:var(--brand); }
+  .copy-btn.copied { color:var(--ok); border-color:var(--ok); }
   .empty { padding:40px 20px; text-align:center; color:var(--ink2); }
   .kbd { font-family:ui-monospace,monospace; font-size:11px; background:var(--panel2); padding:2px 6px; border-radius:4px; border:1px solid var(--border); }
   .cfg-strip { padding:8px 16px; background:var(--panel2); border-top:1px solid var(--border); font-size:11px; color:var(--ink2); }
@@ -11325,8 +11341,9 @@ ${!flexEnabled
   <div class="tile tile-warn"><div class="tile-label">429 (rate-limited)</div><div class="tile-value">${rateLimit429}</div><div class="tile-sub">fell to Replicate</div></div>
   <div class="tile tile-warn"><div class="tile-label">503 (capacity)</div><div class="tile-value">${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
   <div class="tile"><div class="tile-label">Latency avg / p50 / p95</div><div class="tile-value" style="font-size:15px">${avgLatency!=null?`${(avgLatency/1000).toFixed(1)}s / ${(p50!/1000).toFixed(1)}s / ${(p95!/1000).toFixed(1)}s`:'—'}</div><div class="tile-sub">success only</div></div>
-  <div class="tile tile-flex"><div class="tile-label">Flex billed (est.)</div><div class="tile-value">$${costBilled.toFixed(2)}</div><div class="tile-sub">success × $${FLEX_UNIT_COST_USD}</div></div>
-  <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">vs Replicate baseline</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">saved vs all-Replicate</div></div>
+  <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} rows have usage</div></div>
+  <div class="tile"><div class="tile-label">Flex billed (flat est.)</div><div class="tile-value">$${costEstimated.toFixed(3)}</div><div class="tile-sub">success × $${FLEX_UNIT_COST_USD} sticker</div></div>
+  <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">vs Replicate baseline</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual vs all-Replicate ($0.15/img)</div></div>
 </div>
 
 <div class="row">
@@ -11335,7 +11352,10 @@ ${!flexEnabled
     <div class="filters">
       <label>Outcome: <select id="f-outcome"><option value="">all</option><option value="success">success</option><option value="503_retried_success">503_retried_success</option><option value="timeout">timeout</option><option value="429">429</option><option value="503">503</option><option value="error">error</option></select></label>
       <label>Run: <select id="f-run"><option value="">all</option>${runsSorted.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id.slice(0,8))} (${r.total})</option>`).join("")}</select></label>
-      <label>Filter: <input type="text" id="f-text" placeholder="project_id / cluster_id / asset / error"></label>
+      <label>From: <input type="datetime-local" id="f-from" title="Only rows sent on/after this time (your browser's timezone)"></label>
+      <label>To: <input type="datetime-local" id="f-to" title="Only rows sent on/before this time"></label>
+      <label>Text: <input type="text" id="f-text" placeholder="id / asset / error"></label>
+      <button type="button" id="f-clear" style="background:var(--panel2);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">reset</button>
       <span id="f-count" style="margin-left:auto;color:var(--ink2);font-size:12px"></span>
     </div>
     <div class="table-scroll">
@@ -11354,8 +11374,27 @@ ${attempts.slice().reverse().map((a, i) => {
   const outcomeClass = (a.outcome === "success" || a.outcome === "503_retried_success") ? "ok"
     : (a.outcome === "timeout" || a.outcome === "error") ? "err" : "warn";
   const raw = JSON.stringify(a, null, 2);
+  const anyA = a as any;
+  const usage = anyA.usage as null | {
+    prompt_text_tokens: number; prompt_image_inputs: number;
+    output_image_tokens: number; output_text_tokens: number;
+    thinking_tokens: number; total_tokens: number;
+  };
+  const costAuth = anyA.cost_authoritative_usd as number | null;
+  const serverMs = anyA.server_elapsed_ms as number | null;
+  const modelVer = anyA.model_version as string | null;
+  const servedTier = anyA.served_tier as string | null;
+  const responseId = anyA.response_id as string | null;
+  // Per-line $ contributions for the token-breakdown table.
+  const usageCost = usage ? {
+    inText: (usage.prompt_text_tokens * 1.0) / 1_000_000,
+    inImg:  usage.prompt_image_inputs * 0.0006,
+    outImg: (usage.output_image_tokens * 60.0) / 1_000_000,
+    outText:(usage.output_text_tokens * 6.0) / 1_000_000,
+    think:  (usage.thinking_tokens * 6.0) / 1_000_000,
+  } : null;
   return `
-          <tr class="main-row" data-outcome="${esc(a.outcome)}" data-run="${esc(a.run_id ?? "")}" data-search="${esc([a.run_id,a.project_id,a.cluster_id,a.asset_type,a.image_id,a.error_message].filter(Boolean).join(" ").toLowerCase())}" data-idx="${i}">
+          <tr class="main-row" data-outcome="${esc(a.outcome)}" data-run="${esc(a.run_id ?? "")}" data-ts="${Date.parse(a.ts_sent)}" data-search="${esc([a.run_id,a.project_id,a.cluster_id,a.asset_type,a.image_id,a.error_message,responseId].filter(Boolean).join(" ").toLowerCase())}" data-idx="${i}">
             <td><span class="caret">▸</span></td>
             <td>${esc(a.ts_sent.replace("T"," ").slice(0,19))}</td>
             <td>${(a.elapsed_ms/1000).toFixed(1)}s</td>
@@ -11377,7 +11416,9 @@ ${attempts.slice().reverse().map((a, i) => {
                   <dl class="kv">
                     <dt>sent</dt><dd>${esc(a.ts_sent)}</dd>
                     <dt>returned</dt><dd>${esc(a.ts_returned)}</dd>
-                    <dt>elapsed</dt><dd class="${outcomeClass}">${a.elapsed_ms} ms · ${(a.elapsed_ms/1000).toFixed(2)}s</dd>
+                    <dt>elapsed (us)</dt><dd class="${outcomeClass}">${a.elapsed_ms} ms · ${(a.elapsed_ms/1000).toFixed(2)}s</dd>
+                    <dt>elapsed (google)</dt><dd>${serverMs != null ? `${serverMs} ms · ${(serverMs/1000).toFixed(2)}s` : '—'}</dd>
+                    <dt>overhead</dt><dd>${serverMs != null ? `${a.elapsed_ms - serverMs} ms` : '—'}</dd>
                     <dt>wall gap</dt><dd>${gapMs} ms</dd>
                     <dt>attempt</dt><dd>${a.attempt}${a.attempt===2?' <span class="warn">(retry)</span>':''}</dd>
                   </dl>
@@ -11385,28 +11426,46 @@ ${attempts.slice().reverse().map((a, i) => {
                 <div class="group">
                   <h4>Attribution</h4>
                   <dl class="kv">
-                    <dt>run_id</dt><dd><a href="/runs/${esc(a.run_id ?? "")}">${esc(a.run_id ?? "-")}</a></dd>
+                    <dt>run_id</dt><dd><a href="/runs/${esc(a.run_id ?? "")}">${esc(a.run_id ?? "-")}</a>${a.run_id?` <button class="copy-btn" data-copy="${esc(a.run_id)}" title="copy">⧉</button>`:""}</dd>
                     <dt>slug</dt><dd>${esc(a.slug ?? "-")}</dd>
-                    <dt>project_id</dt><dd>${esc(a.project_id ?? "-")}</dd>
-                    <dt>cluster_id</dt><dd>${esc(a.cluster_id ?? "-")}</dd>
-                    <dt>image_id</dt><dd>${esc(a.image_id ?? "-")}</dd>
+                    <dt>project_id</dt><dd>${esc(a.project_id ?? "-")}${a.project_id?` <button class="copy-btn" data-copy="${esc(a.project_id)}" title="copy">⧉</button>`:""}</dd>
+                    <dt>cluster_id</dt><dd>${esc(a.cluster_id ?? "-")}${a.cluster_id?` <button class="copy-btn" data-copy="${esc(a.cluster_id)}" title="copy">⧉</button>`:""}</dd>
+                    <dt>image_id</dt><dd>${esc(a.image_id ?? "-")}${a.image_id?` <button class="copy-btn" data-copy="${esc(a.image_id)}" title="copy">⧉</button>`:""}</dd>
                     <dt>asset_type</dt><dd>${esc(a.asset_type ?? "-")}</dd>
                   </dl>
                 </div>
                 <div class="group">
                   <h4>Request / Response</h4>
                   <dl class="kv">
-                    <dt>model</dt><dd>${esc(a.model)}</dd>
-                    <dt>service_tier</dt><dd>${esc(a.service_tier)}</dd>
+                    <dt>model asked</dt><dd>${esc(a.model)}</dd>
+                    <dt>model served</dt><dd>${esc(modelVer ?? "—")}</dd>
+                    <dt>tier asked</dt><dd>${esc(a.service_tier)}</dd>
+                    <dt>tier served</dt><dd class="${servedTier === "flex" ? "ok" : servedTier ? "warn" : ""}">${esc(servedTier ?? "—")}</dd>
                     <dt>outcome</dt><dd class="${outcomeClass}">${esc(a.outcome)}</dd>
                     <dt>http_status</dt><dd>${esc(String(a.http_status ?? "-"))}</dd>
+                    <dt>response_id</dt><dd>${responseId?`<code>${esc(responseId)}</code> <button class="copy-btn" data-copy="${esc(responseId)}" title="copy">⧉</button>`:"—"}</dd>
                     <dt>prompt_len</dt><dd>${a.prompt_len} chars</dd>
-                    <dt>ref_images</dt><dd>${a.ref_images}</dd>
                     <dt>bytes</dt><dd>${a.bytes ? `${a.bytes} B · ${(a.bytes/1024).toFixed(1)} KB` : "-"}</dd>
                     <dt>mime</dt><dd>${esc(a.mime ?? "-")}</dd>
-                    <dt>cost est.</dt><dd>$${(a.cost_estimated_usd ?? 0).toFixed(4)}</dd>
                   </dl>
                 </div>
+                ${usage && usageCost ? `
+                <div class="group" style="grid-column: 1 / -1">
+                  <h4>Usage &amp; cost (authoritative, from Google's usageMetadata)</h4>
+                  <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px">
+                    <thead><tr style="color:var(--ink2)"><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">line</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">tokens/units</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">rate</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">$</th></tr></thead>
+                    <tbody>
+                      <tr><td style="padding:3px 8px">input text</td><td style="text-align:right;padding:3px 8px">${usage.prompt_text_tokens}</td><td style="text-align:right;padding:3px 8px;color:var(--ink2)">$1.00 / 1M</td><td style="text-align:right;padding:3px 8px">$${usageCost.inText.toFixed(6)}</td></tr>
+                      <tr><td style="padding:3px 8px">input images</td><td style="text-align:right;padding:3px 8px">${usage.prompt_image_inputs} ref</td><td style="text-align:right;padding:3px 8px;color:var(--ink2)">$0.0006 / img</td><td style="text-align:right;padding:3px 8px">$${usageCost.inImg.toFixed(6)}</td></tr>
+                      <tr><td style="padding:3px 8px;color:var(--flex)"><b>output image</b></td><td style="text-align:right;padding:3px 8px">${usage.output_image_tokens}</td><td style="text-align:right;padding:3px 8px;color:var(--ink2)">$60 / 1M</td><td style="text-align:right;padding:3px 8px;color:var(--flex)"><b>$${usageCost.outImg.toFixed(6)}</b></td></tr>
+                      <tr><td style="padding:3px 8px">output text</td><td style="text-align:right;padding:3px 8px">${usage.output_text_tokens}</td><td style="text-align:right;padding:3px 8px;color:var(--ink2)">$6 / 1M</td><td style="text-align:right;padding:3px 8px">$${usageCost.outText.toFixed(6)}</td></tr>
+                      <tr><td style="padding:3px 8px">thinking</td><td style="text-align:right;padding:3px 8px">${usage.thinking_tokens}</td><td style="text-align:right;padding:3px 8px;color:var(--ink2)">$6 / 1M</td><td style="text-align:right;padding:3px 8px">$${usageCost.think.toFixed(6)}</td></tr>
+                      <tr style="border-top:1px solid var(--border)"><td style="padding:6px 8px"><b>total (Flex bill)</b></td><td style="text-align:right;padding:6px 8px"><b>${usage.total_tokens}</b></td><td></td><td style="text-align:right;padding:6px 8px"><b>$${(costAuth ?? 0).toFixed(4)}</b></td></tr>
+                      <tr style="color:var(--ink2)"><td style="padding:3px 8px">flat sticker (est.)</td><td></td><td></td><td style="text-align:right;padding:3px 8px">$${(a.cost_estimated_usd ?? 0).toFixed(4)}</td></tr>
+                      <tr style="color:var(--ink2)"><td style="padding:3px 8px">would-be Replicate</td><td></td><td></td><td style="text-align:right;padding:3px 8px">$0.1500</td></tr>
+                    </tbody>
+                  </table>
+                </div>` : `<div class="group" style="grid-column: 1 / -1"><h4>Usage</h4><dl class="kv"><dt>note</dt><dd class="warn">No usageMetadata in this row — old log line predating token capture. Flat estimate: $${(a.cost_estimated_usd ?? 0).toFixed(4)}</dd></dl></div>`}
                 ${a.error_message ? `<div class="group" style="grid-column: 1 / -1"><h4>Error</h4><dl class="kv"><dt>message</dt><dd class="err">${esc(a.error_message)}</dd></dl></div>` : ""}
                 <div class="detail-raw">${esc(raw)}</div>
               </div>
@@ -11429,7 +11488,7 @@ ${attempts.slice().reverse().map((a, i) => {
     <h2>Per-run rollup</h2>
     <div class="runs-scroll">
       <table>
-        <thead><tr><th>run_id</th><th>total</th><th>ok</th><th>t/o</th><th>fail</th><th>cost</th></tr></thead>
+        <thead><tr><th>run_id</th><th>total</th><th>ok</th><th>t/o</th><th>fail</th><th title="Token-based actual">cost $</th></tr></thead>
         <tbody>
 ${runsSorted.map(r=>`          <tr>
             <td><a href="/runs/${esc(r.run_id)}" style="color:var(--brand);font-family:ui-monospace,monospace;font-size:11px">${esc(r.run_id.slice(0,10))}…</a></td>
@@ -11437,7 +11496,7 @@ ${runsSorted.map(r=>`          <tr>
             <td style="color:var(--ok)">${r.success}</td>
             <td style="color:var(--err)">${r.timeout}</td>
             <td style="color:var(--warn)">${r.failed}</td>
-            <td>$${r.costBilled.toFixed(3)}</td>
+            <td title="Actual (token-based) — flat est. $${r.costEstimated.toFixed(3)}">$${r.costActual.toFixed(4)}</td>
           </tr>`).join("")}
         </tbody>
       </table>
@@ -11451,14 +11510,34 @@ ${runsSorted.map(r=>`          <tr>
   const fOut  = document.getElementById('f-outcome');
   const fRun  = document.getElementById('f-run');
   const fText = document.getElementById('f-text');
+  const fFrom = document.getElementById('f-from');
+  const fTo   = document.getElementById('f-to');
+  const fClear= document.getElementById('f-clear');
   const fCount= document.getElementById('f-count');
 
   // Click-to-expand: main-row toggles the detail-row that follows.
-  // Detail rows are laid out immediately after their main-row so
-  // matching by data-idx is unambiguous.
+  // Copy buttons inside the detail-row must NOT bubble up and toggle
+  // the row shut — guard with a target check.
   const detailRowFor = (idx) => tbody.querySelector('tr.detail-row[data-idx="' + idx + '"]');
   tbody.addEventListener('click', (ev) => {
-    const row = ev.target.closest('tr.main-row');
+    const t = ev.target;
+    // Copy button: write to clipboard, flash "copied", swallow event.
+    if (t.classList && t.classList.contains('copy-btn')) {
+      const val = t.getAttribute('data-copy') || '';
+      if (val) {
+        navigator.clipboard.writeText(val).then(() => {
+          t.classList.add('copied');
+          const orig = t.textContent;
+          t.textContent = '✓';
+          setTimeout(() => { t.classList.remove('copied'); t.textContent = orig; }, 900);
+        }).catch(() => { t.textContent = '✕'; });
+      }
+      ev.stopPropagation();
+      return;
+    }
+    // Detail-row content — links, table cells etc — never toggles.
+    if (t.closest('tr.detail-row')) return;
+    const row = t.closest('tr.main-row');
     if (!row) return;
     const idx = row.dataset.idx;
     const detail = detailRowFor(idx);
@@ -11467,20 +11546,30 @@ ${runsSorted.map(r=>`          <tr>
     detail.style.display = open ? '' : 'none';
   });
 
+  // Datetime-local input reports "YYYY-MM-DDTHH:MM" in the browser's
+  // LOCAL timezone. Date.parse on that string interprets it as local
+  // time too — so filtering matches what the operator SEES.
+  function tsFilter(inputVal, boundary) {
+    if (!inputVal) return null;
+    const ms = Date.parse(inputVal);
+    return Number.isFinite(ms) ? ms : null;
+  }
   function applyFilters() {
     const o = fOut.value, r = fRun.value, t = fText.value.trim().toLowerCase();
+    const from = tsFilter(fFrom.value);
+    const to   = tsFilter(fTo.value);
     let visible = 0;
     for (const row of tbody.querySelectorAll('tr.main-row')) {
+      const ts = Number(row.dataset.ts);
       const okO = !o || row.dataset.outcome === o;
       const okR = !r || row.dataset.run === r;
       const okT = !t || row.dataset.search.includes(t);
-      const show = okO && okR && okT;
+      const okF = from == null || ts >= from;
+      const okD = to   == null || ts <= to;
+      const show = okO && okR && okT && okF && okD;
       row.style.display = show ? '' : 'none';
       const detail = detailRowFor(row.dataset.idx);
       if (detail) {
-        // If the main row is hidden, always hide its detail row.
-        // If the main row is visible, keep the detail row's current
-        // open/closed state (based on the .open class on main-row).
         if (!show) detail.style.display = 'none';
         else if (!row.classList.contains('open')) detail.style.display = 'none';
       }
@@ -11488,9 +11577,12 @@ ${runsSorted.map(r=>`          <tr>
     }
     fCount.textContent = visible + ' visible';
   }
-  fOut.addEventListener('change', applyFilters);
-  fRun.addEventListener('change', applyFilters);
+  [fOut, fRun, fFrom, fTo].forEach(el => el.addEventListener('change', applyFilters));
   fText.addEventListener('input', applyFilters);
+  fClear.addEventListener('click', () => {
+    fOut.value = ''; fRun.value = ''; fFrom.value = ''; fTo.value = ''; fText.value = '';
+    applyFilters();
+  });
   applyFilters();
 </script>
 </body></html>`;

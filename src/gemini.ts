@@ -69,15 +69,37 @@ export interface FlexResult {
   outcome: "success" | "503_retried_success";
 }
 
+interface UsageBreakdown {
+  prompt_text_tokens: number;
+  prompt_image_inputs: number; // ref_images (Flex bills flat per image input)
+  output_image_tokens: number;
+  output_text_tokens: number;
+  thinking_tokens: number;
+  total_tokens: number;
+}
+
 interface AttemptLog {
   ts_sent: string;
   ts_returned: string;
   elapsed_ms: number;
+  /** Google's own server-side elapsed measure from `Server-Timing` header
+   *  (`gfet4t7; dur=<ms>`) — subtracts network + our async overhead so
+   *  we can compare "how fast Google was" vs "how long we waited". */
+  server_elapsed_ms: number | null;
   outcome: FlexOutcome;
   http_status: number | null;
   attempt: 1 | 2;
   model: string;
+  /** `modelVersion` field from the response — proves which underlying
+   *  build served the call, not just what we asked for. */
+  model_version: string | null;
   service_tier: "flex";
+  /** `serviceTier` echoed by Google (usage_metadata.serviceTier /
+   *  `x-gemini-service-tier` header) — proves the request WAS served
+   *  at Flex tier and didn't get silently upgraded/downgraded. */
+  served_tier: string | null;
+  /** Google's per-response id — the string to quote in support tickets. */
+  response_id: string | null;
   run_id?: string;
   image_id: string;
   cluster_id?: string;
@@ -89,7 +111,16 @@ interface AttemptLog {
   prompt_len: number;
   ref_images: number;
   error_message: string | null;
+  /** Flat unit-rate estimate ($0.067 for a 1K/2K flex image). Kept as
+   *  a fallback; the token-breakdown-based cost below is authoritative. */
   cost_estimated_usd: number;
+  /** Authoritative cost computed from response.usageMetadata token
+   *  counts × Flex-tier prices. Null when we don't have usageMetadata
+   *  (older log rows, timeouts, non-200 responses). */
+  cost_authoritative_usd: number | null;
+  /** Full usage breakdown for token-level analysis (dashboard renders
+   *  each line individually with its own $ contribution). */
+  usage: UsageBreakdown | null;
 }
 
 // Journal on the mounted VOLUME so /stats/flex + /flex-dashboard
@@ -145,6 +176,98 @@ async function fetchInlineImage(url: string): Promise<{ data: string; mimeType: 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Flex-tier pricing (Google AI docs, "Pricing" page, 2026-08). Update
+// only when the pricing page changes — the tokens-to-dollars math
+// below cross-checks against Google's per-image sticker rate ($0.067
+// = 1120 image tokens × $60/1M).
+// ---------------------------------------------------------------------------
+const FLEX_PRICING = {
+  input_text_per_1m_usd: 1.0,
+  input_image_flat_usd: 0.0006, // per image input, per Google's pricing table
+  output_text_per_1m_usd: 6.0, // "text and thinking" share this rate
+  output_image_per_1m_usd: 60.0, // = ~$0.067 at 1120 tokens/image
+} as const;
+
+function computeFlexCostFromUsage(u: UsageBreakdown): number {
+  return (
+    (u.prompt_text_tokens * FLEX_PRICING.input_text_per_1m_usd) / 1_000_000 +
+    u.prompt_image_inputs * FLEX_PRICING.input_image_flat_usd +
+    (u.output_text_tokens * FLEX_PRICING.output_text_per_1m_usd) / 1_000_000 +
+    (u.thinking_tokens * FLEX_PRICING.output_text_per_1m_usd) / 1_000_000 +
+    (u.output_image_tokens * FLEX_PRICING.output_image_per_1m_usd) / 1_000_000
+  );
+}
+
+/**
+ * Pull usageMetadata + response headers out of the SDK response. Returns
+ * null for the usage/cost if the response has no usageMetadata (older
+ * SDK / non-standard error path).
+ */
+function extractUsage(anyResp: any, refImages: number): {
+  usage: UsageBreakdown | null;
+  cost_authoritative: number | null;
+  server_elapsed_ms: number | null;
+  model_version: string | null;
+  served_tier: string | null;
+  response_id: string | null;
+} {
+  const um = anyResp?.usageMetadata;
+  const headers = anyResp?.sdkHttpResponse?.headers ?? {};
+  const model_version = anyResp?.modelVersion ?? null;
+  const response_id = anyResp?.responseId ?? null;
+
+  // "server-timing: gfet4t7; dur=28414" — Google's own elapsed ms.
+  const serverTiming = headers["server-timing"] as string | undefined;
+  const serverElapsedMs = (() => {
+    if (!serverTiming) return null;
+    const m = /dur=([0-9]+)/.exec(serverTiming);
+    return m && m[1] ? Number(m[1]) : null;
+  })();
+
+  const servedTier =
+    (um?.serviceTier as string | undefined) ??
+    (headers["x-gemini-service-tier"] as string | undefined) ??
+    null;
+
+  if (!um) {
+    return {
+      usage: null,
+      cost_authoritative: null,
+      server_elapsed_ms: serverElapsedMs,
+      model_version,
+      served_tier: servedTier,
+      response_id,
+    };
+  }
+
+  const imageOutputTokens =
+    (um.candidatesTokensDetails as Array<{ modality?: string; tokenCount?: number }> | undefined)
+      ?.filter((d) => d.modality === "IMAGE")
+      .reduce((s, d) => s + (d.tokenCount ?? 0), 0) ?? 0;
+  const candidateTokens = Number(um.candidatesTokenCount ?? 0);
+  const promptTextTokens = Number(um.promptTokenCount ?? 0);
+  const thinkingTokens = Number(um.thoughtsTokenCount ?? 0);
+  const outputTextTokens = Math.max(0, candidateTokens - imageOutputTokens);
+
+  const usage: UsageBreakdown = {
+    prompt_text_tokens: promptTextTokens,
+    prompt_image_inputs: refImages,
+    output_image_tokens: imageOutputTokens,
+    output_text_tokens: outputTextTokens,
+    thinking_tokens: thinkingTokens,
+    total_tokens: Number(um.totalTokenCount ?? 0),
+  };
+  return {
+    usage,
+    cost_authoritative: computeFlexCostFromUsage(usage),
+    server_elapsed_ms: serverElapsedMs,
+    model_version,
+    served_tier: servedTier,
+    response_id,
+  };
+}
+
 function extFromMime(mime: string | null): string {
   if (!mime) return "png";
   if (/jpeg|jpg/i.test(mime)) return "jpg";
@@ -182,6 +305,30 @@ async function singleAttempt(
   let outcome: FlexOutcome = "success";
   let errorMessage: string | null = null;
 
+  // Base log entry — every appendLog site spreads this and overrides
+  // just the fields that differ, so nobody forgets a column when we
+  // add one.
+  const baseLog = {
+    ts_sent: ts_sent_iso,
+    attempt,
+    model: FLEX_MODEL,
+    model_version: null,
+    service_tier: "flex" as const,
+    served_tier: null,
+    response_id: null,
+    server_elapsed_ms: null,
+    run_id: params.runId,
+    image_id: params.imageId,
+    cluster_id: params.clusterId,
+    project_id: params.projectId,
+    asset_type: params.assetType,
+    slug: params.slug,
+    prompt_len: params.prompt.length,
+    ref_images: inlineRefs.length,
+    usage: null,
+    cost_authoritative_usd: null,
+  };
+
   try {
     const resp = await Promise.race([
       ai.models.generateContent({
@@ -200,32 +347,28 @@ async function singleAttempt(
     const elapsed = Date.now() - t_sent;
     httpStatus = 200;
     const anyResp: any = resp;
+    const usageInfo = extractUsage(anyResp, inlineRefs.length);
     const respParts = anyResp?.candidates?.[0]?.content?.parts ?? [];
     const imgPart = respParts.find((p: any) => p.inlineData?.data);
     if (!imgPart) {
       outcome = "error";
       errorMessage = "no inline image data in response";
       await appendLog({
-        ts_sent: ts_sent_iso,
+        ...baseLog,
         ts_returned: new Date().toISOString(),
         elapsed_ms: elapsed,
         outcome,
         http_status: httpStatus,
-        attempt,
-        model: FLEX_MODEL,
-        service_tier: "flex",
-        run_id: params.runId,
-        image_id: params.imageId,
-        cluster_id: params.clusterId,
-        project_id: params.projectId,
-        asset_type: params.assetType,
-        slug: params.slug,
         bytes: 0,
         mime: null,
-        prompt_len: params.prompt.length,
-        ref_images: inlineRefs.length,
         error_message: errorMessage,
         cost_estimated_usd: FLEX_UNIT_COST_USD,
+        model_version: usageInfo.model_version,
+        served_tier: usageInfo.served_tier,
+        response_id: usageInfo.response_id,
+        server_elapsed_ms: usageInfo.server_elapsed_ms,
+        usage: usageInfo.usage,
+        cost_authoritative_usd: usageInfo.cost_authoritative,
       });
       throw new FlexError(errorMessage, outcome, elapsed, httpStatus);
     }
@@ -233,26 +376,21 @@ async function singleAttempt(
     bytesLen = bytes.length;
     mimeOut = imgPart.inlineData.mimeType ?? "image/png";
     await appendLog({
-      ts_sent: ts_sent_iso,
+      ...baseLog,
       ts_returned: new Date().toISOString(),
       elapsed_ms: elapsed,
       outcome,
       http_status: httpStatus,
-      attempt,
-      model: FLEX_MODEL,
-      service_tier: "flex",
-      run_id: params.runId,
-      image_id: params.imageId,
-      cluster_id: params.clusterId,
-      project_id: params.projectId,
-      asset_type: params.assetType,
-      slug: params.slug,
       bytes: bytesLen,
       mime: mimeOut,
-      prompt_len: params.prompt.length,
-      ref_images: inlineRefs.length,
       error_message: null,
       cost_estimated_usd: FLEX_UNIT_COST_USD,
+      model_version: usageInfo.model_version,
+      served_tier: usageInfo.served_tier,
+      response_id: usageInfo.response_id,
+      server_elapsed_ms: usageInfo.server_elapsed_ms,
+      usage: usageInfo.usage,
+      cost_authoritative_usd: usageInfo.cost_authoritative,
     });
     return { bytes, mimeType: mimeOut ?? "image/png", elapsed_ms: elapsed };
   } catch (err) {
@@ -263,24 +401,13 @@ async function singleAttempt(
     httpStatus = cls.status;
     errorMessage = (err as Error)?.message ?? String(err);
     await appendLog({
-      ts_sent: ts_sent_iso,
+      ...baseLog,
       ts_returned: new Date().toISOString(),
       elapsed_ms: elapsed,
       outcome,
       http_status: httpStatus,
-      attempt,
-      model: FLEX_MODEL,
-      service_tier: "flex",
-      run_id: params.runId,
-      image_id: params.imageId,
-      cluster_id: params.clusterId,
-      project_id: params.projectId,
-      asset_type: params.assetType,
-      slug: params.slug,
       bytes: 0,
       mime: null,
-      prompt_len: params.prompt.length,
-      ref_images: inlineRefs.length,
       error_message: errorMessage,
       cost_estimated_usd: outcome === "timeout" ? FLEX_UNIT_COST_USD : 0,
     });
