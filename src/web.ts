@@ -11209,8 +11209,15 @@ export function startWebServer(port: number): void {
         // Eventual-completion latencies: successful attempts (whatever
         // their user-facing outcome) — i.e. successes + post_timeout
         // successes. This is the honest "what timeout catches N% of
-        // real successes?" distribution.
+        // real successes?" distribution — kept internal, used for
+        // the capture-rate table's denominator only. NOT shown as a
+        // display row; operators found it confusing to see fast
+        // successes muddying the tail signal.
         const elapsedEventual: number[] = [];
+        // Post-timeout-only tail — Flex responses that arrived AFTER
+        // our user-facing FLEX_TIMEOUT_MS. This is the "how bad is
+        // the tail" signal without dilution from normal-fast wins.
+        const elapsedPostTimeout: number[] = [];
         // Retryable-failure latencies — 429 + 503 + generic errors.
         // Deliberately excludes timeout: a timeout is our own decision
         // (elapsed_ms == config value, not a real Google response), so
@@ -11251,8 +11258,10 @@ export function startWebServer(port: number): void {
             // post_timeout doesn't count toward the user-facing success
             // rate (we already fell back to Replicate). It DOES count
             // toward the "eventual" latency distribution used to pick a
-            // saner FLEX_TIMEOUT_MS.
+            // saner FLEX_TIMEOUT_MS, AND we surface it separately as
+            // the pure-tail percentile row.
             elapsedEventual.push(a.elapsed_ms);
+            elapsedPostTimeout.push(a.elapsed_ms);
           }
           if (a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
             elapsedRetryable.push(a.elapsed_ms);
@@ -11284,6 +11293,7 @@ export function startWebServer(port: number): void {
         elapsedFailure.sort((a, b) => a - b);
         elapsedRetryable.sort((a, b) => a - b);
         elapsedEventual.sort((a, b) => a - b);
+        elapsedPostTimeout.sort((a, b) => a - b);
 
         // Observation-coverage window: the capture-rate table's
         // denominator is only trustworthy for rows logged AFTER the
@@ -11322,9 +11332,10 @@ export function startWebServer(port: number): void {
             max: arr[arr.length - 1],
           };
         };
-        const latSuccess   = stats(elapsedSuccess);
-        const latRetryable = stats(elapsedRetryable);
-        const latEventual  = stats(elapsedEventual);
+        const latSuccess     = stats(elapsedSuccess);
+        const latRetryable   = stats(elapsedRetryable);
+        const latEventual    = stats(elapsedEventual);
+        const latPostTimeout = stats(elapsedPostTimeout);
         // Per-era timeout percentile lines. Sort buckets by seconds
         // ascending so the table reads legacy-first, current-last.
         const timeoutEraStats = [...timeoutEra.entries()]
@@ -11549,7 +11560,7 @@ ${!flexEnabled
         ${(() => {
           const rows: Array<{label:string, s: ReturnType<typeof stats>, cls:string, note:string}> = [];
           rows.push({ label: "success (user-facing wins)", s: latSuccess, cls: "ok", note: `real Google response received under our budget` });
-          rows.push({ label: "eventual (success + post-timeout success)", s: latEventual, cls: "flex", note: "true Flex response distribution — drives the capture-rate table below" });
+          rows.push({ label: "post-timeout success (tail)", s: latPostTimeout, cls: "flex", note: "Flex responses that arrived AFTER our timeout — the pure-tail distribution (no fast wins mixed in)" });
           for (const era of timeoutEraStats) {
             rows.push({
               label: `timeout — ${era.secs}s budget${era.isCurrent?' (current)':' (legacy)'}`,
@@ -11581,6 +11592,7 @@ ${!flexEnabled
   <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
     Higher = more Flex wins, but longer worst-case user wait. Current config: <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code> · observation window: <code>${(cfg.FLEX_OBSERVATION_MS/1000)|0}s</code>.<br>
     Denominator = <b>${latEventual.count} eventual successes</b> (${elapsedSuccess.length} real success + ${postTimeoutSuccess} post-timeout success).
+    Combined here on purpose — the capture-rate answers "how many successful Flex calls would a candidate timeout catch", and successful means either flavour.
   </div>
   <div style="padding:0 16px 12px;color:var(--ink2);font-size:11.5px;border-top:1px dashed var(--border);margin-top:4px;padding-top:10px">
     <b style="color:var(--warn)">Data-coverage caveat.</b>
