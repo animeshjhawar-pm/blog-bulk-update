@@ -11440,33 +11440,19 @@ export function startWebServer(port: number): void {
   @media (max-width:900px) { .row { grid-template-columns:1fr; } }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   .card h2 { margin:0; padding:12px 16px; font-size:14px; font-weight:600; border-bottom:1px solid var(--border); }
-  .filters { padding:12px 16px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; background:var(--panel2); border-bottom:1px solid var(--border); }
+  .filters { padding:12px 16px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; background:var(--panel2); border-bottom:1px solid var(--border); }
   .filters label { font-size:12px; color:var(--ink2); display:inline-flex; align-items:center; gap:6px; }
-  .filters select, .filters input {
-    background:var(--panel); color:var(--ink); border:1px solid var(--border); border-radius:6px;
-    padding:6px 10px; font-size:12px; font-family:inherit; font-weight:500;
-    transition:border-color .12s, box-shadow .12s;
+  /* Use OS-native controls — cleaner + accessible + everyone knows how they work.
+     Only override what's necessary to sit on the dark panel background. */
+  .filters select, .filters input[type=date] {
+    font-size:12px; font-family:inherit; padding:4px 6px;
+    background:var(--panel); color:var(--ink);
+    border:1px solid var(--border); border-radius:5px;
+    color-scheme:dark;
   }
-  .filters select {
-    -webkit-appearance:none; -moz-appearance:none; appearance:none;
-    padding-right:26px;
-    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%2394a3b8' d='M0 0l5 6 5-6z'/></svg>");
-    background-repeat:no-repeat; background-position:right 8px center;
-    cursor:pointer; min-width:140px;
-  }
-  .filters select:hover, .filters input:hover { border-color:var(--ink2); }
-  .filters select:focus, .filters input:focus {
-    outline:none; border-color:var(--brand);
-    box-shadow:0 0 0 3px rgba(124,131,255,.15);
-  }
-  /* Native date picker's calendar/spin icons — force them light-mode-invisible on dark bg. */
-  .filters input[type=date]::-webkit-calendar-picker-indicator {
-    filter:invert(0.7); cursor:pointer; opacity:0.75;
-  }
-  .filters input[type=date]::-webkit-calendar-picker-indicator:hover { opacity:1; }
   .filters button {
-    background:var(--panel); color:var(--ink); border:1px solid var(--border); border-radius:6px;
-    padding:6px 12px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit;
+    background:var(--panel); color:var(--ink); border:1px solid var(--border); border-radius:5px;
+    padding:5px 12px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit;
   }
   .filters button:hover { border-color:var(--brand); color:var(--brand); }
   table { width:100%; border-collapse:collapse; font-size:12px; }
@@ -11495,6 +11481,26 @@ export function startWebServer(port: number): void {
   tr.main-row.open { background:rgba(124,131,255,.12); }
   tr.main-row .caret { display:inline-block; width:12px; color:var(--ink2); transition:transform .12s; }
   tr.main-row.open .caret { transform:rotate(90deg); color:var(--brand); }
+  /* Sortable table headers — click to sort by that column, click again
+     to reverse. Arrow indicator shows current sort state. */
+  th.sortable { cursor:pointer; user-select:none; position:sticky; top:0; }
+  th.sortable:hover { color:var(--brand); }
+  th.sortable .arrow { display:inline-block; width:10px; margin-left:2px; color:var(--ink2); opacity:0.5; }
+  th.sortable.sort-asc  .arrow::before { content:"↑"; opacity:1; color:var(--brand); }
+  th.sortable.sort-desc .arrow::before { content:"↓"; opacity:1; color:var(--brand); }
+  th.sortable .arrow::before { content:"↕"; }
+  /* Window switcher — brand-highlighted for the active option. */
+  .window-links a { color:var(--brand); padding:2px 8px; border-radius:4px; }
+  .window-links a.active { background:var(--brand); color:#fff; }
+  /* Copy-JSON button pinned to the raw-JSON pane. */
+  .detail-raw-wrap { position:relative; grid-column: 1 / -1; }
+  .detail-raw-wrap .copy-raw {
+    position:absolute; top:6px; right:8px;
+    background:var(--panel); color:var(--ink2); border:1px solid var(--border);
+    border-radius:4px; padding:3px 8px; font-size:10.5px; cursor:pointer; z-index:1;
+  }
+  .detail-raw-wrap .copy-raw:hover { color:var(--brand); border-color:var(--brand); }
+  .detail-raw-wrap .copy-raw.copied { color:var(--ok); border-color:var(--ok); }
   tr.detail-row td { background:var(--panel2); padding:0; border-bottom:2px solid var(--border); }
   .detail-panel { padding:14px 20px; display:grid; grid-template-columns:repeat(3, 1fr); gap:20px 24px; }
   .detail-panel .group h4 { margin:0 0 6px; font-size:10.5px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink2); font-weight:500; }
@@ -11528,9 +11534,16 @@ export function startWebServer(port: number): void {
 </head><body>
 <h1>Flex Dashboard</h1>
 <div class="sub">
-  Window: last ${hours}h · Model: <code>${esc(FLEX_MODEL)}</code> · Unit cost: $${FLEX_UNIT_COST_USD}/img
-  · <a href="/flex-dashboard?hours=24">24h</a> · <a href="/flex-dashboard?hours=168">7d</a> · <a href="/flex-dashboard?hours=720">30d</a>
-  · <a href="/stats/flex?hours=${hours}">raw JSON</a> · <a href="/runs">← back to runs</a>
+  Model <code>${esc(FLEX_MODEL)}</code> · Unit $${FLEX_UNIT_COST_USD}/img
+  <span class="window-links" style="margin-left:12px">
+    <a href="/flex-dashboard?hours=24"  class="${hours===24?'active':''}">24h</a>
+    <a href="/flex-dashboard?hours=168" class="${hours===168?'active':''}">7d</a>
+    <a href="/flex-dashboard?hours=720" class="${hours===720?'active':''}">30d</a>
+  </span>
+  <span style="margin-left:12px">
+    <a href="/stats/flex?hours=${hours}" target="_blank">raw JSON</a>
+    · <a href="/runs">← back to runs</a>
+  </span>
 </div>
 
 ${!flexEnabled
@@ -11703,9 +11716,17 @@ ${!flexEnabled
         <thead>
           <tr>
             <th style="width:14px"></th>
-            <th>ts_sent</th><th>elapsed</th><th>outcome</th><th>att</th>
-            <th>run</th><th>image</th><th>asset</th><th>ref</th>
-            <th>bytes</th><th>http</th><th>error</th>
+            <th class="sortable sort-desc" data-sort="ts">ts_sent<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="num" data-col="2">elapsed<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="str" data-col="3">outcome<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="num" data-col="4">att<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="str" data-col="5">run<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="str" data-col="6">image<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="str" data-col="7">asset<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="num" data-col="8">ref<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="num" data-col="9">bytes<span class="arrow"></span></th>
+            <th class="sortable"           data-sort="str" data-col="10">http<span class="arrow"></span></th>
+            <th>error</th>
           </tr>
         </thead>
         <tbody id="attempts-tbody">
@@ -11807,7 +11828,10 @@ ${attempts.slice().reverse().map((a, i) => {
                   </table>
                 </div>` : `<div class="group" style="grid-column: 1 / -1"><h4>Usage</h4><dl class="kv"><dt>note</dt><dd class="warn">No usageMetadata in this row — old log line predating token capture. Flat estimate: $${(a.cost_estimated_usd ?? 0).toFixed(4)}</dd></dl></div>`}
                 ${a.error_message ? `<div class="group" style="grid-column: 1 / -1"><h4>Error</h4><dl class="kv"><dt>message</dt><dd class="err">${esc(a.error_message)}</dd></dl></div>` : ""}
-                <div class="detail-raw">${esc(raw)}</div>
+                <div class="detail-raw-wrap">
+                  <button type="button" class="copy-raw" data-copy-raw>copy JSON</button>
+                  <div class="detail-raw">${esc(raw)}</div>
+                </div>
               </div>
             </td>
           </tr>`;
@@ -11861,7 +11885,7 @@ ${runsSorted.map(r=>`          <tr>
   const detailRowFor = (idx) => tbody.querySelector('tr.detail-row[data-idx="' + idx + '"]');
   tbody.addEventListener('click', (ev) => {
     const t = ev.target;
-    // Copy button: write to clipboard, flash "copied", swallow event.
+    // Copy button (small ID copiers next to run/project/etc.)
     if (t.classList && t.classList.contains('copy-btn')) {
       const val = t.getAttribute('data-copy') || '';
       if (val) {
@@ -11871,6 +11895,20 @@ ${runsSorted.map(r=>`          <tr>
           t.textContent = '✓';
           setTimeout(() => { t.classList.remove('copied'); t.textContent = orig; }, 900);
         }).catch(() => { t.textContent = '✕'; });
+      }
+      ev.stopPropagation();
+      return;
+    }
+    // Copy full-JSON button on the raw pane.
+    if (t.hasAttribute && t.hasAttribute('data-copy-raw')) {
+      const pre = t.parentElement.querySelector('.detail-raw');
+      if (pre) {
+        navigator.clipboard.writeText(pre.textContent).then(() => {
+          t.classList.add('copied');
+          const orig = t.textContent;
+          t.textContent = 'copied ✓';
+          setTimeout(() => { t.classList.remove('copied'); t.textContent = orig; }, 1200);
+        }).catch(() => { t.textContent = 'failed ✕'; });
       }
       ev.stopPropagation();
       return;
@@ -11885,6 +11923,53 @@ ${runsSorted.map(r=>`          <tr>
     const open = row.classList.toggle('open');
     detail.style.display = open ? '' : 'none';
   });
+
+  // Click-to-sort on table headers. data-sort=ts|num|str tells the
+  // comparator how to interpret. Cell values come from the row's
+  // data-ts (for ts column) or the Nth <td>'s textContent otherwise.
+  // Preserves the visual order of main-row + its detail-row pair.
+  const thead = document.querySelector('#attempts-table thead');
+  if (thead) {
+    thead.addEventListener('click', (ev) => {
+      const th = ev.target.closest('th.sortable');
+      if (!th) return;
+      const sortKind = th.getAttribute('data-sort');
+      const colIdx   = Number(th.getAttribute('data-col') || 0);
+      // Toggle direction: if this th was already asc, go desc; else asc.
+      const wasAsc = th.classList.contains('sort-asc');
+      // Clear all other headers first.
+      thead.querySelectorAll('th.sortable').forEach(h => h.classList.remove('sort-asc','sort-desc'));
+      th.classList.add(wasAsc ? 'sort-desc' : 'sort-asc');
+      const dir = wasAsc ? -1 : 1;
+
+      const pairs = [];
+      for (const row of tbody.querySelectorAll('tr.main-row')) {
+        const detail = detailRowFor(row.dataset.idx);
+        pairs.push({ row, detail });
+      }
+      const keyOf = (row) => {
+        if (sortKind === 'ts') return Number(row.dataset.ts);
+        const cell = row.children[colIdx];
+        const txt  = cell ? cell.textContent.trim() : '';
+        if (sortKind === 'num') {
+          const n = parseFloat(txt.replace(/[^0-9.\-]/g, ''));
+          return isNaN(n) ? 0 : n;
+        }
+        return txt.toLowerCase();
+      };
+      pairs.sort((a, b) => {
+        const ka = keyOf(a.row), kb = keyOf(b.row);
+        if (ka < kb) return -1 * dir;
+        if (ka > kb) return  1 * dir;
+        return 0;
+      });
+      // Re-append in sorted order — moves the detail row along with its main.
+      for (const { row, detail } of pairs) {
+        tbody.appendChild(row);
+        if (detail) tbody.appendChild(detail);
+      }
+    });
+  }
 
   // Date input reports "YYYY-MM-DD". "From" = local midnight start;
   // "To" = local end-of-day (23:59:59.999) so the picker reads as
