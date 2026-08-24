@@ -11164,6 +11164,11 @@ export function startWebServer(port: number): void {
         // successes. This is the honest "what timeout catches N% of
         // real successes?" distribution.
         const elapsedEventual: number[] = [];
+        // Timeout-era breakdown: the effective FLEX_TIMEOUT_MS in force
+        // WHEN each timeout row was logged (approximated as
+        // elapsed_ms rounded to nearest 60s). Lets ops read "3 legacy
+        // 300s timeouts + 2 current 480s timeouts" without grepping.
+        const timeoutEra = new Map<number, number>();
         let costAuthoritative = 0, costEstimated = 0, costWasted = 0;
         let authoritativeCount = 0; // how many attempts had usageMetadata (older log rows won't)
         const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number; costWasted: number }>();
@@ -11198,7 +11203,11 @@ export function startWebServer(port: number): void {
           if (a.outcome === "timeout" || a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
             elapsedFailure.push(a.elapsed_ms);
           }
-          if (a.outcome === "timeout") costWasted += est;
+          if (a.outcome === "timeout") {
+            costWasted += est;
+            const bucket = Math.round(a.elapsed_ms / 60_000) * 60; // seconds, rounded to nearest minute
+            timeoutEra.set(bucket, (timeoutEra.get(bucket) ?? 0) + 1);
+          }
           const key = a.run_id ?? "(no-run-id)";
           const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costActual: 0, costEstimated: 0, costWasted: 0 };
           // Don't double-count observation rows in per-run totals; they
@@ -11314,13 +11323,35 @@ export function startWebServer(port: number): void {
   @media (max-width:900px) { .row { grid-template-columns:1fr; } }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   .card h2 { margin:0; padding:12px 16px; font-size:14px; font-weight:600; border-bottom:1px solid var(--border); }
-  .filters { padding:12px 16px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel2); border-bottom:1px solid var(--border); }
-  .filters label { font-size:12px; color:var(--ink2); }
+  .filters { padding:12px 16px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; background:var(--panel2); border-bottom:1px solid var(--border); }
+  .filters label { font-size:12px; color:var(--ink2); display:inline-flex; align-items:center; gap:6px; }
   .filters select, .filters input {
-    background:var(--panel2); color:var(--ink); border:1px solid var(--border); border-radius:6px;
-    padding:5px 8px; font-size:12px; font-family:inherit;
+    background:var(--panel); color:var(--ink); border:1px solid var(--border); border-radius:6px;
+    padding:6px 10px; font-size:12px; font-family:inherit; font-weight:500;
+    transition:border-color .12s, box-shadow .12s;
   }
-  .filters input[type=text] { min-width:180px; }
+  .filters select {
+    -webkit-appearance:none; -moz-appearance:none; appearance:none;
+    padding-right:26px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%2394a3b8' d='M0 0l5 6 5-6z'/></svg>");
+    background-repeat:no-repeat; background-position:right 8px center;
+    cursor:pointer; min-width:140px;
+  }
+  .filters select:hover, .filters input:hover { border-color:var(--ink2); }
+  .filters select:focus, .filters input:focus {
+    outline:none; border-color:var(--brand);
+    box-shadow:0 0 0 3px rgba(124,131,255,.15);
+  }
+  /* Native date picker's calendar/spin icons — force them light-mode-invisible on dark bg. */
+  .filters input[type=date]::-webkit-calendar-picker-indicator {
+    filter:invert(0.7); cursor:pointer; opacity:0.75;
+  }
+  .filters input[type=date]::-webkit-calendar-picker-indicator:hover { opacity:1; }
+  .filters button {
+    background:var(--panel); color:var(--ink); border:1px solid var(--border); border-radius:6px;
+    padding:6px 12px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit;
+  }
+  .filters button:hover { border-color:var(--brand); color:var(--brand); }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; }
   th { position:sticky; top:0; background:var(--panel2); color:var(--ink2); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.4px; z-index:1; }
@@ -11402,7 +11433,11 @@ ${!flexEnabled
   </div>
   <div class="tile"><div class="tile-label">Attempts (user-facing)</div><div class="tile-value">${totalUserFacing}</div><div class="tile-sub">peak concurrency ${peakConcurrency}${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit>0?` · +${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit} obs`:''}</div></div>
   <div class="tile tile-good"><div class="tile-label">Success</div><div class="tile-value">${successCount}</div><div class="tile-sub">${retriedSuccess} via 503 retry</div></div>
-  <div class="tile tile-err"><div class="tile-label">Timeouts (${(cfg.FLEX_TIMEOUT_MS/1000)|0}s)</div><div class="tile-value">${timeoutCount}</div><div class="tile-sub">fell to Replicate</div></div>
+  <div class="tile tile-err">
+    <div class="tile-label">Timeouts</div>
+    <div class="tile-value">${timeoutCount}</div>
+    <div class="tile-sub">${timeoutEra.size === 0 ? `budget ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s · fell to Replicate` : [...timeoutEra.entries()].sort((a,b)=>a[0]-b[0]).map(([secs,n]) => `${n}@${secs}s${secs*1000===cfg.FLEX_TIMEOUT_MS?' (current)':' (legacy)'}`).join(" · ")}</div>
+  </div>
   <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
   <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
   <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} have usage</div></div>
@@ -11472,12 +11507,29 @@ ${!flexEnabled
   <div class="card">
     <h2>Per-attempt log</h2>
     <div class="filters">
-      <label>Outcome: <select id="f-outcome"><option value="">all</option><option value="success">success</option><option value="503_retried_success">503_retried_success</option><option value="timeout">timeout</option><option value="429">429</option><option value="503">503</option><option value="error">error</option></select></label>
-      <label>Run: <select id="f-run"><option value="">all</option>${runsSorted.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id.slice(0,8))} (${r.total})</option>`).join("")}</select></label>
-      <label>From: <input type="datetime-local" id="f-from" title="Only rows sent on/after this time (your browser's timezone)"></label>
-      <label>To: <input type="datetime-local" id="f-to" title="Only rows sent on/before this time"></label>
-      <label>Text: <input type="text" id="f-text" placeholder="id / asset / error"></label>
-      <button type="button" id="f-clear" style="background:var(--panel2);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">reset</button>
+      <label>Outcome
+        <select id="f-outcome">
+          <option value="">all</option>
+          <option value="success">success</option>
+          <option value="503_retried_success">success (via retry)</option>
+          <option value="timeout">timeout</option>
+          <option value="429">429 rate-limit</option>
+          <option value="503">503 capacity</option>
+          <option value="error">error</option>
+          <option value="post_timeout_success">post-timeout success</option>
+          <option value="post_timeout_error">post-timeout error</option>
+          <option value="post_timeout_cap_hit">post-timeout cap hit</option>
+        </select>
+      </label>
+      <label>Run
+        <select id="f-run">
+          <option value="">all</option>
+          ${runsSorted.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id.slice(0,8))} · ${r.total} attempt${r.total===1?'':'s'}</option>`).join("")}
+        </select>
+      </label>
+      <label>From <input type="date" id="f-from" title="Only rows sent on/after this date (browser local time)"></label>
+      <label>To <input type="date" id="f-to" title="Only rows sent on/before this date (browser local time)"></label>
+      <button type="button" id="f-clear">reset</button>
       <span id="f-count" style="margin-left:auto;color:var(--ink2);font-size:12px"></span>
     </div>
     <div class="table-scroll">
@@ -11632,7 +11684,6 @@ ${runsSorted.map(r=>`          <tr>
   const tbody = document.getElementById('attempts-tbody');
   const fOut  = document.getElementById('f-outcome');
   const fRun  = document.getElementById('f-run');
-  const fText = document.getElementById('f-text');
   const fFrom = document.getElementById('f-from');
   const fTo   = document.getElementById('f-to');
   const fClear= document.getElementById('f-clear');
@@ -11669,27 +11720,31 @@ ${runsSorted.map(r=>`          <tr>
     detail.style.display = open ? '' : 'none';
   });
 
-  // Datetime-local input reports "YYYY-MM-DDTHH:MM" in the browser's
-  // LOCAL timezone. Date.parse on that string interprets it as local
-  // time too — so filtering matches what the operator SEES.
-  function tsFilter(inputVal, boundary) {
-    if (!inputVal) return null;
-    const ms = Date.parse(inputVal);
-    return Number.isFinite(ms) ? ms : null;
+  // Date input reports "YYYY-MM-DD". "From" = local midnight start;
+  // "To" = local end-of-day (23:59:59.999) so the picker reads as
+  // inclusive of the selected date.
+  function fromMs(v) {
+    if (!v) return null;
+    const d = new Date(v + 'T00:00:00');
+    return isNaN(d) ? null : d.getTime();
+  }
+  function toMs(v) {
+    if (!v) return null;
+    const d = new Date(v + 'T23:59:59.999');
+    return isNaN(d) ? null : d.getTime();
   }
   function applyFilters() {
-    const o = fOut.value, r = fRun.value, t = fText.value.trim().toLowerCase();
-    const from = tsFilter(fFrom.value);
-    const to   = tsFilter(fTo.value);
+    const o = fOut.value, r = fRun.value;
+    const from = fromMs(fFrom.value);
+    const to   = toMs(fTo.value);
     let visible = 0;
     for (const row of tbody.querySelectorAll('tr.main-row')) {
       const ts = Number(row.dataset.ts);
       const okO = !o || row.dataset.outcome === o;
       const okR = !r || row.dataset.run === r;
-      const okT = !t || row.dataset.search.includes(t);
       const okF = from == null || ts >= from;
       const okD = to   == null || ts <= to;
-      const show = okO && okR && okT && okF && okD;
+      const show = okO && okR && okF && okD;
       row.style.display = show ? '' : 'none';
       const detail = detailRowFor(row.dataset.idx);
       if (detail) {
@@ -11701,9 +11756,8 @@ ${runsSorted.map(r=>`          <tr>
     fCount.textContent = visible + ' visible';
   }
   [fOut, fRun, fFrom, fTo].forEach(el => el.addEventListener('change', applyFilters));
-  fText.addEventListener('input', applyFilters);
   fClear.addEventListener('click', () => {
-    fOut.value = ''; fRun.value = ''; fFrom.value = ''; fTo.value = ''; fText.value = '';
+    fOut.value = ''; fRun.value = ''; fFrom.value = ''; fTo.value = '';
     applyFilters();
   });
   applyFilters();
