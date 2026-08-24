@@ -11164,11 +11164,18 @@ export function startWebServer(port: number): void {
         // successes. This is the honest "what timeout catches N% of
         // real successes?" distribution.
         const elapsedEventual: number[] = [];
-        // Timeout-era breakdown: the effective FLEX_TIMEOUT_MS in force
-        // WHEN each timeout row was logged (approximated as
-        // elapsed_ms rounded to nearest 60s). Lets ops read "3 legacy
-        // 300s timeouts + 2 current 480s timeouts" without grepping.
-        const timeoutEra = new Map<number, number>();
+        // Retryable-failure latencies — 429 + 503 + generic errors.
+        // Deliberately excludes timeout: a timeout is our own decision
+        // (elapsed_ms == config value, not a real Google response), so
+        // it has different percentile semantics from a Google-side
+        // fault we bailed on.
+        const elapsedRetryable: number[] = [];
+        // Timeout-era buckets: keyed by the effective FLEX_TIMEOUT_MS
+        // in force when each row was logged (approximated as elapsed_ms
+        // rounded to nearest 60s). Value = list of elapsed_ms so we can
+        // compute percentiles per era (avg/p50 for a legacy-300s row
+        // clumps around 300s, current-480s clumps around 480s).
+        const timeoutEra = new Map<number, number[]>();
         let costAuthoritative = 0, costEstimated = 0, costWasted = 0;
         let authoritativeCount = 0; // how many attempts had usageMetadata (older log rows won't)
         const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number; costWasted: number }>();
@@ -11200,13 +11207,17 @@ export function startWebServer(port: number): void {
             // saner FLEX_TIMEOUT_MS.
             elapsedEventual.push(a.elapsed_ms);
           }
-          if (a.outcome === "timeout" || a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
-            elapsedFailure.push(a.elapsed_ms);
+          if (a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
+            elapsedRetryable.push(a.elapsed_ms);
+            elapsedFailure.push(a.elapsed_ms); // kept for the legacy "failure" combined metric
           }
           if (a.outcome === "timeout") {
             costWasted += est;
             const bucket = Math.round(a.elapsed_ms / 60_000) * 60; // seconds, rounded to nearest minute
-            timeoutEra.set(bucket, (timeoutEra.get(bucket) ?? 0) + 1);
+            const arr = timeoutEra.get(bucket) ?? [];
+            arr.push(a.elapsed_ms);
+            timeoutEra.set(bucket, arr);
+            elapsedFailure.push(a.elapsed_ms); // legacy combined
           }
           const key = a.run_id ?? "(no-run-id)";
           const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costActual: 0, costEstimated: 0, costWasted: 0 };
@@ -11224,7 +11235,27 @@ export function startWebServer(port: number): void {
         }
         elapsedSuccess.sort((a, b) => a - b);
         elapsedFailure.sort((a, b) => a - b);
+        elapsedRetryable.sort((a, b) => a - b);
         elapsedEventual.sort((a, b) => a - b);
+
+        // Observation-coverage window: the capture-rate table's
+        // denominator is only trustworthy for rows logged AFTER the
+        // post-timeout observer shipped. Before that, timed-out rows
+        // had NO tail data — we simply gave up. We approximate the
+        // observer-shipped moment from the earliest post_timeout_*
+        // row in the window. If none exist yet, the table is truly
+        // "successes only" and we say so plainly.
+        const firstObsRow = attempts
+          .filter((a) => a.outcome === "post_timeout_success" || a.outcome === "post_timeout_error" || a.outcome === "post_timeout_cap_hit")
+          .map((a) => Date.parse(a.ts_sent))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b)[0] ?? null;
+        // Timeouts that PREDATE the observer — their eventual tail is
+        // unknown, and they're absent from elapsedEventual. This is
+        // the count the operator needs to see to trust the table.
+        const timeoutsWithoutObservation = firstObsRow == null
+          ? attempts.filter((a) => a.outcome === "timeout").length
+          : attempts.filter((a) => a.outcome === "timeout" && Date.parse(a.ts_sent) < firstObsRow).length;
         // Denominator for the top-line rate: excludes observation rows
         // (they duplicate timeout rows we already counted).
         const totalUserFacing = attempts.filter(a =>
@@ -11244,9 +11275,18 @@ export function startWebServer(port: number): void {
             max: arr[arr.length - 1],
           };
         };
-        const latSuccess  = stats(elapsedSuccess);
-        const latFailure  = stats(elapsedFailure);
-        const latEventual = stats(elapsedEventual);
+        const latSuccess   = stats(elapsedSuccess);
+        const latRetryable = stats(elapsedRetryable);
+        const latEventual  = stats(elapsedEventual);
+        // Per-era timeout percentile lines. Sort buckets by seconds
+        // ascending so the table reads legacy-first, current-last.
+        const timeoutEraStats = [...timeoutEra.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([secs, arr]) => ({
+            secs,
+            isCurrent: secs * 1000 === Number(process.env.FLEX_TIMEOUT_MS ?? "480000"),
+            stats: stats(arr.slice().sort((a, b) => a - b)),
+          }));
         const savedVsReplicate = successCount * 0.15 - costAuthoritative - costWasted;
         // "If we had set FLEX_TIMEOUT_MS to N seconds, how many of the
         // eventually-successful attempts would we have caught?"
@@ -11436,7 +11476,7 @@ ${!flexEnabled
   <div class="tile tile-err">
     <div class="tile-label">Timeouts</div>
     <div class="tile-value">${timeoutCount}</div>
-    <div class="tile-sub">${timeoutEra.size === 0 ? `budget ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s · fell to Replicate` : [...timeoutEra.entries()].sort((a,b)=>a[0]-b[0]).map(([secs,n]) => `${n}@${secs}s${secs*1000===cfg.FLEX_TIMEOUT_MS?' (current)':' (legacy)'}`).join(" · ")}</div>
+    <div class="tile-sub">${timeoutEra.size === 0 ? `budget ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s · fell to Replicate` : [...timeoutEra.entries()].sort((a,b)=>a[0]-b[0]).map(([secs,arr]) => `${arr.length}@${secs}s${secs*1000===cfg.FLEX_TIMEOUT_MS?' (current)':' (legacy)'}`).join(" · ")}</div>
   </div>
   <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
   <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
@@ -11445,7 +11485,7 @@ ${!flexEnabled
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <h2>Latency distribution (percentiles in seconds)</h2>
+  <h2>Latency distribution (percentiles in seconds) · current timeout <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code></h2>
   <div style="padding:12px 16px;overflow-x:auto">
     <table style="width:100%;font-size:12px;border-collapse:collapse">
       <thead><tr style="color:var(--ink2)">
@@ -11459,11 +11499,20 @@ ${!flexEnabled
         <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">max</th>
       </tr></thead>
       <tbody>
-        ${[
-          { label: "success (user-facing wins)", s: latSuccess, cls: "ok", note: `real successes returned under the ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s budget` },
-          { label: "failure (429·503·timeout·error)", s: latFailure, cls: "err", note: "elapsed until we gave up. timeouts stamp at the config value — not useful on their own" },
-          { label: "eventual (success + post-timeout success)", s: latEventual, cls: "flex", note: "true distribution — drives the capture-rate table below" },
-        ].map(row => `
+        ${(() => {
+          const rows: Array<{label:string, s: ReturnType<typeof stats>, cls:string, note:string}> = [];
+          rows.push({ label: "success (user-facing wins)", s: latSuccess, cls: "ok", note: `real Google response received under our budget` });
+          rows.push({ label: "eventual (success + post-timeout success)", s: latEventual, cls: "flex", note: "true Flex response distribution — drives the capture-rate table below" });
+          for (const era of timeoutEraStats) {
+            rows.push({
+              label: `timeout — ${era.secs}s budget${era.isCurrent?' (current)':' (legacy)'}`,
+              s: era.stats,
+              cls: era.isCurrent ? "warn" : "err",
+              note: `our own decision to stop waiting at ${era.secs}s. elapsed clusters around the budget by definition — the useful signal is COUNT, not percentile.`,
+            });
+          }
+          rows.push({ label: "retryable failure (429 · 503 · error)", s: latRetryable, cls: "err", note: "Google-side faults we bailed on. distinct from timeout." });
+          return rows.map(row => `
           <tr>
             <td style="padding:5px 10px;color:var(--${row.cls})"><b>${esc(row.label)}</b><div style="color:var(--ink2);font-size:11px;font-weight:normal">${esc(row.note)}</div></td>
             <td style="text-align:right;padding:5px 10px">${row.s.count}</td>
@@ -11473,7 +11522,8 @@ ${!flexEnabled
             <td style="text-align:right;padding:5px 10px">${row.s.p95!=null?(row.s.p95/1000).toFixed(1)+'s':'—'}</td>
             <td style="text-align:right;padding:5px 10px">${row.s.p99!=null?(row.s.p99/1000).toFixed(1)+'s':'—'}</td>
             <td style="text-align:right;padding:5px 10px">${row.s.max!=null?(row.s.max/1000).toFixed(1)+'s':'—'}</td>
-          </tr>`).join("")}
+          </tr>`).join("");
+        })()}
       </tbody>
     </table>
   </div>
@@ -11482,9 +11532,18 @@ ${!flexEnabled
 <div class="card" style="margin-bottom:16px">
   <h2>Capture rate by candidate timeout — "if FLEX_TIMEOUT_MS = N sec, we'd catch X% of eventual successes"</h2>
   <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
-    Higher = more Flex wins, but longer worst-case user wait. Current config: <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code> · observation window: <code>${(cfg.FLEX_OBSERVATION_MS/1000)|0}s</code>.
-    Denominator = ${latEventual.count} eventual successes (real + post-timeout).
-    ${latEventual.count === 0 ? '<div class="warn" style="margin-top:6px;color:var(--warn)">No eventual data yet — trigger a run that hits at least one timeout to populate the tail.</div>' : ''}
+    Higher = more Flex wins, but longer worst-case user wait. Current config: <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code> · observation window: <code>${(cfg.FLEX_OBSERVATION_MS/1000)|0}s</code>.<br>
+    Denominator = <b>${latEventual.count} eventual successes</b> (${elapsedSuccess.length} real success + ${postTimeoutSuccess} post-timeout success).
+  </div>
+  <div style="padding:0 16px 12px;color:var(--ink2);font-size:11.5px;border-top:1px dashed var(--border);margin-top:4px;padding-top:10px">
+    <b style="color:var(--warn)">Data-coverage caveat.</b>
+    ${firstObsRow != null
+      ? `Post-timeout observation started at <code>${esc(new Date(firstObsRow).toISOString().replace('T',' ').slice(0,19))}</code> — the first timed-out row after that has a real eventual-latency measurement. `
+      : `Post-timeout observation hasn't captured a row yet — we've had no timeouts to observe since it shipped, so the table currently only reflects wins-under-budget. `}
+    ${timeoutsWithoutObservation > 0
+      ? `<span style="color:var(--err)"><b>${timeoutsWithoutObservation} timeout row${timeoutsWithoutObservation===1?'':'s'}</b> pre-date the observer</span> and therefore have <b>no tail data</b> — they're excluded from the denominator above. Those show as "timeout — 300s budget (legacy)" in the latency table but contribute nothing to capture rates because we don't know when (or if) Google eventually responded.`
+      : `All timeout rows in the window either have an observation record or are still awaiting one.`}
+    ${latEventual.count === 0 ? '<div style="margin-top:6px;color:var(--warn)">No eventual data yet — trigger a run that hits at least one timeout to populate the tail.</div>' : ''}
   </div>
   <div style="padding:8px 16px 16px;overflow-x:auto">
     <table style="width:100%;font-size:12px;border-collapse:collapse">
