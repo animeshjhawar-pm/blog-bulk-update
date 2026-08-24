@@ -22,7 +22,34 @@ import { GoogleGenAI } from "@google/genai";
 import axios from "axios";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { Agent, setGlobalDispatcher } from "undici";
 import { runOutDir } from "./runOutDir.js";
+
+// Node 20's global `fetch` is undici, which defaults bodyTimeout and
+// headersTimeout to 300000ms — so any Flex call past 5min was dying
+// with "fetch failed" BEFORE our own FLEX_TIMEOUT_MS could fire.
+// Confirmed by an error row on 2026-08-24 with elapsed=300843ms
+// (undici default + ~1s SSL overhead). Replace the global dispatcher
+// with an Agent that tolerates our FLEX_OBSERVATION_MS (15min) plus
+// slack — otherwise the whole observation flow is a mirage. Global
+// affects all fetches in this subprocess, incl. Portkey; Portkey
+// calls typically finish in <30s so raising the ceiling is harmless.
+const FLEX_UNDICI_TIMEOUT_MS = 20 * 60 * 1000;
+let undiciConfigured = false;
+function ensureLongUndiciTimeouts(): void {
+  if (undiciConfigured) return;
+  setGlobalDispatcher(new Agent({
+    bodyTimeout: FLEX_UNDICI_TIMEOUT_MS,
+    headersTimeout: FLEX_UNDICI_TIMEOUT_MS,
+    connectTimeout: 30_000,
+    keepAliveTimeout: 60_000,
+    keepAliveMaxTimeout: 5 * 60_000,
+  }));
+  undiciConfigured = true;
+  process.stderr.write(
+    `flex: undici dispatcher set — body/headers ${FLEX_UNDICI_TIMEOUT_MS}ms (was 300000ms default)\n`,
+  );
+}
 
 const FLEX_MODEL = process.env.FLEX_MODEL ?? "gemini-3-pro-image";
 const FLEX_TIMEOUT_MS = Number(process.env.FLEX_TIMEOUT_MS ?? "480000");
@@ -164,6 +191,17 @@ function classifyError(err: unknown): { outcome: FlexOutcome; status: number | n
   const status: number | null =
     anyErr?.status ?? anyErr?.statusCode ?? anyErr?.response?.status ?? null;
   const msg = String(anyErr?.message ?? err ?? "").toLowerCase();
+  // Undici socket-level timeout: message is "fetch failed" with a
+  // cause code like UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT
+  // (or ETIMEDOUT / socket hang up). Classify as timeout so the
+  // observer flow kicks in, not a generic error. Even after we bump
+  // undici's own default (see ensureLongUndiciTimeouts), OS-level
+  // socket hang-ups can still surface here.
+  const causeCode = anyErr?.cause?.code ?? anyErr?.code ?? "";
+  const undiciTimeoutCodes = /UND_ERR_(HEADERS|BODY|CONNECT)_TIMEOUT|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET/;
+  if (msg === "fetch failed" || undiciTimeoutCodes.test(String(causeCode)) || undiciTimeoutCodes.test(msg)) {
+    return { outcome: "timeout", status };
+  }
   if (status === 429 || /rate.?limit|resource_exhausted|quota/.test(msg)) {
     return { outcome: "429", status };
   }
@@ -560,7 +598,14 @@ export function isFlexEnabled(): boolean {
 export async function generateImageViaFlex(params: FlexParams): Promise<FlexResult> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new FlexError("GEMINI_API_KEY not set", "error", 0, null);
-  const ai = new GoogleGenAI({ apiKey: key });
+  // Bump undici's 5-min default BEFORE the first SDK call. Idempotent.
+  ensureLongUndiciTimeouts();
+  const ai = new GoogleGenAI({
+    apiKey: key,
+    // Belt-and-braces: also set the SDK-level per-call timeout to the
+    // same window. Redundant with undici above but harmless.
+    httpOptions: { timeout: FLEX_UNDICI_TIMEOUT_MS },
+  });
 
   let result: { bytes: Buffer; mimeType: string; elapsed_ms: number };
   let outcome: "success" | "503_retried_success" = "success";
