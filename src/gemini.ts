@@ -8,7 +8,8 @@
 //
 // Retry / fallthrough contract (owned by generate.ts):
 //   - success            → return
-//   - 503                → 1 retry with 5s backoff, then throw FlexError
+//   - 503                → up to 3 retries with 5s / 10s / 20s ±jitter,
+//                          then throw FlexError
 //   - 429 / overloaded   → throw FlexError immediately (fall through)
 //   - timeout (300s)     → throw FlexError immediately (fall through)
 //   - any other error    → throw FlexError immediately (fall through)
@@ -68,6 +69,7 @@ export type FlexOutcome =
   | "429"
   | "503"
   | "503_retried_success"
+  | "fetch_failed"
   | "error"
   // Observed AFTER a user-facing timeout: user already fell back to
   // Replicate, but we kept the Flex request awaited in the background
@@ -130,7 +132,7 @@ interface AttemptLog {
   server_elapsed_ms: number | null;
   outcome: FlexOutcome;
   http_status: number | null;
-  attempt: 1 | 2;
+  attempt: 1 | 2 | 3 | 4;
   model: string;
   /** `modelVersion` field from the response — proves which underlying
    *  build served the call, not just what we asked for. */
@@ -191,16 +193,17 @@ function classifyError(err: unknown): { outcome: FlexOutcome; status: number | n
   const status: number | null =
     anyErr?.status ?? anyErr?.statusCode ?? anyErr?.response?.status ?? null;
   const msg = String(anyErr?.message ?? err ?? "").toLowerCase();
-  // Undici socket-level timeout: message is "fetch failed" with a
+  // Undici socket-level abort: message is "fetch failed" with a
   // cause code like UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT
-  // (or ETIMEDOUT / socket hang up). Classify as timeout so the
-  // observer flow kicks in, not a generic error. Even after we bump
-  // undici's own default (see ensureLongUndiciTimeouts), OS-level
-  // socket hang-ups can still surface here.
+  // (or ETIMEDOUT / socket hang up). Classified as its OWN outcome
+  // (fetch_failed) rather than folded into `timeout` — semantically
+  // distinct: a real `timeout` is our own decision, `fetch_failed`
+  // means the SDK's underlying request died on us. Different fix
+  // paths (raise undici dispatcher for the latter).
   const causeCode = anyErr?.cause?.code ?? anyErr?.code ?? "";
   const undiciTimeoutCodes = /UND_ERR_(HEADERS|BODY|CONNECT)_TIMEOUT|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET/;
   if (msg === "fetch failed" || undiciTimeoutCodes.test(String(causeCode)) || undiciTimeoutCodes.test(msg)) {
-    return { outcome: "timeout", status };
+    return { outcome: "fetch_failed", status };
   }
   if (status === 429 || /rate.?limit|resource_exhausted|quota/.test(msg)) {
     return { outcome: "429", status };
@@ -336,7 +339,7 @@ function safeBasename(s: string): string {
 async function singleAttempt(
   ai: GoogleGenAI,
   params: FlexParams,
-  attempt: 1 | 2,
+  attempt: 1 | 2 | 3 | 4,
 ): Promise<{ bytes: Buffer; mimeType: string; elapsed_ms: number }> {
   const inlineRefs = (
     await Promise.all((params.imageInput ?? []).map((u) => fetchInlineImage(u)))
@@ -610,17 +613,41 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
   let result: { bytes: Buffer; mimeType: string; elapsed_ms: number };
   let outcome: "success" | "503_retried_success" = "success";
 
-  try {
-    result = await singleAttempt(ai, params, 1);
-  } catch (err) {
-    if (!(err instanceof FlexError) || err.outcome !== "503") throw err;
-    process.stderr.write(
-      `flex: 503 on attempt 1 (elapsed=${err.elapsedMs}ms) — retrying once in 5s\n`,
-    );
-    await new Promise((r) => setTimeout(r, 5000));
-    result = await singleAttempt(ai, params, 2);
-    outcome = "503_retried_success";
+  // 503 retry schedule: base backoffs 5s / 10s / 20s (attempts 2, 3, 4).
+  // Multiplied by (1 + rand ±20%) so a mass-503 wave doesn't retry in
+  // lock-step. Retry ONLY on 503 (sheddable capacity) — 429 / timeout /
+  // fetch_failed / any other outcome falls through immediately per the
+  // contract at the top of this file.
+  const RETRY_BACKOFFS_MS = [5_000, 10_000, 20_000];
+  const attempts: Array<1 | 2 | 3 | 4> = [1, 2, 3, 4];
+  let lastErr: FlexError | null = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i]!;
+    if (i > 0) {
+      const base = RETRY_BACKOFFS_MS[i - 1] ?? 20_000;
+      const jitter = 1 + (Math.random() * 0.4 - 0.2); // ±20%
+      const waitMs = Math.round(base * jitter);
+      process.stderr.write(
+        `flex: 503 on attempt ${attempt - 1} (elapsed=${lastErr?.elapsedMs}ms) — retrying #${attempt - 1} in ${waitMs}ms\n`,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    try {
+      result = await singleAttempt(ai, params, attempt);
+      if (attempt > 1) outcome = "503_retried_success";
+      lastErr = null;
+      break;
+    } catch (err) {
+      if (!(err instanceof FlexError)) throw err;
+      lastErr = err;
+      // Retry only on 503. Anything else exits the loop and rethrows.
+      if (err.outcome !== "503" || attempt === attempts[attempts.length - 1]) throw err;
+    }
   }
+  if (lastErr) throw lastErr;
+  // TS: `result` is definitely assigned above by the time we exit
+  // the loop without throwing.
+  result = result!;
 
   // Match rehost.ts EXACTLY — same ephemeral cwd/out layout — so the
   // subsequent downloadImage() no-op's the copy (source === target).

@@ -11201,8 +11201,12 @@ export function startWebServer(port: number): void {
         const flexKeySet = !!process.env.GEMINI_API_KEY;
 
         // Compute aggregates for the tiles.
-        let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0;
+        let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0, fetchFailedCount = 0;
         let postTimeoutSuccess = 0, postTimeoutError = 0, postTimeoutCapHit = 0;
+        // Grouped-error tally: outcome+message → { count, lastSeen, sampleRunIds[] }.
+        // Truncate message to 160 chars so a chatty stack trace doesn't
+        // eat the whole row. Sorted desc by count in the render pass.
+        const errorGroups = new Map<string, { outcome: string; message: string; count: number; lastSeen: string; sampleRunIds: string[] }>();
         let retryFired = 0;
         const elapsedSuccess: number[] = [];
         const elapsedFailure: number[] = [];
@@ -11245,7 +11249,22 @@ export function startWebServer(port: number): void {
           else if (a.outcome === "post_timeout_success") postTimeoutSuccess++;
           else if (a.outcome === "post_timeout_error") postTimeoutError++;
           else if (a.outcome === "post_timeout_cap_hit") postTimeoutCapHit++;
+          else if (a.outcome === "fetch_failed") fetchFailedCount++;
           else errorCount++;
+
+          // Roll every non-success outcome into the grouped-error map
+          // so the dashboard can show "top failure signatures" in one
+          // place. Key includes outcome so identical messages under
+          // different outcome types don't collide.
+          if (a.outcome !== "success" && a.outcome !== "503_retried_success" && a.outcome !== "post_timeout_success") {
+            const msg = ((a.error_message ?? "") || "(no message)").slice(0, 160);
+            const key = `${a.outcome}::${msg}`;
+            const g = errorGroups.get(key) ?? { outcome: a.outcome, message: msg, count: 0, lastSeen: a.ts_sent, sampleRunIds: [] };
+            g.count++;
+            if (a.ts_sent > g.lastSeen) g.lastSeen = a.ts_sent;
+            if (a.run_id && g.sampleRunIds.length < 3 && !g.sampleRunIds.includes(a.run_id)) g.sampleRunIds.push(a.run_id);
+            errorGroups.set(key, g);
+          }
           if (a.attempt === 2) retryFired++;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             elapsedSuccess.push(a.elapsed_ms);
@@ -11464,6 +11483,7 @@ export function startWebServer(port: number): void {
   .pill-post_timeout_success { background:rgba(59,130,246,.15); color:#93c5fd; }
   .pill-post_timeout_error   { background:rgba(148,163,184,.15); color:#94a3b8; }
   .pill-post_timeout_cap_hit { background:rgba(148,163,184,.15); color:#94a3b8; }
+  .pill-fetch_failed         { background:rgba(239,68,68,.15); color:#f87171; }
   .table-scroll { max-height:640px; overflow:auto; }
   .runs-scroll { max-height:640px; overflow:auto; }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; color:var(--ink2); }
@@ -11537,6 +11557,7 @@ ${!flexEnabled
     <div class="tile-sub">${timeoutEra.size === 0 ? `budget ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s · fell to Replicate` : [...timeoutEra.entries()].sort((a,b)=>a[0]-b[0]).map(([secs,arr]) => `${arr.length}@${secs}s${secs*1000===cfg.FLEX_TIMEOUT_MS?' (current)':' (legacy)'}`).join(" · ")}</div>
   </div>
   <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
+  <div class="tile tile-err"><div class="tile-label">Fetch failed (socket)</div><div class="tile-value">${fetchFailedCount}</div><div class="tile-sub">undici / OS-level abort</div></div>
   <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
   <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} have usage</div></div>
   <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">Net vs Replicate</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual + wasted vs $0.15 baseline</div></div>
@@ -11588,6 +11609,32 @@ ${!flexEnabled
 </div>
 
 <div class="card" style="margin-bottom:16px">
+  <h2>Failure signatures — grouped by outcome + error message</h2>
+  <div style="padding:12px 16px;overflow-x:auto">
+    ${errorGroups.size === 0 ? `<div style="color:var(--ink2);font-size:12px">No failures in this window.</div>` : `
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead><tr style="color:var(--ink2)">
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">count</th>
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:180px">outcome</th>
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border)">error message</th>
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:160px">last seen</th>
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:200px">sample runs</th>
+      </tr></thead>
+      <tbody>
+        ${[...errorGroups.values()].sort((a,b) => b.count - a.count).map(g => `
+          <tr>
+            <td style="text-align:right;padding:5px 10px;font-weight:600">${g.count}</td>
+            <td style="padding:5px 10px"><span class="pill pill-${esc(g.outcome)}">${esc(g.outcome)}</span></td>
+            <td style="padding:5px 10px;color:var(--ink);word-break:break-word;max-width:520px">${esc(g.message)}</td>
+            <td style="padding:5px 10px;color:var(--ink2)">${esc(g.lastSeen.replace("T"," ").slice(0,19))}</td>
+            <td style="padding:5px 10px">${g.sampleRunIds.map(rid => `<a href="/runs/${esc(rid)}" style="color:var(--brand);font-family:ui-monospace,monospace;font-size:11px;margin-right:6px">${esc(rid.slice(0,8))}</a>`).join("")}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`}
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
   <h2>Capture rate by candidate timeout — "if FLEX_TIMEOUT_MS = N sec, we'd catch X% of eventual successes"</h2>
   <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
     Higher = more Flex wins, but longer worst-case user wait. Current config: <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code> · observation window: <code>${(cfg.FLEX_OBSERVATION_MS/1000)|0}s</code>.<br>
@@ -11633,6 +11680,7 @@ ${!flexEnabled
           <option value="timeout">timeout</option>
           <option value="429">429 rate-limit</option>
           <option value="503">503 capacity</option>
+          <option value="fetch_failed">fetch failed (socket)</option>
           <option value="error">error</option>
           <option value="post_timeout_success">post-timeout success</option>
           <option value="post_timeout_error">post-timeout error</option>
