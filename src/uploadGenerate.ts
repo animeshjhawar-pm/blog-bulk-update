@@ -642,9 +642,17 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     runId: options.runId,
   });
 
-  await closePool();
   process.stderr.write(
     `upload-generate: done — ${summary.ok} ok, ${summary.failed} failed\n`,
   );
   process.stderr.write(`upload-generate: csv=${csvPath}\nupload-generate: html=${htmlPath}\n`);
+  // Same signal as regen — release the spawn slot + close SSE before
+  // observers drain. See regen.ts's flushFlexObservers call for the
+  // motivation.
+  process.stdout.write(`upload-generate: main-done\n`);
+
+  // Late import to avoid pulling the SDK for non-Flex workloads.
+  const { flushFlexObservers } = await import("./gemini.js");
+  await flushFlexObservers(120_000);
+  await closePool();
 }

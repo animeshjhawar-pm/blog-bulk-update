@@ -674,14 +674,23 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     runId: options.runId,
   });
 
-  // If any images fell to Replicate on a Flex TIMEOUT, keep the
-  // subprocess alive until the detached Flex observers settle (or
-  // hit the observation cap). Without this the process exits and we
-  // never log the true tail latency. Fast when no observers pending.
-  await flushFlexObservers();
-  await closePool();
   process.stderr.write(
     `regen: done — ${summary.ok} ok, ${summary.failed} failed, ${summary.dry_run} dry-run\n`,
   );
   process.stderr.write(`regen: csv=${csvPath}\nregen: html=${htmlPath}\n`);
+  // Signal the parent web process that USER-FACING work is complete —
+  // it releases the concurrency slot and closes the SSE stream on
+  // this marker, so a queued run can start and the "streaming…" pill
+  // clears even while this subprocess continues to drain observers.
+  // MUST be emitted BEFORE any await that could take non-trivial time.
+  process.stdout.write(`regen: main-done\n`);
+
+  // Now drain observers, capped short so the subprocess doesn't linger
+  // long enough to matter operationally. 2 min = enough to catch most
+  // near-timeout Flex tails; anything longer is beyond our observability
+  // budget for now. (Was 15 min — that was too long; a stuck observer
+  // held the subprocess and, before the parent-side slot fix, held the
+  // spawn slot too.)
+  await flushFlexObservers(120_000);
+  await closePool();
 }

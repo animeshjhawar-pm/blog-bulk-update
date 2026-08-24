@@ -127,6 +127,15 @@ interface RunState {
   proc: ChildProcess;
   listeners: Set<ServerResponse>;
   /**
+   * True once the subprocess signalled `regen: main-done` (or an
+   * equivalent for other run modes) — meaning the user-facing work
+   * is complete and its concurrency slot has been released even
+   * though the child process itself may still be alive draining
+   * post-timeout Flex observers. Guards releaseSpawnSlot from
+   * running twice (once on marker, once on child close).
+   */
+  slotReleased?: boolean;
+  /**
    * "regen"           — generated via Replicate/fal subprocess (default).
    * "upload"          — operator dropped client-provided replacement images.
    * "upload-generate" — operator dropped a PRODUCT image per slot; the CLI
@@ -6260,6 +6269,24 @@ function startRegen(opts: {
     // line the moment it hits the rate-limit backoff schedule. Feed
     // that to the global cooldown so new spawns defer.
     if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
+    // Main-done marker — regen.ts emits this AFTER the CSV/HTML are
+    // written but BEFORE it awaits flushFlexObservers(). Users don't
+    // want the run's concurrency slot held for the 15-min observer
+    // window; nor do they want the "streaming…" pill lingering. So we
+    // release the slot + close the SSE stream here, then let the
+    // subprocess quietly drain observers and exit whenever it does.
+    // The child-close handler below is guarded via state.slotReleased
+    // so we don't double-release the slot.
+    if (/^regen: main-done/m.test(text) && !state.slotReleased) {
+      state.slotReleased = true;
+      state.done = true;
+      for (const l of state.listeners) {
+        l.write(`event: end\ndata: ${JSON.stringify({ code: 0, csvPath: state.csvPath, htmlPath: state.htmlPath, note: "main work complete — flex observers may still be draining" })}\n\n`);
+        l.end();
+      }
+      state.listeners.clear();
+      releaseSpawnSlot();
+    }
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
   proc.stdout?.on("data", ondata);
@@ -6272,8 +6299,13 @@ function startRegen(opts: {
       l.end();
     }
     state.listeners.clear();
-    // Free the concurrent-run slot for any queued spawn.
-    releaseSpawnSlot();
+    // Free the concurrent-run slot for any queued spawn — SKIP if the
+    // main-done marker already released it (see the ondata handler
+    // above). Non-flex runs / crashes still take this path.
+    if (!state.slotReleased) {
+      state.slotReleased = true;
+      releaseSpawnSlot();
+    }
     // Unexpected exit → check for orphans this subprocess left behind
     // and auto-resume them. Non-zero code = crash (OOM, unhandled
     // throw); code 0 with orphans = filtered early exit, still worth a
@@ -10784,6 +10816,18 @@ function startUploadGenerate(opts: {
     if (html && html[1]) state.htmlPath = html[1].trim();
     // Feed E003 markers into the global cooldown — same as regen.
     if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
+    // Same early-release semantics as regen: upload-generate spawns
+    // Flex too, so its subprocess can also linger on observers.
+    if (/^upload-generate: main-done/m.test(text) && !state.slotReleased) {
+      state.slotReleased = true;
+      state.done = true;
+      for (const l of state.listeners) {
+        l.write(`event: end\ndata: ${JSON.stringify({ code: 0, csvPath: state.csvPath, htmlPath: state.htmlPath, note: "main work complete — flex observers may still be draining" })}\n\n`);
+        l.end();
+      }
+      state.listeners.clear();
+      releaseSpawnSlot();
+    }
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
   proc.stdout?.on("data", ondata);
@@ -10796,7 +10840,10 @@ function startUploadGenerate(opts: {
       l.end();
     }
     state.listeners.clear();
-    releaseSpawnSlot();
+    if (!state.slotReleased) {
+      state.slotReleased = true;
+      releaseSpawnSlot();
+    }
   });
   return state;
 }
