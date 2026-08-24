@@ -11155,11 +11155,18 @@ export function startWebServer(port: number): void {
 
         // Compute aggregates for the tiles.
         let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0;
+        let postTimeoutSuccess = 0, postTimeoutError = 0, postTimeoutCapHit = 0;
         let retryFired = 0;
         const elapsedSuccess: number[] = [];
+        const elapsedFailure: number[] = [];
+        // Eventual-completion latencies: successful attempts (whatever
+        // their user-facing outcome) — i.e. successes + post_timeout
+        // successes. This is the honest "what timeout catches N% of
+        // real successes?" distribution.
+        const elapsedEventual: number[] = [];
         let costAuthoritative = 0, costEstimated = 0, costWasted = 0;
         let authoritativeCount = 0; // how many attempts had usageMetadata (older log rows won't)
-        const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number }>();
+        const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number; costWasted: number }>();
         for (const a of attempts) {
           const auth = (a as any).cost_authoritative_usd as number | null | undefined;
           const est = a.cost_estimated_usd ?? FLEX_UNIT_COST_USD;
@@ -11169,35 +11176,84 @@ export function startWebServer(port: number): void {
           else if (a.outcome === "timeout") timeoutCount++;
           else if (a.outcome === "429") rateLimit429++;
           else if (a.outcome === "503") unavail503++;
+          else if (a.outcome === "post_timeout_success") postTimeoutSuccess++;
+          else if (a.outcome === "post_timeout_error") postTimeoutError++;
+          else if (a.outcome === "post_timeout_cap_hit") postTimeoutCapHit++;
           else errorCount++;
           if (a.attempt === 2) retryFired++;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             elapsedSuccess.push(a.elapsed_ms);
+            elapsedEventual.push(a.elapsed_ms);
             costEstimated += est;
             if (typeof auth === "number") { costAuthoritative += auth; authoritativeCount++; }
             else costAuthoritative += est; // fall back to estimate for pre-usageMetadata rows
           }
+          if (a.outcome === "post_timeout_success") {
+            // post_timeout doesn't count toward the user-facing success
+            // rate (we already fell back to Replicate). It DOES count
+            // toward the "eventual" latency distribution used to pick a
+            // saner FLEX_TIMEOUT_MS.
+            elapsedEventual.push(a.elapsed_ms);
+          }
+          if (a.outcome === "timeout" || a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
+            elapsedFailure.push(a.elapsed_ms);
+          }
           if (a.outcome === "timeout") costWasted += est;
           const key = a.run_id ?? "(no-run-id)";
-          const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costActual: 0, costEstimated: 0 };
-          rec.total++;
+          const rec = perRun.get(key) ?? { total: 0, success: 0, timeout: 0, failed: 0, costActual: 0, costEstimated: 0, costWasted: 0 };
+          // Don't double-count observation rows in per-run totals; they
+          // duplicate the timeout row that was already counted.
+          const isObservation = a.outcome === "post_timeout_success" || a.outcome === "post_timeout_error" || a.outcome === "post_timeout_cap_hit";
+          if (!isObservation) rec.total++;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             rec.success++;
             rec.costActual += perAttemptCost;
             rec.costEstimated += est;
-          } else if (a.outcome === "timeout") rec.timeout++;
-          else rec.failed++;
+          } else if (a.outcome === "timeout") { rec.timeout++; rec.costWasted += est; }
+          else if (!isObservation) rec.failed++;
           perRun.set(key, rec);
         }
         elapsedSuccess.sort((a, b) => a - b);
+        elapsedFailure.sort((a, b) => a - b);
+        elapsedEventual.sort((a, b) => a - b);
+        // Denominator for the top-line rate: excludes observation rows
+        // (they duplicate timeout rows we already counted).
+        const totalUserFacing = attempts.filter(a =>
+          a.outcome !== "post_timeout_success" &&
+          a.outcome !== "post_timeout_error" &&
+          a.outcome !== "post_timeout_cap_hit"
+        ).length;
         const total = attempts.length;
-        const successRate = total > 0 ? (successCount / total) : null;
-        const avgLatency = elapsedSuccess.length > 0
-          ? Math.round(elapsedSuccess.reduce((s, n) => s + n, 0) / elapsedSuccess.length)
-          : null;
-        const p50 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.5)] : null;
-        const p95 = elapsedSuccess.length > 0 ? elapsedSuccess[Math.floor(elapsedSuccess.length * 0.95)] : null;
+        const successRate = totalUserFacing > 0 ? (successCount / totalUserFacing) : null;
+        const stats = (arr: number[]) => {
+          if (arr.length === 0) return { count: 0, avg: null, p50: null, p90: null, p95: null, p99: null, max: null };
+          const pick = (p: number) => arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
+          return {
+            count: arr.length,
+            avg: Math.round(arr.reduce((s, n) => s + n, 0) / arr.length),
+            p50: pick(0.5), p90: pick(0.9), p95: pick(0.95), p99: pick(0.99),
+            max: arr[arr.length - 1],
+          };
+        };
+        const latSuccess  = stats(elapsedSuccess);
+        const latFailure  = stats(elapsedFailure);
+        const latEventual = stats(elapsedEventual);
         const savedVsReplicate = successCount * 0.15 - costAuthoritative - costWasted;
+        // "If we had set FLEX_TIMEOUT_MS to N seconds, how many of the
+        // eventually-successful attempts would we have caught?"
+        // Buckets picked to bracket the current 480s config + likely
+        // production bounds. Computed off elapsedEventual so post_timeout
+        // successes count too — the whole point of observation.
+        const captureBuckets = [30, 60, 90, 120, 180, 240, 300, 360, 480, 600, 720, 900].map((secs) => {
+          const cap = secs * 1000;
+          const caught = elapsedEventual.filter(ms => ms <= cap).length;
+          return {
+            secs,
+            caught,
+            total: elapsedEventual.length,
+            pct: elapsedEventual.length > 0 ? (caught / elapsedEventual.length) : null,
+          };
+        });
 
         const runsSorted = [...perRun.entries()]
           .map(([run_id, s]) => ({ run_id, ...s }))
@@ -11217,7 +11273,8 @@ export function startWebServer(port: number): void {
 
         const cfg = {
           FLEX_ENABLED: flexEnabled,
-          FLEX_TIMEOUT_MS: Number(process.env.FLEX_TIMEOUT_MS ?? "300000"),
+          FLEX_TIMEOUT_MS: Number(process.env.FLEX_TIMEOUT_MS ?? "480000"),
+          FLEX_OBSERVATION_MS: Number(process.env.FLEX_OBSERVATION_MS ?? "900000"),
           FLEX_MODEL,
           FLEX_UNIT_COST_USD,
           GEMINI_API_KEY_SET: flexKeySet,
@@ -11275,6 +11332,9 @@ export function startWebServer(port: number): void {
   .pill-429 { background:rgba(245,158,11,.15); color:#fbbf24; }
   .pill-503 { background:rgba(245,158,11,.15); color:#fbbf24; }
   .pill-error { background:rgba(148,163,184,.15); color:#cbd5e1; }
+  .pill-post_timeout_success { background:rgba(59,130,246,.15); color:#93c5fd; }
+  .pill-post_timeout_error   { background:rgba(148,163,184,.15); color:#94a3b8; }
+  .pill-post_timeout_cap_hit { background:rgba(148,163,184,.15); color:#94a3b8; }
   .table-scroll { max-height:640px; overflow:auto; }
   .runs-scroll { max-height:640px; overflow:auto; }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; color:var(--ink2); }
@@ -11335,15 +11395,77 @@ ${!flexEnabled
         : `<div class="banner banner-ok">Flex is HEALTHY — ${(successRate!*100).toFixed(1)}% success over ${total} attempts.</div>`}
 
 <div class="tiles">
-  <div class="tile"><div class="tile-label">Attempts</div><div class="tile-value">${total}</div><div class="tile-sub">peak concurrency ${peakConcurrency}</div></div>
+  <div class="tile ${successRate!=null && successRate>=0.9 ? 'tile-good' : successRate!=null && successRate>=0.5 ? 'tile-warn' : 'tile-err'}">
+    <div class="tile-label">Success %</div>
+    <div class="tile-value">${successRate!=null?`${(successRate*100).toFixed(1)}%`:'—'}</div>
+    <div class="tile-sub">${successCount} / ${totalUserFacing} user-facing attempts</div>
+  </div>
+  <div class="tile"><div class="tile-label">Attempts (user-facing)</div><div class="tile-value">${totalUserFacing}</div><div class="tile-sub">peak concurrency ${peakConcurrency}${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit>0?` · +${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit} obs`:''}</div></div>
   <div class="tile tile-good"><div class="tile-label">Success</div><div class="tile-value">${successCount}</div><div class="tile-sub">${retriedSuccess} via 503 retry</div></div>
   <div class="tile tile-err"><div class="tile-label">Timeouts (${(cfg.FLEX_TIMEOUT_MS/1000)|0}s)</div><div class="tile-value">${timeoutCount}</div><div class="tile-sub">fell to Replicate</div></div>
-  <div class="tile tile-warn"><div class="tile-label">429 (rate-limited)</div><div class="tile-value">${rateLimit429}</div><div class="tile-sub">fell to Replicate</div></div>
-  <div class="tile tile-warn"><div class="tile-label">503 (capacity)</div><div class="tile-value">${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
-  <div class="tile"><div class="tile-label">Latency avg / p50 / p95</div><div class="tile-value" style="font-size:15px">${avgLatency!=null?`${(avgLatency/1000).toFixed(1)}s / ${(p50!/1000).toFixed(1)}s / ${(p95!/1000).toFixed(1)}s`:'—'}</div><div class="tile-sub">success only</div></div>
-  <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} rows have usage</div></div>
-  <div class="tile"><div class="tile-label">Flex billed (flat est.)</div><div class="tile-value">$${costEstimated.toFixed(3)}</div><div class="tile-sub">success × $${FLEX_UNIT_COST_USD} sticker</div></div>
-  <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">vs Replicate baseline</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual vs all-Replicate ($0.15/img)</div></div>
+  <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
+  <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
+  <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} have usage</div></div>
+  <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">Net vs Replicate</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual + wasted vs $0.15 baseline</div></div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>Latency distribution (percentiles in seconds)</h2>
+  <div style="padding:12px 16px;overflow-x:auto">
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead><tr style="color:var(--ink2)">
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border)">series</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">n</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">avg</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">p50</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">p90</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">p95</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">p99</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border)">max</th>
+      </tr></thead>
+      <tbody>
+        ${[
+          { label: "success (user-facing wins)", s: latSuccess, cls: "ok", note: `real successes returned under the ${(cfg.FLEX_TIMEOUT_MS/1000)|0}s budget` },
+          { label: "failure (429·503·timeout·error)", s: latFailure, cls: "err", note: "elapsed until we gave up. timeouts stamp at the config value — not useful on their own" },
+          { label: "eventual (success + post-timeout success)", s: latEventual, cls: "flex", note: "true distribution — drives the capture-rate table below" },
+        ].map(row => `
+          <tr>
+            <td style="padding:5px 10px;color:var(--${row.cls})"><b>${esc(row.label)}</b><div style="color:var(--ink2);font-size:11px;font-weight:normal">${esc(row.note)}</div></td>
+            <td style="text-align:right;padding:5px 10px">${row.s.count}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.avg!=null?(row.s.avg/1000).toFixed(1)+'s':'—'}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.p50!=null?(row.s.p50/1000).toFixed(1)+'s':'—'}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.p90!=null?(row.s.p90/1000).toFixed(1)+'s':'—'}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.p95!=null?(row.s.p95/1000).toFixed(1)+'s':'—'}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.p99!=null?(row.s.p99/1000).toFixed(1)+'s':'—'}</td>
+            <td style="text-align:right;padding:5px 10px">${row.s.max!=null?(row.s.max/1000).toFixed(1)+'s':'—'}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>Capture rate by candidate timeout — "if FLEX_TIMEOUT_MS = N sec, we'd catch X% of eventual successes"</h2>
+  <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
+    Higher = more Flex wins, but longer worst-case user wait. Current config: <code style="color:var(--brand)">${(cfg.FLEX_TIMEOUT_MS/1000)|0}s</code> · observation window: <code>${(cfg.FLEX_OBSERVATION_MS/1000)|0}s</code>.
+    Denominator = ${latEventual.count} eventual successes (real + post-timeout).
+    ${latEventual.count === 0 ? '<div class="warn" style="margin-top:6px;color:var(--warn)">No eventual data yet — trigger a run that hits at least one timeout to populate the tail.</div>' : ''}
+  </div>
+  <div style="padding:8px 16px 16px;overflow-x:auto">
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead><tr style="color:var(--ink2)">
+        ${captureBuckets.map(b => `<th style="text-align:center;padding:6px 8px;border-bottom:1px solid var(--border);${b.secs*1000===cfg.FLEX_TIMEOUT_MS?'color:var(--brand);':''}">${b.secs}s${b.secs*1000===cfg.FLEX_TIMEOUT_MS?' (current)':''}</th>`).join("")}
+      </tr></thead>
+      <tbody>
+        <tr>
+          ${captureBuckets.map(b => `<td style="text-align:center;padding:5px 8px;color:${b.pct==null?'var(--ink2)':b.pct>=0.9?'var(--ok)':b.pct>=0.5?'var(--warn)':'var(--err)'};font-weight:600">${b.pct==null?'—':(b.pct*100).toFixed(0)+'%'}</td>`).join("")}
+        </tr>
+        <tr style="color:var(--ink2);font-size:11px">
+          ${captureBuckets.map(b => `<td style="text-align:center;padding:2px 8px">${b.caught}/${b.total}</td>`).join("")}
+        </tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <div class="row">
@@ -11479,6 +11601,7 @@ ${attempts.slice().reverse().map((a, i) => {
     <div class="cfg-strip">
       Config: FLEX_ENABLED=<code>${esc(String(cfg.FLEX_ENABLED))}</code>
       · FLEX_TIMEOUT_MS=<code>${cfg.FLEX_TIMEOUT_MS}</code>
+      · FLEX_OBSERVATION_MS=<code>${cfg.FLEX_OBSERVATION_MS}</code>
       · FLEX_MODEL=<code>${esc(cfg.FLEX_MODEL)}</code>
       · GEMINI_API_KEY set=<code>${cfg.GEMINI_API_KEY_SET}</code>
     </div>

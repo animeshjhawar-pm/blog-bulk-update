@@ -25,7 +25,14 @@ import path from "node:path";
 import { runOutDir } from "./runOutDir.js";
 
 const FLEX_MODEL = process.env.FLEX_MODEL ?? "gemini-3-pro-image";
-const FLEX_TIMEOUT_MS = Number(process.env.FLEX_TIMEOUT_MS ?? "300000");
+const FLEX_TIMEOUT_MS = Number(process.env.FLEX_TIMEOUT_MS ?? "480000");
+// Total observation window from t_sent — we keep awaiting the Flex
+// promise past the user-facing timeout so we learn the true tail.
+// Not the user-facing budget; strictly a research/monitoring lever.
+// If it fires before Google responds, we log outcome=post_timeout_cap_hit
+// and stop waiting (socket may still leak until Node reaps it — Google
+// SDK doesn't expose an abort signal we can safely bind to yet).
+const FLEX_OBSERVATION_MS = Number(process.env.FLEX_OBSERVATION_MS ?? "900000");
 const FLEX_UNIT_COST_USD = 0.067; // 1K/2K image at Flex tier (2026-08 pricing page)
 
 export type FlexOutcome =
@@ -34,7 +41,15 @@ export type FlexOutcome =
   | "429"
   | "503"
   | "503_retried_success"
-  | "error";
+  | "error"
+  // Observed AFTER a user-facing timeout: user already fell back to
+  // Replicate, but we kept the Flex request awaited in the background
+  // so we can measure the true tail (answers "what timeout would have
+  // captured this?"). All three are additional log rows, not returned
+  // to the caller — the run is already done.
+  | "post_timeout_success"
+  | "post_timeout_error"
+  | "post_timeout_cap_hit";
 
 export class FlexError extends Error {
   constructor(
@@ -329,17 +344,22 @@ async function singleAttempt(
     cost_authoritative_usd: null,
   };
 
+  // Detach the underlying request so we can KEEP AWAITING it after a
+  // user-facing timeout — that's the only way we learn the true tail
+  // and can defend a specific FLEX_TIMEOUT_MS number with data.
+  const requestPromise = ai.models.generateContent({
+    model: FLEX_MODEL,
+    contents: [{ role: "user", parts }],
+    config: {
+      // @ts-expect-error - Flex tier flag; SDK types may lag
+      serviceTier: "flex",
+      responseModalities: ["IMAGE"],
+    },
+  });
+
   try {
     const resp = await Promise.race([
-      ai.models.generateContent({
-        model: FLEX_MODEL,
-        contents: [{ role: "user", parts }],
-        config: {
-          // @ts-expect-error - Flex tier flag; SDK types may lag
-          serviceTier: "flex",
-          responseModalities: ["IMAGE"],
-        },
-      }),
+      requestPromise,
       new Promise((_, rej) =>
         setTimeout(() => rej(new Error("FLEX_TIMEOUT")), FLEX_TIMEOUT_MS),
       ),
@@ -411,7 +431,119 @@ async function singleAttempt(
       error_message: errorMessage,
       cost_estimated_usd: outcome === "timeout" ? FLEX_UNIT_COST_USD : 0,
     });
+    // POST-TIMEOUT OBSERVATION — user-facing path already fell through
+    // to Replicate. Keep waiting for the real Flex answer up to
+    // FLEX_OBSERVATION_MS from t_sent, then log an additional row so
+    // the dashboard can compute "what timeout would have caught this?"
+    if (outcome === "timeout" && FLEX_OBSERVATION_MS > FLEX_TIMEOUT_MS) {
+      const remainingMs = FLEX_OBSERVATION_MS - (Date.now() - t_sent);
+      if (remainingMs > 0) {
+        // .catch on the outer race is intentional — we don't want the
+        // observer to bubble an unhandledRejection.
+        const observer = Promise.race([
+          requestPromise.then(
+            (resp) => ({ kind: "settled" as const, resp, err: null }),
+            (e) => ({ kind: "settled" as const, resp: null, err: e }),
+          ),
+          new Promise<{ kind: "cap" }>((res) =>
+            setTimeout(() => res({ kind: "cap" }), remainingMs),
+          ),
+        ])
+          .then(async (r) => {
+            const obsElapsed = Date.now() - t_sent;
+            if (r.kind === "cap") {
+              await appendLog({
+                ...baseLog,
+                ts_returned: new Date().toISOString(),
+                elapsed_ms: obsElapsed,
+                outcome: "post_timeout_cap_hit",
+                http_status: null,
+                bytes: 0,
+                mime: null,
+                error_message: `no response after ${(FLEX_OBSERVATION_MS / 1000) | 0}s observation window`,
+                cost_estimated_usd: 0,
+              });
+              return;
+            }
+            if (r.err) {
+              await appendLog({
+                ...baseLog,
+                ts_returned: new Date().toISOString(),
+                elapsed_ms: obsElapsed,
+                outcome: "post_timeout_error",
+                http_status: (r.err as any)?.status ?? null,
+                bytes: 0,
+                mime: null,
+                error_message: (r.err as Error)?.message ?? String(r.err),
+                cost_estimated_usd: 0,
+              });
+              return;
+            }
+            const anyResp: any = r.resp;
+            const usageInfo = extractUsage(anyResp, inlineRefs.length);
+            const respParts = anyResp?.candidates?.[0]?.content?.parts ?? [];
+            const imgPart = respParts.find((p: any) => p.inlineData?.data);
+            const bytes = imgPart?.inlineData?.data
+              ? Buffer.from(imgPart.inlineData.data, "base64").length
+              : 0;
+            const mime = imgPart?.inlineData?.mimeType ?? null;
+            await appendLog({
+              ...baseLog,
+              ts_returned: new Date().toISOString(),
+              elapsed_ms: obsElapsed,
+              outcome: "post_timeout_success",
+              http_status: 200,
+              bytes,
+              mime,
+              error_message: null,
+              cost_estimated_usd: FLEX_UNIT_COST_USD,
+              model_version: usageInfo.model_version,
+              served_tier: usageInfo.served_tier,
+              response_id: usageInfo.response_id,
+              server_elapsed_ms: usageInfo.server_elapsed_ms,
+              usage: usageInfo.usage,
+              cost_authoritative_usd: usageInfo.cost_authoritative,
+            });
+          })
+          .catch((e) => {
+            process.stderr.write(
+              `flex: observer for ${params.imageId} crashed: ${(e as Error).message}\n`,
+            );
+          })
+          .finally(() => {
+            pendingObservers.delete(observer);
+          });
+        pendingObservers.add(observer);
+      }
+    }
     throw new FlexError(errorMessage, outcome, elapsed, httpStatus);
+  }
+}
+
+// Live observer set — populated when a post-timeout observation is
+// detached, drained when it settles. Regen.ts calls flushFlexObservers()
+// after the main workload so the subprocess doesn't exit before its
+// observers can write their log rows. Observation lives inside the
+// regen subprocess (that's where the SDK call was made); if the
+// subprocess dies for other reasons — Railway redeploy, SIGKILL — the
+// pending observation is lost. Acceptable for a research feature.
+const pendingObservers: Set<Promise<unknown>> = new Set();
+
+export async function flushFlexObservers(maxWaitMs?: number): Promise<void> {
+  if (pendingObservers.size === 0) return;
+  const wait = maxWaitMs ?? FLEX_OBSERVATION_MS + 30_000;
+  const n = pendingObservers.size;
+  process.stderr.write(
+    `flex: waiting for ${n} post-timeout observer(s) to settle (max ${wait}ms)\n`,
+  );
+  await Promise.race([
+    Promise.allSettled([...pendingObservers]),
+    new Promise((r) => setTimeout(r, wait)),
+  ]);
+  if (pendingObservers.size > 0) {
+    process.stderr.write(
+      `flex: exiting with ${pendingObservers.size} observer(s) still pending — those tail rows will not be logged\n`,
+    );
   }
 }
 

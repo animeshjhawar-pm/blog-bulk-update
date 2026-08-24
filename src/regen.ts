@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { loadEnv } from "./env.js";
 import { runOutDir } from "./runOutDir.js";
+import { flushFlexObservers } from "./gemini.js";
 import {
   closePool,
   listPublishedClusters,
@@ -673,6 +674,11 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     runId: options.runId,
   });
 
+  // If any images fell to Replicate on a Flex TIMEOUT, keep the
+  // subprocess alive until the detached Flex observers settle (or
+  // hit the observation cap). Without this the process exits and we
+  // never log the true tail latency. Fast when no observers pending.
+  await flushFlexObservers();
   await closePool();
   process.stderr.write(
     `regen: done — ${summary.ok} ok, ${summary.failed} failed, ${summary.dry_run} dry-run\n`,
