@@ -685,12 +685,15 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   // MUST be emitted BEFORE any await that could take non-trivial time.
   process.stdout.write(`regen: main-done\n`);
 
-  // Now drain observers, capped short so the subprocess doesn't linger
-  // long enough to matter operationally. 2 min = enough to catch most
-  // near-timeout Flex tails; anything longer is beyond our observability
-  // budget for now. (Was 15 min — that was too long; a stuck observer
-  // held the subprocess and, before the parent-side slot fix, held the
-  // spawn slot too.)
-  await flushFlexObservers(120_000);
+  // Now drain observers. Wait long enough for every observer to reach
+  // its OWN internal cap (FLEX_OBSERVATION_MS from t_sent) — default
+  // FLEX_OBSERVATION_MS + 30s slack. The subprocess lives this long
+  // AFTER user-facing work is done, but that's harmless: the parent
+  // released the spawn slot + closed the SSE stream on `main-done`
+  // above, so users see no delay and no queueing. Only cost is a
+  // lingering Node process per timed-out image (~100 MB RAM each).
+  // If Google eventually responds within the window we capture the
+  // real tail latency — the whole point of the evaluation.
+  await flushFlexObservers();
   await closePool();
 }

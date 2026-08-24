@@ -652,7 +652,10 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
   process.stdout.write(`upload-generate: main-done\n`);
 
   // Late import to avoid pulling the SDK for non-Flex workloads.
+  // Wait the full observation window — subprocess lingers but the
+  // parent already released the spawn slot + closed SSE on main-done,
+  // so no user-visible impact. See regen.ts for the full rationale.
   const { flushFlexObservers } = await import("./gemini.js");
-  await flushFlexObservers(120_000);
+  await flushFlexObservers();
   await closePool();
 }
