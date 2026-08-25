@@ -660,6 +660,17 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
       lastErr = err;
       // Retry only on 503. Anything else exits the loop and rethrows.
       if (err.outcome !== "503" || attempt === attempts[attempts.length - 1]) throw err;
+      // FAST-503 short-circuit: a retry that 503s in under 3s means
+      // Google definitively has no capacity right now (they didn't
+      // even queue us). Waiting through more retries — each 10-20s
+      // backoff — just costs the operator time. Fall through to the
+      // Replicate/fal chain immediately in that case.
+      if (attempt >= 2 && err.elapsedMs < 3000) {
+        process.stderr.write(
+          `flex: fast-503 short-circuit — attempt ${attempt} bailed in ${err.elapsedMs}ms (< 3s), skipping remaining retries\n`,
+        );
+        throw err;
+      }
     }
   }
   if (lastErr) throw lastErr;
