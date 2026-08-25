@@ -31,6 +31,7 @@
     "csv-parse": "^6.2.1",
     "csv-stringify": "^6.5.2",
     "dotenv": "^16.4.5",
+    "openai": "^7.5.0",
     "p-limit": "^6.2.0",
     "pg": "^8.13.1",
     "replicate": "^1.0.1",

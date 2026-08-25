@@ -385,6 +385,19 @@ async function singleAttempt(
     cost_authoritative_usd: null,
   };
 
+  // Gemini's SDK supports "1:1", "2:3", "3:2", "3:4", "4:3", "9:16",
+  // "16:9", "21:9". Anything else the model rejects. Pass what we
+  // have if it matches; otherwise omit (model falls back to its
+  // default rather than error). Our DEFAULT_ASPECT map only ever
+  // emits "16:9" / "3:2" / "1:1" today so this is defensive.
+  const SUPPORTED_ASPECTS = new Set(["1:1","2:3","3:2","3:4","4:3","9:16","16:9","21:9"]);
+  const aspectRatio = SUPPORTED_ASPECTS.has(params.aspectRatio) ? params.aspectRatio : undefined;
+  if (!aspectRatio && params.aspectRatio) {
+    process.stderr.write(
+      `flex: aspectRatio "${params.aspectRatio}" not in Gemini's supported list — omitting from imageConfig\n`,
+    );
+  }
+
   // Detach the underlying request so we can KEEP AWAITING it after a
   // user-facing timeout — that's the only way we learn the true tail
   // and can defend a specific FLEX_TIMEOUT_MS number with data.
@@ -395,6 +408,11 @@ async function singleAttempt(
       // @ts-expect-error - Flex tier flag; SDK types may lag
       serviceTier: "flex",
       responseModalities: ["IMAGE"],
+      // Explicit imageConfig — WITHOUT this Gemini uses its default
+      // (~1:1) regardless of what the prompt text says. Confirmed
+      // via run dd0f86f4 (2026-08-25): 92/92 images via Flex, all
+      // with default aspect instead of the 16:9/3:2 asked.
+      ...(aspectRatio ? { imageConfig: { aspectRatio } } : {}),
     },
   });
 
