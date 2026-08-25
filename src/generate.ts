@@ -13,26 +13,31 @@ function isReplicateRateLimitError(err: unknown): boolean {
   return /ModelRateLimitError|\(E003\)|currently unavailable due to high demand/i.test(msg);
 }
 
-// Broader "Replicate is having a bad time, try the next layer"
-// classifier. Includes E003 PLUS the non-rate-limit infrastructure
-// errors ops actually see in the wild — connection resets, upstream
-// gateway timeouts, Cloudflare 5xx, and Replicate's own async pred
-// wrapper wrapping any of those in HTTPStatusError / ReadTimeout.
-//
-// The fallback chain in generate() only escapes to layer-2 /
-// fal.ai on rate-limit errors before this. Adding these shapes so
-// transient infra flakes (ops report: "8 of 10 apply, 2 miss") also
-// fall through instead of dying at the pro layer with a red X.
-function isReplicateTransientInfraError(err: unknown): boolean {
-  if (isReplicateRateLimitError(err)) return true;
+// Widened 2026-08-25: fall to fal.ai on ANY Replicate failure EXCEPT
+// the two known-permanent shapes where fal can't help. Rationale:
+// per-image fal cost is $0.039 vs an operator having to Regenerate
+// manually. Losing $0.039 on a doomed-anyway safety refusal is worse
+// than losing operator time, so we explicitly still skip fal on:
+//   1. Nano-banana-pro safety-filter refusals — fal runs the SAME
+//      underlying model, so its safety filter will refuse too.
+//      Prompt needs a human fix, not a provider switch.
+//   2. 4xx caller-side errors (auth, malformed input, missing prompt) —
+//      fal will 4xx the same request. Nothing changes.
+// Everything else — infra flakes, empty outputs, Cloudflare 403,
+// timeouts, unwrapped 5xx — gets a fal attempt.
+function isReplicateSafetyRefusal(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? "");
-  // Prefix guard so we don't accidentally fall back on genuine
-  // caller-side errors (missing prompt, auth 401, malformed input);
-  // only messages that came from Replicate's async prediction
-  // wrapper qualify. Replicate wraps upstream failures as
-  // "Async prediction failed: <type>: …" — that's the tell.
-  if (!/Async prediction failed|Replicate prediction failed|Replicate error/.test(msg)) return false;
-  return /HTTPStatusError|ReadTimeout|ConnectTimeout|ECONNRESET|ETIMEDOUT|Client error '499|Client error '502|Client error '503|Client error '504|Server error '5\d\d/i.test(msg);
+  return /safety filter|content policy|content_policy_violation|flagged as unsafe|violates .* usage polic|responsible ai|refused to generate/i.test(msg);
+}
+function isCallerSide4xx(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /Client error '4(0[0-49]|1\d|2\d|3\d)|Bad request|Unauthorized|Forbidden|Not found|Unprocessable/i.test(msg)
+    && !/Client error '429/.test(msg); // 429 = rate-limit → still worth fal
+}
+function isReplicateTransientInfraError(err: unknown): boolean {
+  if (isReplicateSafetyRefusal(err)) return false;
+  if (isCallerSide4xx(err)) return false;
+  return true;
 }
 
 export interface GenerateParams {
@@ -181,10 +186,12 @@ export async function generate(params: GenerateParams): Promise<GenerateResult> 
   } catch (err) {
     if (!isReplicateTransientInfraError(err) || !process.env.FAL_KEY) throw err;
 
-    // Layer 2 — fal.ai nano-banana-pro. Different provider, only fires
-    // when Replicate is throttled AND FAL_KEY is set.
+    // Layer 2 — fal.ai nano-banana-pro. Different provider, fires on
+    // ANY Replicate failure except known-permanent shapes (safety
+    // refusals + caller-side 4xx). See classifier above.
+    const errMsg = (err as Error)?.message ?? String(err);
     process.stderr.write(
-      `generate: Replicate nano-banana-pro E003 exhausted — falling back to fal.ai nano-banana-pro\n`,
+      `generate: Replicate nano-banana-pro failed (${errMsg.slice(0, 160)}) — falling back to fal.ai\n`,
     );
     try {
       const fb = await generateImageViaFalNanoBanana({
