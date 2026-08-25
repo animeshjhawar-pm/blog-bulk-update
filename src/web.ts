@@ -11202,6 +11202,12 @@ export function startWebServer(port: number): void {
 
         // Compute aggregates for the tiles.
         let successCount = 0, timeoutCount = 0, rateLimit429 = 0, unavail503 = 0, retriedSuccess = 0, errorCount = 0, fetchFailedCount = 0;
+        // Retry breakdown: rows keyed by attempt number, one column per
+        // outcome. attempt=1 shows the base first-try distribution;
+        // attempt=2/3/4 show what each retry produced. success at
+        // attempt>1 is logged as outcome=503_retried_success — that's
+        // the "retry saved us" metric.
+        const retryGrid: Record<number, Record<string, number>> = { 1: {}, 2: {}, 3: {}, 4: {} };
         let postTimeoutSuccess = 0, postTimeoutError = 0, postTimeoutCapHit = 0;
         // Grouped-error tally: outcome+message → { count, lastSeen, sampleRunIds[] }.
         // Truncate message to 160 chars so a chatty stack trace doesn't
@@ -11265,7 +11271,11 @@ export function startWebServer(port: number): void {
             if (a.run_id && g.sampleRunIds.length < 3 && !g.sampleRunIds.includes(a.run_id)) g.sampleRunIds.push(a.run_id);
             errorGroups.set(key, g);
           }
-          if (a.attempt === 2) retryFired++;
+          // retryFired = any attempt > 1 (i.e. retry #1/#2/#3 that fired
+          // because attempt 1 hit 503). Not just attempt 2.
+          if (a.attempt > 1) retryFired++;
+          const att = a.attempt >= 1 && a.attempt <= 4 ? a.attempt : 1;
+          retryGrid[att]![a.outcome] = (retryGrid[att]![a.outcome] ?? 0) + 1;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             elapsedSuccess.push(a.elapsed_ms);
             elapsedEventual.push(a.elapsed_ms);
@@ -11571,9 +11581,72 @@ ${!flexEnabled
   </div>
   <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
   <div class="tile tile-err"><div class="tile-label">Fetch failed (socket)</div><div class="tile-value">${fetchFailedCount}</div><div class="tile-sub">undici / OS-level abort</div></div>
+  <div class="tile ${retriedSuccess>0?'tile-good':''}"><div class="tile-label">Retries that saved</div><div class="tile-value">${retriedSuccess} / ${retryFired}</div><div class="tile-sub">succeeded after ≥1 503 retry · ${retryFired>0?`${((retriedSuccess/retryFired)*100).toFixed(0)}% payoff`:'no retries fired yet'}</div></div>
   <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
   <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} have usage</div></div>
   <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">Net vs Replicate</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual + wasted vs $0.15 baseline</div></div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>Retry breakdown — did the 3× 5s/10s/20s±jitter policy help?</h2>
+  <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
+    Each row is one attempt slot. attempt=1 = first try. attempt=2/3/4 = successive retries fired only on 503.
+    A retry that saves lands as <span class="pill pill-503_retried_success">503_retried_success</span> in that attempt's row.
+  </div>
+  <div style="padding:8px 16px 16px;overflow-x:auto">
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead><tr style="color:var(--ink2)">
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:110px">attempt</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">total</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:80px;color:var(--ok)">success</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:110px;color:var(--flex)">saved by retry</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">503</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">429</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:80px">timeout</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:110px">fetch failed</th>
+        <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">error</th>
+      </tr></thead>
+      <tbody>
+        ${[1,2,3,4].map(n => {
+          const row = retryGrid[n] ?? {};
+          const total = Object.values(row).reduce((s: number, v: number) => s + v, 0);
+          const cell = (v: number | undefined) => `<td style="text-align:right;padding:5px 10px">${v ?? 0}</td>`;
+          const label = n === 1
+            ? '<b>1</b> (first try)'
+            : `<b>${n}</b> (retry #${n-1}, ${n===2?'~5s':n===3?'~10s':'~20s'}±jitter)`;
+          return `
+          <tr${total===0?' style="color:var(--ink2)"':''}>
+            <td style="padding:5px 10px">${label}</td>
+            <td style="text-align:right;padding:5px 10px">${total}</td>
+            <td style="text-align:right;padding:5px 10px;color:var(--ok)">${row.success ?? 0}</td>
+            <td style="text-align:right;padding:5px 10px;color:var(--flex)">${row['503_retried_success'] ?? 0}</td>
+            ${cell(row['503'])}
+            ${cell(row['429'])}
+            ${cell(row.timeout)}
+            ${cell(row.fetch_failed)}
+            ${cell(row.error)}
+          </tr>`;
+        }).join("")}
+        <tr style="border-top:1px solid var(--border);font-weight:600">
+          <td style="padding:6px 10px">totals across retries (attempts 2-4)</td>
+          <td style="text-align:right;padding:6px 10px">${retryFired}</td>
+          <td></td>
+          <td style="text-align:right;padding:6px 10px;color:var(--flex)">${retriedSuccess}</td>
+          <td style="text-align:right;padding:6px 10px">${(retryGrid[2]?.['503']??0)+(retryGrid[3]?.['503']??0)+(retryGrid[4]?.['503']??0)}</td>
+          <td></td><td></td><td></td><td></td>
+        </tr>
+      </tbody>
+    </table>
+    ${retryFired > 0 ? `
+    <div style="margin-top:10px;font-size:12px;color:var(--ink2)">
+      <b style="color:var(--ok)">Payoff:</b> <code>${retriedSuccess}</code> retries succeeded out of <code>${retryFired}</code> fired
+      = <code>${((retriedSuccess/retryFired)*100).toFixed(1)}%</code>.
+      ${retriedSuccess === 0 ? ' <span style="color:var(--err)">All retries still hit 503 — Google\'s capacity events last longer than our 5/10/20s backoff. Consider adding a longer 4th tier or falling through faster.</span>' : ''}
+    </div>` : `
+    <div style="margin-top:10px;font-size:12px;color:var(--ink2)">
+      No retries fired in this window (no 503s hit).
+    </div>`}
+  </div>
 </div>
 
 <div class="card" style="margin-bottom:16px">
