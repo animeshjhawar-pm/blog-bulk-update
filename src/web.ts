@@ -11243,6 +11243,17 @@ export function startWebServer(port: number): void {
         let costAuthoritative = 0, costEstimated = 0, costWasted = 0;
         let authoritativeCount = 0; // how many attempts had usageMetadata (older log rows won't)
         const perRun = new Map<string, { total: number; success: number; timeout: number; failed: number; costActual: number; costEstimated: number; costWasted: number }>();
+        // Pre-pass: which (run_id, image_id) pairs have a
+        // post_timeout_success row? Used below to avoid double-counting
+        // cost — a timeout row's flat estimate is only added when the
+        // observer never came back with the real number. When it did,
+        // the authoritative cost from post_timeout_success wins.
+        const observedImages = new Set<string>();
+        for (const a of attempts) {
+          if (a.outcome === "post_timeout_success") {
+            observedImages.add(`${a.run_id ?? ""}::${a.image_id ?? ""}`);
+          }
+        }
         for (const a of attempts) {
           const auth = (a as any).cost_authoritative_usd as number | null | undefined;
           const est = a.cost_estimated_usd ?? FLEX_UNIT_COST_USD;
@@ -11291,13 +11302,21 @@ export function startWebServer(port: number): void {
             // the pure-tail percentile row.
             elapsedEventual.push(a.elapsed_ms);
             elapsedPostTimeout.push(a.elapsed_ms);
+            // Google billed us for this image even though we already
+            // fell through to Replicate — pure wasted Flex spend.
+            // Authoritative because the observer captured usageMetadata.
+            costWasted += typeof auth === "number" ? auth : est;
           }
           if (a.outcome === "error" || a.outcome === "429" || a.outcome === "503") {
             elapsedRetryable.push(a.elapsed_ms);
             elapsedFailure.push(a.elapsed_ms); // kept for the legacy "failure" combined metric
           }
           if (a.outcome === "timeout") {
-            costWasted += est;
+            // Only add flat estimate when there's NO paired
+            // post_timeout_success — otherwise the observer will
+            // supply the authoritative number and we'd double-count.
+            const key = `${a.run_id ?? ""}::${a.image_id ?? ""}`;
+            if (!observedImages.has(key)) costWasted += est;
             const bucket = Math.round(a.elapsed_ms / 60_000) * 60; // seconds, rounded to nearest minute
             const arr = timeoutEra.get(bucket) ?? [];
             arr.push(a.elapsed_ms);
@@ -11582,7 +11601,7 @@ ${!flexEnabled
   <div class="tile tile-warn"><div class="tile-label">429 · 503</div><div class="tile-value">${rateLimit429} · ${unavail503}</div><div class="tile-sub">${retryFired} retries fired</div></div>
   <div class="tile tile-err"><div class="tile-label">Fetch failed (socket)</div><div class="tile-value">${fetchFailedCount}</div><div class="tile-sub">undici / OS-level abort</div></div>
   <div class="tile ${retriedSuccess>0?'tile-good':''}"><div class="tile-label">Retries that saved</div><div class="tile-value">${retriedSuccess} / ${retryFired}</div><div class="tile-sub">succeeded after ≥1 503 retry · ${retryFired>0?`${((retriedSuccess/retryFired)*100).toFixed(0)}% payoff`:'no retries fired yet'}</div></div>
-  <div class="tile tile-err"><div class="tile-label">Wasted cost (timeouts)</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">Flex bills timed-out calls too</div></div>
+  <div class="tile tile-err"><div class="tile-label">Wasted Flex spend</div><div class="tile-value">$${costWasted.toFixed(3)}</div><div class="tile-sub">timeouts (est.) + post_timeout_success (actual) — image was Replicate-served, Flex billed anyway</div></div>
   <div class="tile tile-flex"><div class="tile-label">Flex billed (actual)</div><div class="tile-value">$${costAuthoritative.toFixed(3)}</div><div class="tile-sub">token-based · ${authoritativeCount}/${successCount} have usage</div></div>
   <div class="tile ${savedVsReplicate>=0?'tile-good':'tile-err'}"><div class="tile-label">Net vs Replicate</div><div class="tile-value">${savedVsReplicate>=0?'+':''}$${savedVsReplicate.toFixed(2)}</div><div class="tile-sub">actual + wasted vs $0.15 baseline</div></div>
 </div>
