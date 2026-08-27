@@ -11207,7 +11207,7 @@ export function startWebServer(port: number): void {
         // attempt=2/3/4 show what each retry produced. success at
         // attempt>1 is logged as outcome=503_retried_success — that's
         // the "retry saved us" metric.
-        const retryGrid: Record<number, Record<string, number>> = { 1: {}, 2: {}, 3: {}, 4: {} };
+        const retryGrid: Record<number, Record<string, number>> = { 1: {}, 2: {}, 3: {} };
         let postTimeoutSuccess = 0, postTimeoutError = 0, postTimeoutCapHit = 0;
         // Grouped-error tally: outcome+message → { count, lastSeen, sampleRunIds[] }.
         // Truncate message to 160 chars so a chatty stack trace doesn't
@@ -11285,7 +11285,7 @@ export function startWebServer(port: number): void {
           // retryFired = any attempt > 1 (i.e. retry #1/#2/#3 that fired
           // because attempt 1 hit 503). Not just attempt 2.
           if (a.attempt > 1) retryFired++;
-          const att = a.attempt >= 1 && a.attempt <= 4 ? a.attempt : 1;
+          const att = a.attempt >= 1 && a.attempt <= 3 ? a.attempt : 1;
           retryGrid[att]![a.outcome] = (retryGrid[att]![a.outcome] ?? 0) + 1;
           if (a.outcome === "success" || a.outcome === "503_retried_success") {
             elapsedSuccess.push(a.elapsed_ms);
@@ -11370,6 +11370,13 @@ export function startWebServer(port: number): void {
         ).length;
         const total = attempts.length;
         const successRate = totalUserFacing > 0 ? (successCount / totalUserFacing) : null;
+        // Capacity-adjusted: what would our rate look like if Google
+        // never 503'd us? Denominator excludes rows where Google shed
+        // capacity (503), so this reads as "on requests Google
+        // actually processed, we succeeded X% of the time".
+        // Isolates our pipeline health from Google's capacity health.
+        const non503Total = totalUserFacing - unavail503;
+        const successRateExcl503 = non503Total > 0 ? (successCount / non503Total) : null;
         const stats = (arr: number[]) => {
           if (arr.length === 0) return { count: 0, avg: null, p50: null, p90: null, p95: null, p99: null, max: null };
           const pick = (p: number) => arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
@@ -11587,9 +11594,14 @@ ${!flexEnabled
 
 <div class="tiles">
   <div class="tile ${successRate!=null && successRate>=0.9 ? 'tile-good' : successRate!=null && successRate>=0.5 ? 'tile-warn' : 'tile-err'}">
-    <div class="tile-label">Success %</div>
+    <div class="tile-label">Success % (overall)</div>
     <div class="tile-value">${successRate!=null?`${(successRate*100).toFixed(1)}%`:'—'}</div>
-    <div class="tile-sub">${successCount} / ${totalUserFacing} user-facing attempts</div>
+    <div class="tile-sub">${successCount} / ${totalUserFacing} attempts · includes 503s</div>
+  </div>
+  <div class="tile ${successRateExcl503!=null && successRateExcl503>=0.9 ? 'tile-good' : successRateExcl503!=null && successRateExcl503>=0.5 ? 'tile-warn' : 'tile-err'}">
+    <div class="tile-label">Success % (excl. 503)</div>
+    <div class="tile-value">${successRateExcl503!=null?`${(successRateExcl503*100).toFixed(1)}%`:'—'}</div>
+    <div class="tile-sub">${successCount} / ${non503Total} · isolates pipeline from Google capacity</div>
   </div>
   <div class="tile"><div class="tile-label">Attempts (user-facing)</div><div class="tile-value">${totalUserFacing}</div><div class="tile-sub">peak concurrency ${peakConcurrency}${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit>0?` · +${postTimeoutSuccess+postTimeoutError+postTimeoutCapHit} obs`:''}</div></div>
   <div class="tile tile-good"><div class="tile-label">Success</div><div class="tile-value">${successCount}</div><div class="tile-sub">${retriedSuccess} via 503 retry</div></div>
@@ -11607,15 +11619,15 @@ ${!flexEnabled
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <h2>Retry breakdown — did the 3× 5s/10s/20s±jitter policy help?</h2>
+  <h2>Retry breakdown — is a retry actually landing something different?</h2>
   <div style="padding:12px 16px;color:var(--ink2);font-size:12px;margin-bottom:4px">
-    Each row is one attempt slot. attempt=1 = first try. attempt=2/3/4 = successive retries fired only on 503.
-    A retry that saves lands as <span class="pill pill-503_retried_success">503_retried_success</span> in that attempt's row.
+    Retry policy (2026-08-25): 2 retries max on 503 with 5s / 10s ±jitter backoffs. The 20s 3rd retry was removed after 0/82 payoff.
+    A retry that saves lands as <span class="pill pill-503_retried_success">503_retried_success</span> in that attempt's row. A retry that comes back with the SAME 503 lands as another <span class="pill pill-503">503</span> row — the tension you want to watch.
   </div>
   <div style="padding:8px 16px 16px;overflow-x:auto">
     <table style="width:100%;font-size:12px;border-collapse:collapse">
       <thead><tr style="color:var(--ink2)">
-        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:110px">attempt</th>
+        <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);width:130px">attempt</th>
         <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">total</th>
         <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:80px;color:var(--ok)">success</th>
         <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:110px;color:var(--flex)">saved by retry</th>
@@ -11626,13 +11638,13 @@ ${!flexEnabled
         <th style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);width:60px">error</th>
       </tr></thead>
       <tbody>
-        ${[1,2,3,4].map(n => {
+        ${[1,2,3].map(n => {
           const row = retryGrid[n] ?? {};
           const total = Object.values(row).reduce((s: number, v: number) => s + v, 0);
           const cell = (v: number | undefined) => `<td style="text-align:right;padding:5px 10px">${v ?? 0}</td>`;
           const label = n === 1
             ? '<b>1</b> (first try)'
-            : `<b>${n}</b> (retry #${n-1}, ${n===2?'~5s':n===3?'~10s':'~20s'}±jitter)`;
+            : `<b>${n}</b> (retry #${n-1}, ${n===2?'~5s':'~10s'}±jitter)`;
           return `
           <tr${total===0?' style="color:var(--ink2)"':''}>
             <td style="padding:5px 10px">${label}</td>
@@ -11647,21 +11659,32 @@ ${!flexEnabled
           </tr>`;
         }).join("")}
         <tr style="border-top:1px solid var(--border);font-weight:600">
-          <td style="padding:6px 10px">totals across retries (attempts 2-4)</td>
+          <td style="padding:6px 10px">totals across retries (attempts 2-3)</td>
           <td style="text-align:right;padding:6px 10px">${retryFired}</td>
           <td></td>
           <td style="text-align:right;padding:6px 10px;color:var(--flex)">${retriedSuccess}</td>
-          <td style="text-align:right;padding:6px 10px">${(retryGrid[2]?.['503']??0)+(retryGrid[3]?.['503']??0)+(retryGrid[4]?.['503']??0)}</td>
+          <td style="text-align:right;padding:6px 10px">${(retryGrid[2]?.['503']??0)+(retryGrid[3]?.['503']??0)}</td>
           <td></td><td></td><td></td><td></td>
         </tr>
       </tbody>
     </table>
-    ${retryFired > 0 ? `
-    <div style="margin-top:10px;font-size:12px;color:var(--ink2)">
-      <b style="color:var(--ok)">Payoff:</b> <code>${retriedSuccess}</code> retries succeeded out of <code>${retryFired}</code> fired
-      = <code>${((retriedSuccess/retryFired)*100).toFixed(1)}%</code>.
-      ${retriedSuccess === 0 ? ' <span style="color:var(--err)">All retries still hit 503 — Google\'s capacity events last longer than our 5/10/20s backoff. Consider adding a longer 4th tier or falling through faster.</span>' : ''}
-    </div>` : `
+    ${retryFired > 0 ? (() => {
+      const retry503Again = (retryGrid[2]?.['503'] ?? 0) + (retryGrid[3]?.['503'] ?? 0);
+      const retryOther    = retryFired - retriedSuccess - retry503Again;
+      const sameStatusPct = (retry503Again / retryFired * 100).toFixed(1);
+      const savePct       = (retriedSuccess / retryFired * 100).toFixed(1);
+      return `
+      <div style="margin-top:12px;font-size:12px;padding:10px 14px;background:var(--panel2);border-radius:6px;border:1px solid var(--border)">
+        <div style="margin-bottom:6px;color:var(--ink)"><b>Of ${retryFired} retries fired:</b></div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:2px 12px;color:var(--ink2)">
+          <div style="color:var(--ok)">✓ saved (retry succeeded)</div>       <div><code>${retriedSuccess}</code> · <code>${savePct}%</code></div>
+          <div style="color:var(--err)">↻ same 503 (retry brought no change)</div> <div><code>${retry503Again}</code> · <code>${sameStatusPct}%</code></div>
+          <div style="color:var(--warn)">≠ different outcome (429/timeout/error)</div> <div><code>${retryOther}</code></div>
+        </div>
+        ${Number(sameStatusPct) >= 80 ? `<div style="margin-top:8px;color:var(--err)">⚠ Most retries return the same 503 — Google's capacity events outlast our backoff. The 5s/10s ladder isn't buying us anything during sustained outages; the fast-503 short-circuit (attempt 2 fail in &lt;3s → skip attempt 3) is your safety valve.</div>` : ''}
+        ${Number(savePct) >= 20 ? `<div style="margin-top:8px;color:var(--ok)">✓ Retries are earning their keep — one in ${(retryFired/retriedSuccess).toFixed(1)} recovers a would-be fall-through.</div>` : ''}
+      </div>`;
+    })() : `
     <div style="margin-top:10px;font-size:12px;color:var(--ink2)">
       No retries fired in this window (no 503s hit).
     </div>`}

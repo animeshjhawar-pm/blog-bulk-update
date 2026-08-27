@@ -8,8 +8,10 @@
 //
 // Retry / fallthrough contract (owned by generate.ts):
 //   - success            → return
-//   - 503                → up to 3 retries with 5s / 10s / 20s ±jitter,
-//                          then throw FlexError
+//   - 503                → up to 2 retries with 5s / 10s ±jitter,
+//                          then throw FlexError (3rd retry at 20s
+//                          removed 2026-08-25 — data showed 0/82
+//                          payoff during sustained 503 waves)
 //   - 429 / overloaded   → throw FlexError immediately (fall through)
 //   - timeout (300s)     → throw FlexError immediately (fall through)
 //   - any other error    → throw FlexError immediately (fall through)
@@ -132,7 +134,7 @@ interface AttemptLog {
   server_elapsed_ms: number | null;
   outcome: FlexOutcome;
   http_status: number | null;
-  attempt: 1 | 2 | 3 | 4;
+  attempt: 1 | 2 | 3;
   model: string;
   /** `modelVersion` field from the response — proves which underlying
    *  build served the call, not just what we asked for. */
@@ -339,7 +341,7 @@ function safeBasename(s: string): string {
 async function singleAttempt(
   ai: GoogleGenAI,
   params: FlexParams,
-  attempt: 1 | 2 | 3 | 4,
+  attempt: 1 | 2 | 3,
 ): Promise<{ bytes: Buffer; mimeType: string; elapsed_ms: number }> {
   const inlineRefs = (
     await Promise.all((params.imageInput ?? []).map((u) => fetchInlineImage(u)))
@@ -631,13 +633,13 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
   let result: { bytes: Buffer; mimeType: string; elapsed_ms: number };
   let outcome: "success" | "503_retried_success" = "success";
 
-  // 503 retry schedule: base backoffs 5s / 10s / 20s (attempts 2, 3, 4).
+  // 503 retry schedule: base backoffs 5s / 10s (attempts 2 and 3).
   // Multiplied by (1 + rand ±20%) so a mass-503 wave doesn't retry in
   // lock-step. Retry ONLY on 503 (sheddable capacity) — 429 / timeout /
   // fetch_failed / any other outcome falls through immediately per the
   // contract at the top of this file.
-  const RETRY_BACKOFFS_MS = [5_000, 10_000, 20_000];
-  const attempts: Array<1 | 2 | 3 | 4> = [1, 2, 3, 4];
+  const RETRY_BACKOFFS_MS = [5_000, 10_000];
+  const attempts: Array<1 | 2 | 3> = [1, 2, 3];
   let lastErr: FlexError | null = null;
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i]!;
