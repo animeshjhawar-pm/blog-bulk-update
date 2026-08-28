@@ -6984,7 +6984,16 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
             const errCell = errText
               ? `<div class="err-line"><strong>Error:</strong> ${esc(errText.slice(0, 400))}</div>`
               : "";
+            // synthetic = image_id was fabricated as a stable placeholder
+            // (cover-images/<cluster> or thumbnail-images/<cluster>)
+            // because the resolver couldn't find a real id in page_info
+            // AT RUN TIME. Kept as a UI hint. Whether Apply is safe
+            // depends on the asset type: thumbnails have a URL-swap
+            // path in repoint that works even without a real image_id;
+            // covers do not, so those still need to be skipped.
             const synthetic = r.image_id.includes("/");
+            const syntheticThumbApplyable = synthetic && r.asset_type === "thumbnail";
+            const syntheticSkip = synthetic && !syntheticThumbApplyable;
             // Compare button gate: BOTH a new image AND a known old
             // image. With the previous_image_url CSV column populated
             // at run-start, every workspace-visible image carries its
@@ -7021,7 +7030,7 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
             const applyUnsupported = false;
             const applyDisabledReason = "";
             return `
-<div class="result-card${isUpload ? ' upload-mode' : ''}" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${isUpload ? ' data-upload="1"' : ''}${isUpload && !hasUploadedFile ? ' data-needs-file="1"' : ''}${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
+<div class="result-card${isUpload ? ' upload-mode' : ''}" data-image-id="${esc(r.image_id)}" data-cluster-id="${esc(clusterId)}" data-state="${isFailed ? "failed" : "pending"}"${isUpload ? ' data-upload="1"' : ''}${isUpload && !hasUploadedFile ? ' data-needs-file="1"' : ''}${applyUnsupported ? ' data-apply-unsupported="1"' : ""}${synthetic ? ' data-synthetic="1"' : ""}${syntheticSkip ? ' data-synthetic-skip="1"' : ""}${oldUrl ? ` data-old-url="${esc(oldUrl)}"` : ""}>
   <label class="rc-pick" title="${applyUnsupported ? esc(applyDisabledReason) : "Include in bulk actions (Apply / Regenerate)"}">
     <input type="checkbox" class="rc-pick-cb" ${applyUnsupported || isFailed ? "disabled" : "checked"} onchange="onCardPick(this)">
   </label>
@@ -7671,7 +7680,7 @@ function countApplicable(cards) {
   let eligible = 0, skippedUnsupported = 0, skippedAlreadyApplied = 0, skippedNoFile = 0;
   for (const card of cards) {
     if (!card.dataset.imageId) continue;
-    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') {
+    if (card.dataset.syntheticSkip === '1' || card.dataset.applyUnsupported === '1') {
       skippedUnsupported++;
       continue;
     }
@@ -7966,7 +7975,7 @@ async function applyCluster(clusterId) {
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
-    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') continue;
+    if (card.dataset.syntheticSkip === '1' || card.dataset.applyUnsupported === '1') continue;
     const s = stateOf.get(id) ?? 'pending';
     if (s === 'applied' || s === 'applying') continue;
     stateOf.set(id, 'applying'); paintCard(id);
@@ -8038,7 +8047,7 @@ async function applyAll() {
   for (const card of cards) {
     const id = card.dataset.imageId;
     if (!id) continue;
-    if (card.dataset.synthetic === '1' || card.dataset.applyUnsupported === '1') continue;
+    if (card.dataset.syntheticSkip === '1' || card.dataset.applyUnsupported === '1') continue;
     const s = stateOf.get(id) ?? 'pending';
     if (s === 'applied' || s === 'applying') continue;
     stateOf.set(id, 'applying'); paintCard(id);
@@ -8250,7 +8259,7 @@ async function applyAllPicked() {
     // Filter to genuinely-applicable cards (drop synthetic, unsupported,
     // upload-mode-with-no-file, already-applied, currently-applying).
     const applicableCards = pickedCards
-      .filter((c) => c.dataset.synthetic !== '1' && c.dataset.applyUnsupported !== '1')
+      .filter((c) => c.dataset.syntheticSkip !== '1' && c.dataset.applyUnsupported !== '1')
       .filter((c) => !(c.dataset.upload === '1' && c.dataset.needsFile === '1'))
       .filter((c) => {
         const s = stateOf.get(c.dataset.imageId) ?? 'pending';
