@@ -24,6 +24,7 @@ import { makeLimiter } from "./concurrency.js";
 import { unitCostUsd } from "./pricing.js";
 import {
   collectImageRecords,
+  resolveClusterTopic,
   type AssetType,
   type ImageRecord,
 } from "./pageInfo.js";
@@ -155,7 +156,7 @@ async function processOne(args: {
     image_id: record.imageId,
     asset_type: record.asset,
     cluster_id: record.cluster.id,
-    page_topic: record.cluster.topic ?? "",
+    page_topic: resolveClusterTopic(record.cluster),
     description_used: record.description,
     aspect_ratio: record.aspectRatio,
     generated_at_utc: generatedAt,
@@ -318,7 +319,7 @@ async function processOne(args: {
       clientHomepageUrl: project.url ?? "",
       projectId: project.id,
       promptOverrides: options.promptOverrides,
-      blogTopic: record.cluster.topic ?? "",
+      blogTopic: resolveClusterTopic(record.cluster),
       aspectRatio: record.aspectRatio,
     });
     // buildImagePrompt already prepended a directives block with

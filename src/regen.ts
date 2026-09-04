@@ -27,6 +27,7 @@ import { makeLimiter } from "./concurrency.js";
 import { unitCostUsd } from "./pricing.js";
 import {
   collectImageRecords,
+  resolveClusterTopic,
   type AssetType,
   type ImageRecord,
 } from "./pageInfo.js";
@@ -211,7 +212,7 @@ function buildBaseRow(args: {
     image_id: args.record.imageId,
     asset_type: args.record.asset,
     cluster_id: args.record.cluster.id,
-    page_topic: args.record.cluster.topic ?? "",
+    page_topic: resolveClusterTopic(args.record.cluster),
     description_used: args.record.description,
     aspect_ratio: args.record.aspectRatio,
     generated_at_utc: args.generatedAt,
@@ -330,11 +331,13 @@ async function processOne(args: {
         clientHomepageUrl: project.url ?? "",
         projectId: project.id,
         promptOverrides: options.promptOverrides,
-        // cluster.topic is the blog title for blog clusters. The cover
-        // (+ thumbnail, which re-exports cover) user template references
-        // {{blog_topic}}; without this the block lands empty and Claude
-        // invents a topic from business_context.
-        blogTopic: record.cluster.topic ?? "",
+        // Live blog title via resolveClusterTopic — prefers
+        // page_info.title (what stormbreaker's JSON editor writes)
+        // over the older clusters.topic column (which the editor
+        // never touches). Without this prefer-order, editing a title
+        // in the editor and hitting Regenerate here produced covers
+        // stamped with the STALE topic. See pageInfo.ts helper.
+        blogTopic: resolveClusterTopic(record.cluster),
         // Per-record aspect ratio (16:9 for infographic / internal /
         // external / generic; 1:1 for service_h1 / service_body /
         // category_industry; per-tag override possible via context).

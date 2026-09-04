@@ -118,7 +118,10 @@ export function parseAspectRatio(context: string | undefined): string | null {
 }
 
 function descriptionFor(cluster: ClusterRow): string {
-  return (cluster.topic ?? "").trim();
+  // Reads through resolveClusterTopic so an operator's JSON-editor
+  // edit to page_info.title flows into the image description too,
+  // not just the cover/thumbnail's blog_topic block.
+  return resolveClusterTopic(cluster).trim();
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -229,6 +232,30 @@ function shapeBToRecords(cluster: ClusterRow, hits: ShapeBHit[]): ImageRecord[] 
 // Cover / thumbnail — synthesised from cluster.topic with real-key
 // preference if page_info exposes one.
 // ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The live blog page title. Stormbreaker's JSON editor writes to
+ * `page_info.title`; the older `clusters.topic` column is the fallback
+ * from the initial page-creation flow and does NOT get rewritten when
+ * an operator edits the title in the editor. Every downstream consumer
+ * (image prompt `{{blog_topic}}`, CSV `page_topic`, workspace card
+ * label) should read through this helper so the image reflects the
+ * page's ACTUAL current title, not the stale creation-time topic.
+ *
+ * Precedence: page_info.title → page_info.name → page_info.blog_title
+ * → clusters.topic → "". First non-empty string wins.
+ */
+export function resolveClusterTopic(cluster: {
+  topic?: string | null;
+  page_info?: unknown;
+}): string {
+  const pi = (cluster.page_info ?? {}) as Record<string, unknown>;
+  const cands = [pi.title, pi.name, pi.blog_title, cluster.topic];
+  for (const v of cands) {
+    if (typeof v === "string" && v.trim().length > 0) return v;
+  }
+  return "";
+}
 
 function thumbnailUrlOf(pi: ClusterPageInfo): string | undefined {
   const t = pi.thumbnail;
@@ -576,7 +603,7 @@ function mdxToRecords(
   let derivedCount = 0;
   const records = used.map((t, i) => {
     const section = deriveDescriptionFromSection(md, t.offset);
-    let description = section || (cluster.topic ?? "").trim() || t.alt;
+    let description = section || resolveClusterTopic(cluster).trim() || t.alt;
     if (section) derivedCount++;
 
     // Two+ images in the same section → shared section text. Append the
@@ -759,7 +786,7 @@ function serviceRecords(cluster: ClusterRow): ImageRecord[] {
         asset: "service_h1",
         obj,
         source: "page_info.images[0]",
-        fallbackDescription: cluster.topic ?? "",
+        fallbackDescription: resolveClusterTopic(cluster),
       });
       if (r) out.push(r);
     }
@@ -787,7 +814,7 @@ function serviceRecords(cluster: ClusterRow): ImageRecord[] {
         asset: "service_body",
         obj,
         source: src,
-        fallbackDescription: cluster.topic ?? "",
+        fallbackDescription: resolveClusterTopic(cluster),
       });
       if (r) { out.push(r); break; }
     }
@@ -823,7 +850,7 @@ function categoryRecords(cluster: ClusterRow): ImageRecord[] {
     const obj = imageFromObject(imgCandidate);
     if (!obj) continue;
 
-    const fallback = typeof it.name === "string" ? (it.name as string) : (cluster.topic ?? "");
+    const fallback = typeof it.name === "string" ? (it.name as string) : resolveClusterTopic(cluster);
     const r = recordFromImageObject({
       cluster,
       asset: "category_industry",
