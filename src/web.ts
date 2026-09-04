@@ -26,6 +26,7 @@ import {
   collectImageRecords,
   prefetchBlogMarkdowns,
   flushMdxRecordSummary,
+  resolveClusterTopic,
   type ImageRecord,
 } from "./pageInfo.js";
 import { pickLogoUrl } from "./regen.js";
@@ -2328,7 +2329,10 @@ async function workspacePage(
     return {
       id: c.id,
       page_type: c.page_type,
-      topic: c.topic ?? "(no topic)",
+      // Read via resolveClusterTopic so a JSON-editor edit to
+      // page_info.title flows into the workspace card list too —
+      // clusters.topic is stale after an operator edits the title.
+      topic: resolveClusterTopic(c) || "(no topic)",
       slug: c.slug,
       published_url: publishedUrl,
       updated_at: c.updated_at ? c.updated_at.toISOString().slice(0, 10) : null,
