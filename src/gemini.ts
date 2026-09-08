@@ -3,18 +3,19 @@
 // Nano Banana Pro). Same model as our Replicate primary, but routed
 // through Google's synchronous Flex tier at ~55% discount ($0.067 vs
 // $0.15/image at 1K/2K). Falls through to the existing Replicate/fal
-// chain on any non-success outcome — this file makes NO retry decisions
-// beyond "try once, on 503 try once more".
+// chain on any non-success outcome. NO RETRIES — exactly one attempt.
 //
-// Retry / fallthrough contract (owned by generate.ts):
+// Fallthrough contract (owned by generate.ts):
 //   - success            → return
-//   - 503                → up to 2 retries with 5s / 10s ±jitter,
-//                          then throw FlexError (3rd retry at 20s
-//                          removed 2026-08-25 — data showed 0/82
-//                          payoff during sustained 503 waves)
-//   - 429 / overloaded   → throw FlexError immediately (fall through)
-//   - timeout (300s)     → throw FlexError immediately (fall through)
-//   - any other error    → throw FlexError immediately (fall through)
+//   - ANY failure        → throw FlexError immediately (fall through to
+//                          Replicate → fal)
+//
+// Retries were removed 2026-09-08. Measured payoff across two policies
+// was zero: the 3× 5/10/20s ladder scored 0/82, and the 2× 5/10s ladder
+// scored 0/88 during a sustained Google capacity blackout (186/186
+// attempts shed with 503 over three hours). Google's 503 events outlast
+// any backoff short enough to be worth an operator's wait, so a retry
+// only adds dead time before the inevitable Replicate fall-through.
 //
 // Every attempt is journaled to out/runs/flex-attempts.jsonl regardless
 // of outcome, so /stats/flex can aggregate success rate + cost wasted
@@ -70,6 +71,9 @@ export type FlexOutcome =
   | "timeout"
   | "429"
   | "503"
+  // Retired 2026-09-08 when retries were removed. Kept in the union so
+  // historical flex-attempts.jsonl rows still parse + aggregate; nothing
+  // writes it any more.
   | "503_retried_success"
   | "fetch_failed"
   | "error"
@@ -112,7 +116,8 @@ export interface FlexResult {
   /** file:// URL of the written bytes — downloadImage handles this scheme. */
   image_url: string;
   elapsed_ms: number;
-  outcome: "success" | "503_retried_success";
+  /** Always "success" — retries were removed 2026-09-08. */
+  outcome: "success";
 }
 
 interface UsageBreakdown {
@@ -134,6 +139,8 @@ interface AttemptLog {
   server_elapsed_ms: number | null;
   outcome: FlexOutcome;
   http_status: number | null;
+  /** Always 1 for rows written after 2026-09-08 (retries removed).
+   *  2 and 3 remain in the union so historical rows still parse. */
   attempt: 1 | 2 | 3;
   model: string;
   /** `modelVersion` field from the response — proves which underlying
@@ -341,7 +348,7 @@ function safeBasename(s: string): string {
 async function singleAttempt(
   ai: GoogleGenAI,
   params: FlexParams,
-  attempt: 1 | 2 | 3,
+  attempt: 1,
 ): Promise<{ bytes: Buffer; mimeType: string; elapsed_ms: number }> {
   const inlineRefs = (
     await Promise.all((params.imageInput ?? []).map((u) => fetchInlineImage(u)))
@@ -630,55 +637,12 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
     httpOptions: { timeout: FLEX_UNDICI_TIMEOUT_MS },
   });
 
-  let result: { bytes: Buffer; mimeType: string; elapsed_ms: number };
-  let outcome: "success" | "503_retried_success" = "success";
-
-  // 503 retry schedule: base backoffs 5s / 10s (attempts 2 and 3).
-  // Multiplied by (1 + rand ±20%) so a mass-503 wave doesn't retry in
-  // lock-step. Retry ONLY on 503 (sheddable capacity) — 429 / timeout /
-  // fetch_failed / any other outcome falls through immediately per the
-  // contract at the top of this file.
-  const RETRY_BACKOFFS_MS = [5_000, 10_000];
-  const attempts: Array<1 | 2 | 3> = [1, 2, 3];
-  let lastErr: FlexError | null = null;
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i]!;
-    if (i > 0) {
-      const base = RETRY_BACKOFFS_MS[i - 1] ?? 20_000;
-      const jitter = 1 + (Math.random() * 0.4 - 0.2); // ±20%
-      const waitMs = Math.round(base * jitter);
-      process.stderr.write(
-        `flex: 503 on attempt ${attempt - 1} (elapsed=${lastErr?.elapsedMs}ms) — retrying #${attempt - 1} in ${waitMs}ms\n`,
-      );
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    try {
-      result = await singleAttempt(ai, params, attempt);
-      if (attempt > 1) outcome = "503_retried_success";
-      lastErr = null;
-      break;
-    } catch (err) {
-      if (!(err instanceof FlexError)) throw err;
-      lastErr = err;
-      // Retry only on 503. Anything else exits the loop and rethrows.
-      if (err.outcome !== "503" || attempt === attempts[attempts.length - 1]) throw err;
-      // FAST-503 short-circuit: a retry that 503s in under 3s means
-      // Google definitively has no capacity right now (they didn't
-      // even queue us). Waiting through more retries — each 10-20s
-      // backoff — just costs the operator time. Fall through to the
-      // Replicate/fal chain immediately in that case.
-      if (attempt >= 2 && err.elapsedMs < 3000) {
-        process.stderr.write(
-          `flex: fast-503 short-circuit — attempt ${attempt} bailed in ${err.elapsedMs}ms (< 3s), skipping remaining retries\n`,
-        );
-        throw err;
-      }
-    }
-  }
-  if (lastErr) throw lastErr;
-  // TS: `result` is definitely assigned above by the time we exit
-  // the loop without throwing.
-  result = result!;
+  // ONE attempt. No retry ladder, no backoff, no short-circuit logic.
+  // Any FlexError propagates straight to generate.ts, which falls
+  // through to Replicate → fal. See the contract at the top of this
+  // file for why retries were removed.
+  const outcome: "success" = "success";
+  const result = await singleAttempt(ai, params, 1);
 
   // Match rehost.ts EXACTLY — same ephemeral cwd/out layout — so the
   // subsequent downloadImage() no-op's the copy (source === target).
