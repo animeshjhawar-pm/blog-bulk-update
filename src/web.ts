@@ -165,6 +165,58 @@ interface RunState {
 
 const RUNS = new Map<string, RunState>();
 
+/**
+ * In-flight / recently-finished single-image Regenerate jobs.
+ *
+ * /api/regen-one used to hold the HTTP connection open for the whole
+ * generate cycle. That could not work: the handler writes zero bytes
+ * until the subprocess exits, while a browser gives up on a headerless
+ * response at ~300s. Replicate's own budget is far longer than that
+ * (WEBHOOK_FALLBACK_MS=300s before it even starts polling, then up to
+ * DEFAULT_MAX_WAIT_MS=30min), so any regenerate that missed the webhook
+ * died at exactly 300004ms with Railway logging 499 "client has closed
+ * the request" and the operator seeing a bare "upstream error".
+ *
+ * Now the handler validates + returns 202 with a job id, and the work
+ * runs detached. The client polls /api/regen-one/status. Terminal
+ * outcomes carry the SAME http code + message the synchronous handler
+ * used to return, so no diagnostic detail is lost.
+ */
+interface RegenJob {
+  id: string;
+  image_id: string;
+  cluster_id: string;
+  /** Parent run this regenerate belongs to — the card lives on its page. */
+  parent_run_id: string;
+  /** Child run spawned to do the work; set once the slot is acquired. */
+  child_run_id?: string;
+  status: "running" | "done" | "error";
+  startedAt: number;
+  /** Terminal success payload — same shape the 200 response used to have. */
+  result?: {
+    image_url_new: string;
+    image_local_path: string;
+    image_id: string;
+    cluster_id: string;
+    run_id: string;
+  };
+  /** Terminal failure — `http` is the status the old handler returned. */
+  error?: string;
+  http?: number;
+}
+const REGEN_JOBS = new Map<string, RegenJob>();
+// Bounded so a long-lived process can't accumulate job records. Map
+// preserves insertion order, so the oldest key is the first key.
+const REGEN_JOBS_MAX = 200;
+function putRegenJob(job: RegenJob): void {
+  REGEN_JOBS.set(job.id, job);
+  while (REGEN_JOBS.size > REGEN_JOBS_MAX) {
+    const oldest = REGEN_JOBS.keys().next().value;
+    if (oldest === undefined) break;
+    REGEN_JOBS.delete(oldest);
+  }
+}
+
 // Server-process S3 markdown cache with a 60-second TTL. Without this
 // every workspace render re-fetches every blog cluster's
 // blog_with_image_placeholders.md, which dominates wall time. Repeated
@@ -5303,7 +5355,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   // file the operator dropped originally, so we spawn the
   // upload-generate CLI with a one-entry products manifest pointing
   // at the persisted product file.
-  let child: RunState;
+  let spawnChild: () => RunState;
   if (parent.mode === "upload-generate") {
     // Locate the original product entry for this image_id. Two sources,
     // in order of preference:
@@ -5350,8 +5402,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     const childRunId = randomUUID().replace(/-/g, "").slice(0, 16);
     const productsManifestPath = path.join(tmpDir, `products-${childRunId}.json`);
     await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productEntry }, null, 2), "utf8");
-    await acquireSpawnSlot();
-    child = startUploadGenerate({
+    spawnChild = () => startUploadGenerate({
       client: parent.client,
       runId: childRunId,
       pageType: "blog,service,category",
@@ -5375,8 +5426,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
       productBaseUrl: parent.productBaseUrl,
     });
   } else {
-    await acquireSpawnSlot();
-    child = startRegen({
+    spawnChild = () => startRegen({
       client: parent.client,
       clusterIds: [clusterId],
       imageIds: [imageId],
@@ -5400,6 +5450,75 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     });
   }
 
+  // ── async handoff ──────────────────────────────────────────────
+  // Everything above is fast (CSV read + a couple of temp-file writes)
+  // and its failures are genuine 4xx the operator should see inline.
+  // Everything below — slot acquisition, the subprocess, Replicate's
+  // multi-minute wait — runs detached so the response goes out now.
+  const jobId = randomUUID().replace(/-/g, "").slice(0, 16);
+  putRegenJob({
+    id: jobId,
+    image_id: imageId,
+    cluster_id: clusterId,
+    parent_run_id: parent.id,
+    status: "running",
+    startedAt: Date.now(),
+  });
+  sendJson(res, 202, { job_id: jobId, image_id: imageId, cluster_id: clusterId });
+  // Detached — but NEVER unguarded. An unhandled rejection is fatal on
+  // Node 20, and a throw anywhere past the spawn (CSV read, parent
+  // patch) would otherwise take the whole web process down AND strand
+  // the job on "running" so the client polls forever.
+  runRegenJob(jobId, parent, imageId, clusterId, spawnChild).catch((err) => {
+    process.stderr.write(`regenOne: job ${jobId} threw: ${(err as Error)?.stack ?? err}\n`);
+    failRegenJob(jobId, 500, `regenerate crashed: ${(err as Error)?.message ?? String(err)}`);
+  });
+}
+
+/** Terminal-failure helper — mirrors the http codes the synchronous
+ *  handler used to return so the client renders the same message. */
+function failRegenJob(jobId: string, http: number, error: string, childRunId?: string): void {
+  const job = REGEN_JOBS.get(jobId);
+  if (!job) return;
+  job.status = "error";
+  job.http = http;
+  job.error = error;
+  if (childRunId) job.child_run_id = childRunId;
+}
+
+/**
+ * The detached half of a single-image Regenerate. Acquires the spawn
+ * slot, runs the subprocess, and records a terminal outcome on the job.
+ *
+ * Deliberately does NOT mark the parent CSV row failed on error: today
+ * a failed regenerate leaves the parent row `completed` with the
+ * PREVIOUS image, which keeps that image Apply-eligible. Flipping it to
+ * failed would strip a working image from the operator on a transient
+ * model error.
+ */
+async function runRegenJob(
+  jobId: string,
+  parent: RunState,
+  imageId: string,
+  clusterId: string,
+  spawnChild: () => RunState,
+): Promise<void> {
+  let child: RunState;
+  try {
+    // Moved off the request path: at the 3/3 concurrency cap this
+    // blocks until a slot frees, which on the old synchronous path
+    // counted against the browser's 300s ceiling before we had even
+    // started generating.
+    await acquireSpawnSlot();
+    child = spawnChild();
+  } catch (err) {
+    failRegenJob(jobId, 500, `failed to start regen subprocess: ${(err as Error).message}`);
+    return;
+  }
+
+  const job = REGEN_JOBS.get(jobId);
+  if (job) job.child_run_id = child.id;
+
   // Wait for the subprocess to finish, then read its CSV for the new URL.
   await new Promise<void>((resolve) => {
     if (child.done) return resolve();
@@ -5409,7 +5528,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
 
   if (child.exitCode !== 0) {
     // Genuine non-zero exit — the subprocess crashed.
-    return sendJson(res, 500, { error: `regen subprocess crashed (exit ${child.exitCode}). Check the run log.`, run_id: child.id });
+    return failRegenJob(jobId, 500, `regen subprocess crashed (exit ${child.exitCode}). Check the run log.`, child.id);
   }
   if (!child.csvPath) {
     // exit 0 but no CSV = the CLI hit its "nothing to do — exiting"
@@ -5421,15 +5540,14 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     // Stormbreaker re-rendered the page and the MDX <Image> ids
     // changed. Surface that instead of the nonsensical "failed
     // (exit 0)".
-    return sendJson(res, 409, {
-      error: `Couldn't regenerate ${imageId}: it no longer matches any image in the cluster's current page_info. This usually means the image was already applied (Apply replaces the id) or the page was re-rendered upstream since this run was created. Re-import the cluster and start a fresh run.`,
-      run_id: child.id,
-    });
+    return failRegenJob(jobId, 409,
+      `Couldn't regenerate ${imageId}: it no longer matches any image in the cluster's current page_info. This usually means the image was already applied (Apply replaces the id) or the page was re-rendered upstream since this run was created. Re-import the cluster and start a fresh run.`,
+      child.id);
   }
   const childRows = await readRunCsvOrEmpty(child.csvPath);
   const childRow = childRows.find((r) => r.image_id === imageId);
   if (!childRow) {
-    return sendJson(res, 500, { error: `regen produced no CSV row for ${imageId}`, run_id: child.id });
+    return failRegenJob(jobId, 500, `regen produced no CSV row for ${imageId}`, child.id);
   }
   // Success check has two valid shapes depending on the run mode:
   //   regen           → image_url_new is the Replicate signed URL.
@@ -5440,12 +5558,6 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   //                     image_local_path is populated — that's where
   //                     the composited PNG lives. So we MUST accept
   //                     a successful row that has only image_local_path.
-  //
-  // Before this fix, the !image_url_new check fired for every
-  // upload-generate regenerate even when the new composite was
-  // successfully written to disk — operators saw a misleading
-  // "image model returned no output" error after a fully-successful
-  // regenerate.
   const childSucceeded =
     childRow.status === "completed" &&
     ((childRow.image_url_new || "").trim().length > 0
@@ -5456,10 +5568,9 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     // error into the CSV's `error` column and keeps going (the
     // never-abort-mid-flight contract). Surface the actual cause.
     const why = (childRow.error || "").trim() || "the image model returned no output";
-    return sendJson(res, 502, {
-      error: `Regeneration failed for ${imageId}: ${why} — this is usually a transient image-model error (empty output or a slow Replicate prediction). Click Regenerate again to retry.`,
-      run_id: child.id,
-    });
+    return failRegenJob(jobId, 502,
+      `Regeneration failed for ${imageId}: ${why} — this is usually a transient image-model error (empty output or a slow Replicate prediction). Click Regenerate again to retry.`,
+      child.id);
   }
 
   // CRITICAL: write the regenerated columns back into the PARENT
@@ -5468,14 +5579,11 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   //                parent's image_local_path).
   //   Apply to S3→ uploads the pre-regen image_url_new.
   //   ZIP        → archives the pre-regen image.
-  //   Compare    → the "new" pane shows the pre-regen image
-  //                (the card's <img src> is updated client-side, but
-  //                the cmp modal also uses src so this part already
-  //                worked — the others didn't).
   //
   // The parent CSV is the single source of truth for every read on
   // the runs page; mutating the matching row keeps Download/Apply/
-  // ZIP semantically aligned with what the operator just saw.
+  // ZIP semantically aligned with what the operator just saw. It
+  // also bumps the CSV mtime, which the run page's watchdog polls.
   if (parent.csvPath) {
     try {
       await updateParentCsvRow(parent.csvPath, imageId, {
@@ -5497,16 +5605,21 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
-  // Include image_local_path so upload-generate clients (where
-  // image_url_new is always empty) can see the regenerate succeeded
-  // — the client's preview cache-bust logic OR-checks both fields.
-  sendJson(res, 200, {
-    image_url_new: childRow.image_url_new,
-    image_local_path: childRow.image_local_path,
-    image_id: imageId,
-    cluster_id: clusterId,
-    run_id: child.id,
-  });
+  const done = REGEN_JOBS.get(jobId);
+  if (done) {
+    done.status = "done";
+    done.child_run_id = child.id;
+    // Include image_local_path so upload-generate clients (where
+    // image_url_new is always empty) can see the regenerate succeeded
+    // — the client's preview cache-bust logic OR-checks both fields.
+    done.result = {
+      image_url_new: childRow.image_url_new ?? "",
+      image_local_path: childRow.image_local_path ?? "",
+      image_id: imageId,
+      cluster_id: clusterId,
+      run_id: child.id,
+    };
+  }
 }
 
 /**
@@ -8679,6 +8792,57 @@ function closeCompareOnBackdrop(ev) {
   if (ev.target === ev.currentTarget) closeCompare();
 }
 
+// Pull a human message out of an error response body. Handlers send
+// JSON ({error}); proxies and edge timeouts send plain text.
+async function readErrText(r) {
+  const raw = await r.text().catch(function () { return ''; });
+  if (!raw) return 'HTTP ' + r.status;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.error) return parsed.error;
+  } catch (e) { /* not JSON — fall through to raw */ }
+  return raw;
+}
+
+// Poll a detached Regenerate to completion. Resolves with the same
+// payload the synchronous handler used to return, or throws with the
+// same message. Ticks the button label so a multi-minute Replicate
+// wait visibly stays alive instead of looking hung.
+var REGEN_POLL_MS = 3000;
+var REGEN_POLL_CAP_MS = 35 * 60 * 1000; // > Replicate's 30min ceiling
+async function pollRegenJob(jobId, btn) {
+  const startedAt = Date.now();
+  for (;;) {
+    await new Promise(function (res) { setTimeout(res, REGEN_POLL_MS); });
+    const elapsed = Date.now() - startedAt;
+    if (btn) {
+      const secs = Math.floor(elapsed / 1000);
+      const mm = Math.floor(secs / 60);
+      const ss = String(secs % 60).padStart(2, '0');
+      btn.innerHTML = '<span class="spinner"></span> Regenerating ' + mm + ':' + ss;
+    }
+    let sr;
+    try {
+      sr = await fetch('/api/regen-one/status?job_id=' + encodeURIComponent(jobId), { cache: 'no-store' });
+    } catch (e) {
+      // Transient network blip — keep polling until the cap.
+      if (elapsed > REGEN_POLL_CAP_MS) throw new Error('lost contact with the server while regenerating');
+      continue;
+    }
+    if (sr.status === 404) throw new Error(await readErrText(sr));
+    if (!sr.ok) {
+      if (elapsed > REGEN_POLL_CAP_MS) throw new Error(await readErrText(sr));
+      continue;
+    }
+    const js = await sr.json();
+    if (js.status === 'done') return js;
+    if (js.status === 'error') throw new Error(js.error || 'regenerate failed');
+    if (elapsed > REGEN_POLL_CAP_MS) {
+      throw new Error('still running after ' + Math.round(elapsed / 60000) + ' min — refresh the run page to check whether it landed');
+    }
+  }
+}
+
 async function regenOne(imageId, customInstructions) {
   const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(imageId) + '"]');
   if (!card) return;
@@ -8701,8 +8865,17 @@ async function regenOne(imageId, customInstructions) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
     });
-    if (!r.ok) throw new Error(await r.text());
-    const j = await r.json();
+    // Validation failures (400/404/410) still come back inline. Their
+    // body is JSON, so pull .error out rather than showing raw JSON.
+    if (!r.ok) throw new Error(await readErrText(r));
+    const accepted = await r.json();
+    // The handler is async now: 202 + job id, work runs detached. It
+    // used to hold the connection for the whole generate cycle, which
+    // a browser kills at ~300s with no response — the operator saw a
+    // bare "upstream error" while the job was still running fine.
+    const j = accepted && accepted.job_id
+      ? await pollRegenJob(accepted.job_id, btn)
+      : accepted;
     const img = card.querySelector('.rc-img img');
     if (img && (j.image_url_new || j.image_local_path)) {
       // Route through our /preview/ endpoint so the swapped image
@@ -12261,6 +12434,32 @@ ${runsSorted.map(r=>`          <tr>
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
+      // Poll target for the async Regenerate. Returns the job's
+      // terminal outcome carrying the SAME http code + message the
+      // handler used to return synchronously, so the card renders an
+      // identical diagnosis to before the async split.
+      if (method === "GET" && p === "/api/regen-one/status") {
+        const jobId = url.searchParams.get("job_id") ?? "";
+        const job = REGEN_JOBS.get(jobId);
+        if (!job) {
+          // Unknown id — either a bad param, or the process restarted
+          // and lost the in-memory registry. Tell the client to stop
+          // polling and fall back to a page refresh rather than spin.
+          return sendJson(res, 404, {
+            status: "unknown",
+            error: "This regenerate job is no longer being tracked (the server may have restarted). Refresh the run page to see its current state.",
+          });
+        }
+        return sendJson(res, 200, {
+          status: job.status,
+          image_id: job.image_id,
+          cluster_id: job.cluster_id,
+          run_id: job.child_run_id ?? null,
+          elapsed_ms: Date.now() - job.startedAt,
+          ...(job.status === "done" ? job.result : {}),
+          ...(job.status === "error" ? { error: job.error, http: job.http } : {}),
+        });
+      }
       // Upload-run pipeline. Strictly additive — never touches /regen.
       if (method === "POST" && p === "/upload-run/start") return await uploadRunStartHandler(req, res);
       // Upload-&-Generate pipeline.
