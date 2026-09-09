@@ -153,7 +153,13 @@ program
   // cache file every 2s until Replicate calls us back — memory and
   // CPU per slot are negligible. Higher concurrency finishes a
   // typical run of 20-50 images 2× faster.
-  .option("--concurrency <n>", "parallel image generations", "10")
+  // Measured 2026-09-09 on a 346-image run: ~60s per image (p50 58.6s,
+  // p90 77.1s), so wall time is N*60s/concurrency. At 10 that run took
+  // ~35min. Zero E003 rate-limit errors appeared at that level, so
+  // Replicate had headroom — raised to 20. REGEN_CONCURRENCY overrides
+  // per-deployment without a redeploy; the E003 detector + global
+  // cooldown already degrade gracefully if we overshoot.
+  .option("--concurrency <n>", "parallel image generations", process.env.REGEN_CONCURRENCY ?? "20")
   .option(
     "--prompt-override-file <path>",
     "use the literal text in this file as the image-gen prompt instead of calling Portkey (used by the web UI's Regenerate button to skip the prompt-build step)",
@@ -165,6 +171,10 @@ program
   .option(
     "--resume-prediction-id <id>",
     "before generating, poll Replicate for this prediction id. If it has succeeded, use that URL and skip the new generation (recovers predictions that completed after a prior timeout).",
+  )
+  .option(
+    "--prompt-per-image-file <path>",
+    "JSON file mapping image_id -> the exact prompt to reuse for that image. Lets ONE subprocess regenerate many images while each reuses its own parent prompt (--prompt-override-file is a single string for the whole run and cannot express this).",
   )
   .option(
     "--prompt-overrides-file <path>",
@@ -187,21 +197,34 @@ program
       extraInstructionsFile?: string;
       resumePredictionId?: string;
       promptOverridesFile?: string;
+      promptPerImageFile?: string;
     }) => {
       requireKnownClient(opts.client);
       try {
         const assetTypes = parseAssetTypes(opts.assetTypes);
         const clusterIds = parseClusterIds(opts.clusterIds);
         const imageIds = parseClusterIds(opts.imageIds); // same comma-split semantics
-        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 5);
+        const concurrency = Math.max(1, Number.parseInt(opts.concurrency, 10) || 20);
 
         let promptOverride: string | undefined;
         let extraInstructions: string | undefined;
         let promptOverrides: import("./buildPrompt.js").PromptOverrides | undefined;
-        if (opts.promptOverrideFile || opts.extraInstructionsFile || opts.promptOverridesFile) {
+        let promptPerImage: Record<string, string> | undefined;
+        if (opts.promptOverrideFile || opts.extraInstructionsFile || opts.promptOverridesFile || opts.promptPerImageFile) {
           const fs = await import("node:fs/promises");
           if (opts.promptOverrideFile) {
             promptOverride = await fs.readFile(opts.promptOverrideFile, "utf8");
+          }
+          if (opts.promptPerImageFile) {
+            const raw = await fs.readFile(opts.promptPerImageFile, "utf8");
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === "object") promptPerImage = parsed as Record<string, string>;
+            } catch (err) {
+              process.stderr.write(
+                `regen: ignoring --prompt-per-image-file (invalid JSON): ${(err as Error).message}\n`,
+              );
+            }
           }
           if (opts.extraInstructionsFile) {
             extraInstructions = (await fs.readFile(opts.extraInstructionsFile, "utf8")).trim();
@@ -241,6 +264,7 @@ program
           provider: opts.provider,
           concurrency,
           promptOverride,
+          promptPerImage,
           extraInstructions,
           resumePredictionId: opts.resumePredictionId,
           promptOverrides,

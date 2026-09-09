@@ -192,6 +192,16 @@ interface RegenJob {
   child_run_id?: string;
   status: "running" | "done" | "error";
   startedAt: number;
+  /** Images this job covers. Length 1 for a single Regenerate. */
+  image_ids?: string[];
+  /** Per-image outcome for a batch job. Populated once the subprocess
+   *  exits — one entry per requested image_id. */
+  results?: Record<string, {
+    ok: boolean;
+    image_url_new?: string;
+    image_local_path?: string;
+    error?: string;
+  }>;
   /** Terminal success payload — same shape the 200 response used to have. */
   result?: {
     image_url_new: string;
@@ -5623,6 +5633,194 @@ async function runRegenJob(
 }
 
 /**
+ * BATCH Regenerate — one subprocess for N images.
+ *
+ * The old bulk path looped regenOne per image, so N images meant N CLI
+ * subprocesses. Measured 2026-09-09: each subprocess costs ~5.2s of
+ * cold start (tsx compile + DB + graphic token + cluster fetch) and
+ * takes one of only MAX_CONCURRENT_RUNS slots, while its own
+ * --concurrency 10 sat unused doing a single image. 20 selected images
+ * cost ~104s of pure startup and ran 3-wide instead of 10-wide.
+ *
+ * One subprocess pays startup once and generates at full concurrency.
+ * Per-image prompts are preserved via --prompt-per-image-file, so this
+ * is not a behaviour trade: each image still reuses its own parent
+ * prompt and skips Portkey exactly as the single path does.
+ */
+async function regenBatchHandler(req: IncomingMessage, res: ServerResponse) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let runId = "", imageIds: string[] = [];
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+      run_id?: string; image_ids?: unknown;
+    };
+    runId = body.run_id ?? "";
+    if (Array.isArray(body.image_ids)) {
+      imageIds = body.image_ids.filter((x): x is string => typeof x === "string" && x.length > 0);
+    }
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON body" });
+  }
+  if (!runId) return sendJson(res, 400, { error: "run_id required" });
+  if (imageIds.length === 0) return sendJson(res, 400, { error: "image_ids required (non-empty array)" });
+
+  const parent = RUNS.get(runId);
+  if (!parent) return sendJson(res, 404, { error: `run ${runId} not found` });
+  if (parent.mode === "upload-generate") {
+    // upload-generate needs a per-image product manifest and a
+    // different CLI. Tell the client to use the per-image path; it
+    // falls back to the loop on this status.
+    return sendJson(res, 409, { error: "batch regenerate is not supported for upload-generate runs", fallback: "per-image" });
+  }
+  if (!parent.csvPath) return sendJson(res, 400, { error: `run ${runId} has no CSV to read prompts from` });
+
+  // One CSV read for the whole batch: cluster ids + each image's own
+  // prompt. The single-image path writes one prompt file; a batch
+  // needs the map, because promptOverride is a single string applied
+  // to every record in the run.
+  const rows = await readRunCsvOrEmpty(parent.csvPath);
+  const clusterIds = new Set<string>();
+  const promptPerImage: Record<string, string> = {};
+  const known: string[] = [];
+  for (const id of imageIds) {
+    const row = rows.find((r) => r.image_id === id);
+    if (!row) continue;
+    known.push(id);
+    if (row.cluster_id) clusterIds.add(row.cluster_id);
+    if (row.prompt_used && row.prompt_used.trim().length > 0) promptPerImage[id] = row.prompt_used;
+  }
+  if (known.length === 0) {
+    return sendJson(res, 400, { error: "none of the supplied image_ids appear in this run's CSV" });
+  }
+  if (clusterIds.size === 0) {
+    return sendJson(res, 400, { error: "could not resolve any cluster_id for the supplied image_ids" });
+  }
+
+  const tmpDir = runOutDir();
+  await fs.mkdir(tmpDir, { recursive: true });
+  let promptPerImageFile: string | undefined;
+  if (Object.keys(promptPerImage).length > 0) {
+    promptPerImageFile = path.join(tmpDir, `prompt-per-image-${randomUUID().replace(/-/g, "").slice(0, 12)}.json`);
+    await fs.writeFile(promptPerImageFile, JSON.stringify(promptPerImage, null, 2), "utf8");
+  }
+
+  const jobId = randomUUID().replace(/-/g, "").slice(0, 16);
+  putRegenJob({
+    id: jobId,
+    image_id: known[0]!,
+    cluster_id: [...clusterIds][0]!,
+    parent_run_id: parent.id,
+    image_ids: known,
+    status: "running",
+    startedAt: Date.now(),
+  });
+  sendJson(res, 202, { job_id: jobId, image_ids: known, count: known.length });
+
+  const spawnChild = (): RunState => startRegen({
+    client: parent.client,
+    clusterIds: [...clusterIds],
+    imageIds: known,
+    dryRun: false,
+    mock: false,
+    useSavedToken: true,
+    pageType: "blog,service,category",
+    provider: extractProviderFromArgs(parent.args),
+    promptPerImageFile,
+  });
+
+  runRegenBatchJob(jobId, parent, known, spawnChild).catch((err) => {
+    process.stderr.write(`regenBatch: job ${jobId} threw: ${(err as Error)?.stack ?? err}\n`);
+    failRegenJob(jobId, 500, `batch regenerate crashed: ${(err as Error)?.message ?? String(err)}`);
+  });
+}
+
+/** Detached half of a batch Regenerate. Same contract as runRegenJob,
+ *  but records a per-image outcome map instead of a single result. */
+async function runRegenBatchJob(
+  jobId: string,
+  parent: RunState,
+  imageIds: string[],
+  spawnChild: () => RunState,
+): Promise<void> {
+  let child: RunState;
+  try {
+    await acquireSpawnSlot();
+    child = spawnChild();
+  } catch (err) {
+    failRegenJob(jobId, 500, `failed to start batch regen subprocess: ${(err as Error).message}`);
+    return;
+  }
+  const job = REGEN_JOBS.get(jobId);
+  if (job) job.child_run_id = child.id;
+
+  await new Promise<void>((resolve) => {
+    if (child.done) return resolve();
+    child.proc?.once("close", () => resolve());
+  });
+
+  if (child.exitCode !== 0) {
+    return failRegenJob(jobId, 500, `batch regen subprocess crashed (exit ${child.exitCode}). Check the run log.`, child.id);
+  }
+  if (!child.csvPath) {
+    return failRegenJob(jobId, 409,
+      "Batch regenerate resolved zero images — they may already have been applied, or the page was re-rendered upstream since this run was created.",
+      child.id);
+  }
+
+  const childRows = await readRunCsvOrEmpty(child.csvPath);
+  const results: NonNullable<RegenJob["results"]> = {};
+  for (const id of imageIds) {
+    const row = childRows.find((r) => r.image_id === id);
+    if (!row) {
+      results[id] = { ok: false, error: "no CSV row produced for this image" };
+      continue;
+    }
+    const ok = row.status === "completed" &&
+      ((row.image_url_new || "").trim().length > 0 || (row.image_local_path || "").trim().length > 0);
+    if (!ok) {
+      results[id] = { ok: false, error: (row.error || "").trim() || "the image model returned no output" };
+      continue;
+    }
+    // Same rule as the single path: only SUCCESSES touch the parent
+    // CSV. A failed image keeps its previous row — and therefore its
+    // previous image stays Apply-eligible.
+    if (parent.csvPath) {
+      try {
+        await updateParentCsvRow(parent.csvPath, id, {
+          image_url_new: row.image_url_new,
+          image_local_path: row.image_local_path,
+          prompt_used: row.prompt_used,
+          prediction_id: row.prediction_id ?? "",
+          generated_at_utc: row.generated_at_utc,
+          status: "completed",
+          error: "",
+        });
+      } catch (err) {
+        process.stderr.write(
+          `regenBatch: parent CSV update failed for ${id} in ${parent.csvPath}: ${(err as Error).message}\n`,
+        );
+      }
+    }
+    results[id] = {
+      ok: true,
+      image_url_new: row.image_url_new ?? "",
+      image_local_path: row.image_local_path ?? "",
+    };
+  }
+
+  const done = REGEN_JOBS.get(jobId);
+  if (done) {
+    done.child_run_id = child.id;
+    done.results = results;
+    // "done" means the batch ran to completion; individual images may
+    // still have failed and the client paints those cards red from
+    // `results`. A wholesale failure would have returned above.
+    done.status = "done";
+  }
+}
+
+/**
  * Atomically rewrite a single row in a CSV in place. Used by the
  * single-image Regenerate flow to update the parent run's CSV with
  * the regenerated image's new URL / local path / prompt / prediction
@@ -6336,6 +6534,9 @@ function startRegen(opts: {
   pageType?: string;
   provider?: string;
   promptOverrideFile?: string;
+  /** JSON { image_id -> prompt } so ONE subprocess can regenerate many
+   *  images while each reuses its own parent prompt. */
+  promptPerImageFile?: string;
   /** Path to a UTF-8 file with one-off operator instructions for this
    *  regen only — merged into the top-priority directives block at
    *  generation time. Never mutates the saved graphic_token. */
@@ -6362,6 +6563,7 @@ function startRegen(opts: {
   if (opts.assetTypes) args.push("--asset-types", opts.assetTypes);
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.promptOverrideFile) args.push("--prompt-override-file", opts.promptOverrideFile);
+  if (opts.promptPerImageFile) args.push("--prompt-per-image-file", opts.promptPerImageFile);
   if (opts.extraInstructionsFile) args.push("--extra-instructions-file", opts.extraInstructionsFile);
   if (opts.resumePredictionId) args.push("--resume-prediction-id", opts.resumePredictionId);
   if (opts.promptOverridesFile) args.push("--prompt-overrides-file", opts.promptOverridesFile);
@@ -6386,6 +6588,19 @@ function startRegen(opts: {
     // line the moment it hits the rate-limit backoff schedule. Feed
     // that to the global cooldown so new spawns defer.
     if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
+    // Forward a NARROW allowlist of subprocess diagnostics to the
+    // parent's stderr so they reach Railway. Without this, everything
+    // the child logs (flex outcomes, E003, webhook fallback, the
+    // per-run timing summary) is consumed by the SSE fan-out and never
+    // leaves the container — which is exactly why the prompt-build vs
+    // image-model split was unmeasurable. Per-image "[N/M] cluster=..."
+    // lines are deliberately NOT forwarded: a 346-image run would
+    // flood the platform log.
+    for (const line of text.split("\n")) {
+      if (/^(regen: timing|upload-generate: timing|replicate: (E003|webhook cache empty)|generate: Flex fell through|flex: (undici|observer))/.test(line)) {
+        process.stderr.write(`[run ${state.id}] ${line}\n`);
+      }
+    }
     // Main-done marker — regen.ts emits this AFTER the CSV/HTML are
     // written but BEFORE it awaits flushFlexObservers(). Users don't
     // want the run's concurrency slot held for the 15-min observer
@@ -8634,6 +8849,17 @@ if (document.readyState === 'loading') {
   indexSharedImageIds();
 }
 
+// Toggle the per-card in-flight look for a batch regenerate.
+function setCardsRegenerating(ids, on) {
+  for (const id of ids) {
+    const card = document.querySelector('.result-card[data-image-id="' + CSS.escape(id) + '"]');
+    if (!card) continue;
+    if (on) card.classList.add('regenerating'); else card.classList.remove('regenerating');
+    const b = card.querySelector('.btn-regen');
+    if (b) b.disabled = !!on;
+  }
+}
+
 async function regenAllPicked() {
   const picked = [];
   for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
@@ -8644,25 +8870,65 @@ async function regenAllPicked() {
     picked.push(id);
   }
   if (picked.length === 0) return;
-  // Disable the button so a stray click doesn't double-fire while a
-  // batch is in flight.
-  const btn = document.getElementById('regen-all-btn');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating 0/' + picked.length + '…'; }
+  return batchRegenerate(picked, document.getElementById('regen-all-btn'), '↻ Regenerate selected');
+}
+
+// Shared batched regenerate used by BOTH bulk buttons. One POST, one
+// subprocess, N images — see /api/regen-batch for why.
+async function batchRegenerate(picked, btn, restoreLabel) {
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating ' + picked.length + '…'; }
+  setCardsRegenerating(picked, true);
   try {
-    // Bounded pool — same reasoning as applyAllPicked. Each regenOne
-    // spawns a fresh CLI subprocess that calls Replicate; firing 25
-    // simultaneously spikes both Replicate quota and Railway CPU.
-    // BULK_APPLY_CONCURRENCY=4 keeps outbound bursts bounded.
-    await runWithConcurrency(
-      picked,
-      (id) => regenOne(id),
-      BULK_APPLY_CONCURRENCY,
-      (done, total) => {
-        if (btn) btn.innerHTML = '<span class="spinner"></span> Regenerating ' + done + '/' + total + '…';
-      },
-    );
+    // ONE subprocess for the whole selection. The old path looped
+    // regenOne per image, which spawned N CLI subprocesses — each
+    // paying ~5.2s of cold start, each taking one of only
+    // MAX_CONCURRENT_RUNS slots, each doing a single image while its
+    // own --concurrency sat unused. Measured 2026-09-09.
+    const r = await fetch('/api/regen-batch', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ run_id: RUN_ID, image_ids: picked }),
+    });
+    if (r.status === 409) {
+      // upload-generate runs need a per-image product manifest — the
+      // batch CLI can't express that. Fall back to the old loop.
+      await runWithConcurrency(
+        picked, (id) => regenOne(id), BULK_APPLY_CONCURRENCY,
+        (done, total) => {
+          if (btn) btn.innerHTML = '<span class="spinner"></span> Regenerating ' + done + '/' + total + '…';
+        },
+      );
+      return;
+    }
+    if (!r.ok) throw new Error(await readErrText(r));
+    const accepted = await r.json();
+    const js = await pollRegenJob(accepted.job_id, btn);
+    const results = (js && js.results) || {};
+    let ok = 0, bad = 0;
+    for (const id of picked) {
+      const o = results[id];
+      if (o && o.ok) {
+        ok++;
+        const img = document.querySelector('.result-card[data-image-id="' + CSS.escape(id) + '"] .rc-img img');
+        if (img) img.src = '/runs/' + encodeURIComponent(RUN_ID) + '/preview/' + encodeURIComponent(id) + '?t=' + Date.now();
+        stateOf.set(id, 'pending');
+        paintCard(id);
+      } else {
+        bad++;
+        stateOf.set(id, 'failed');
+        paintCard(id, { error: 'regenerate failed: ' + ((o && o.error) || 'no result returned for this image') });
+      }
+    }
+    if (btn) btn.title = ok + ' regenerated, ' + bad + ' failed';
+  } catch (err) {
+    // A whole-batch failure — every card in the selection is unknown,
+    // so mark them all rather than leaving stale spinners.
+    for (const id of picked) {
+      stateOf.set(id, 'failed');
+      paintCard(id, { error: 'regenerate failed: ' + err.message });
+    }
   } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate selected'; }
+    setCardsRegenerating(picked, false);
+    if (btn) { btn.disabled = false; btn.innerHTML = restoreLabel; }
   }
 }
 
@@ -8683,20 +8949,7 @@ async function regenAllFailed() {
     return;
   }
   if (!confirm('Regenerate ' + failed.length + ' failed card' + (failed.length === 1 ? '' : 's') + '?')) return;
-  const btn = document.getElementById('regen-failed-btn');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Regenerating 0/' + failed.length + '…'; }
-  try {
-    await runWithConcurrency(
-      failed,
-      (id) => regenOne(id),
-      BULK_APPLY_CONCURRENCY,
-      (done, total) => {
-        if (btn) btn.innerHTML = '<span class="spinner"></span> Regenerating ' + done + '/' + total + '…';
-      },
-    );
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = '↻ Regenerate failed'; }
-  }
+  return batchRegenerate(failed, document.getElementById('regen-failed-btn'), '↻ Regenerate failed');
 }
 
 // Per-card zoom button: opens the existing lightbox with the new image.
@@ -11002,6 +11255,19 @@ function startUploadGenerate(opts: {
     if (html && html[1]) state.htmlPath = html[1].trim();
     // Feed E003 markers into the global cooldown — same as regen.
     if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
+    // Forward a NARROW allowlist of subprocess diagnostics to the
+    // parent's stderr so they reach Railway. Without this, everything
+    // the child logs (flex outcomes, E003, webhook fallback, the
+    // per-run timing summary) is consumed by the SSE fan-out and never
+    // leaves the container — which is exactly why the prompt-build vs
+    // image-model split was unmeasurable. Per-image "[N/M] cluster=..."
+    // lines are deliberately NOT forwarded: a 346-image run would
+    // flood the platform log.
+    for (const line of text.split("\n")) {
+      if (/^(regen: timing|upload-generate: timing|replicate: (E003|webhook cache empty)|generate: Flex fell through|flex: (undici|observer))/.test(line)) {
+        process.stderr.write(`[run ${state.id}] ${line}\n`);
+      }
+    }
     // Same early-release semantics as regen: upload-generate spawns
     // Flex too, so its subprocess can also linger on observers.
     if (/^upload-generate: main-done/m.test(text) && !state.slotReleased) {
@@ -12434,6 +12700,7 @@ ${runsSorted.map(r=>`          <tr>
 
       if (method === "POST" && p === "/regen") return await regenPostHandler(req, res);
       if (method === "POST" && p === "/api/regen-one") return await regenOneHandler(req, res);
+      if (method === "POST" && p === "/api/regen-batch") return await regenBatchHandler(req, res);
       // Poll target for the async Regenerate. Returns the job's
       // terminal outcome carrying the SAME http code + message the
       // handler used to return synchronously, so the card renders an
@@ -12457,6 +12724,7 @@ ${runsSorted.map(r=>`          <tr>
           run_id: job.child_run_id ?? null,
           elapsed_ms: Date.now() - job.startedAt,
           ...(job.status === "done" ? job.result : {}),
+          ...(job.results ? { results: job.results } : {}),
           ...(job.status === "error" ? { error: job.error, http: job.http } : {}),
         });
       }

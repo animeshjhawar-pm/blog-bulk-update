@@ -65,6 +65,10 @@ export interface RegenOptions {
    * run's prompt — saves ~5–10s per regeneration.
    */
   promptOverride?: string;
+  /** Per-image prompt reuse: { image_id -> prompt }. Takes precedence
+   *  over promptOverride, which is a single string applied to the whole
+   *  run and therefore cannot serve a multi-image batch regenerate. */
+  promptPerImage?: Record<string, string>;
   /**
    * Free-text addendum merged into the per-record top-priority
    * brand-directives block at generation time. Used by the web UI's
@@ -225,6 +229,11 @@ function buildBaseRow(args: {
 interface RowResult {
   row: Partial<CsvRow>;
   status: "completed" | "failed" | "dry-run";
+  /** Per-stage wall time, aggregated into one summary line per run.
+   *  Subprocess stderr is not forwarded to Railway per-line, so without
+   *  this the prompt-build vs image-model split is unmeasurable from
+   *  outside the container. */
+  timing?: { promptMs: number; genMs: number };
 }
 
 function mergeBusinessContext(raw: unknown, brandGuidelines: string | null): unknown {
@@ -305,8 +314,21 @@ async function processOne(args: {
     || null;
 
   let promptUsed = "";
+  let promptMs = 0;
+  let genMs = 0;
+  const tPrompt = Date.now();
   try {
-    if (options.promptOverride && options.promptOverride.trim().length > 0) {
+    // Prefer this image's OWN parent prompt when a per-image map was
+    // supplied (batch regenerate); fall back to the single-string
+    // override (single-image regenerate).
+    const perImagePrompt = options.promptPerImage?.[record.imageId];
+    const reusePrompt =
+      perImagePrompt && perImagePrompt.trim().length > 0
+        ? perImagePrompt
+        : options.promptOverride && options.promptOverride.trim().length > 0
+          ? options.promptOverride
+          : "";
+    if (reusePrompt) {
       // Skip Portkey: reuse the parent run's prompt. Used by the
       // web UI's single-image Regenerate flow to shave the
       // prompt-building round trip.
@@ -316,7 +338,7 @@ async function processOne(args: {
       // the operator has since updated additional_instructions, OR
       // passed one-off extras for this regen, those stale directives
       // would ride along. Strip + re-apply the MERGED current ones.
-      const stripped = stripAdditionalInstructions(options.promptOverride);
+      const stripped = stripAdditionalInstructions(reusePrompt);
       promptUsed = applyAdditionalInstructions(stripped, mergedDirectives);
       process.stderr.write(
         `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} prompt=override${mergedDirectives ? `+directives${extras ? "+extras" : ""}` : ""}\n`,
@@ -354,6 +376,8 @@ async function processOne(args: {
         ? applyAdditionalInstructions(stripAdditionalInstructions(built.finalPrompt), mergedDirectives)
         : built.finalPrompt;
     }
+
+    promptMs = Date.now() - tPrompt;
 
     if (options.dryRun) {
       process.stderr.write(
@@ -394,6 +418,7 @@ async function processOne(args: {
     const wireframe = WIREFRAME_URLS[record.asset];
     if (wireframe) imageInput.push(wireframe);
 
+    const tGen = Date.now();
     const gen = await generate({
       prompt: promptUsed,
       aspectRatio: record.aspectRatio,
@@ -410,6 +435,8 @@ async function processOne(args: {
       assetType: record.asset,
     });
 
+    genMs = Date.now() - tGen;
+
     const localPath = await downloadImage({
       url: gen.imageUrl,
       slug,
@@ -423,6 +450,7 @@ async function processOne(args: {
 
     return {
       status: "completed",
+      timing: { promptMs, genMs },
       row: {
         ...base,
         prompt_used: promptUsed,
@@ -630,6 +658,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
   const total = records.length;
 
   const allRows: Partial<CsvRow>[] = new Array(total);
+  const timings: Array<{ promptMs: number; genMs: number }> = [];
   const tasks = records.map((record, i) =>
     limit(async () => {
       const result = await processOne({
@@ -644,6 +673,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
         slug,
       });
       allRows[i] = result.row;
+      if (result.timing) timings.push(result.timing);
       await csv.write(result.row);
     }),
   );
@@ -677,6 +707,23 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     runId: options.runId,
   });
 
+  // ONE line per run (never per image — a 346-image run would flood).
+  // web.ts forwards `regen: timing` to the parent's stderr so it lands
+  // in Railway, which is the only way to see this from outside the
+  // container: subprocess stderr is otherwise consumed by the SSE
+  // fan-out and never reaches the platform log.
+  if (timings.length > 0) {
+    const pct = (arr: number[], q: number) =>
+      arr.length ? arr.slice().sort((a, b) => a - b)[Math.min(arr.length - 1, Math.floor(arr.length * q))]! : 0;
+    const pm = timings.map((t) => t.promptMs);
+    const gm = timings.map((t) => t.genMs);
+    const s1 = (v: number) => (v / 1000).toFixed(1) + "s";
+    process.stderr.write(
+      `regen: timing — n=${timings.length} concurrency=${options.concurrency} · ` +
+      `prompt p50=${s1(pct(pm, 0.5))} p90=${s1(pct(pm, 0.9))} · ` +
+      `generate p50=${s1(pct(gm, 0.5))} p90=${s1(pct(gm, 0.9))}\n`,
+    );
+  }
   process.stderr.write(
     `regen: done — ${summary.ok} ok, ${summary.failed} failed, ${summary.dry_run} dry-run\n`,
   );
