@@ -6521,6 +6521,65 @@ function parseMultipart(raw: string, contentType: string): URLSearchParams {
   return out;
 }
 
+/**
+ * Subprocess stdout/stderr arrives as arbitrary byte chunks that do NOT
+ * respect line boundaries: one child write() can be delivered as two
+ * chunks split mid-line, and several writes can arrive coalesced. Every
+ * marker detector in the spawn handlers used to match against a RAW
+ * chunk, so any marker unlucky enough to straddle a boundary was
+ * silently missed. Consequences, all real:
+ *
+ *   regen: csv=…        missed -> state.csvPath never set, run page
+ *                       cannot find the CSV
+ *   regen: html=…       missed -> same for the HTML report
+ *   E003 rate-limit     missed -> global spawn cooldown never armed
+ *   regen: timing       missed -> never reaches Railway (observed
+ *                       2026-09-09: the line was in the run log but
+ *                       absent from the platform log)
+ *   regen: main-done    missed -> spawn slot NOT released early and the
+ *                       SSE "streaming…" pill never clears — i.e. the
+ *                       exact bug fixed in 804ce67 would silently
+ *                       regress on an unlucky chunk split
+ *
+ * This buffers partial lines and emits only COMPLETE ones, so detection
+ * no longer depends on how the OS happened to slice the stream.
+ */
+function makeLineSplitter(onLine: (line: string) => void) {
+  let carry = "";
+  // Defensive cap: a child that emits a very long line with no newline
+  // (a giant JSON blob, say) must not grow this buffer without bound.
+  const MAX_CARRY = 1_000_000;
+  return {
+    feed(text: string) {
+      carry += text;
+      let nl = carry.indexOf("\n");
+      while (nl !== -1) {
+        onLine(carry.slice(0, nl));
+        carry = carry.slice(nl + 1);
+        nl = carry.indexOf("\n");
+      }
+      if (carry.length > MAX_CARRY) {
+        onLine(carry);
+        carry = "";
+      }
+    },
+    /** A child can exit without a trailing newline — flush the remainder
+     *  so a final marker on an unterminated line still counts. */
+    flush() {
+      if (carry.length === 0) return;
+      const last = carry;
+      carry = "";
+      onLine(last);
+    },
+  };
+}
+
+/** Subprocess lines worth forwarding to the parent's stderr (and thus
+ *  to Railway). Deliberately narrow — per-image "[N/M] cluster=…" lines
+ *  are excluded because a 346-image run would flood the platform log. */
+const SUBPROCESS_FORWARD_RE =
+  /^(regen: timing|upload-generate: timing|replicate: (E003|webhook cache empty)|generate: Flex fell through|flex: (undici|observer))/;
+
 function startRegen(opts: {
   client: string;
   clusterIds: string[];
@@ -6577,39 +6636,24 @@ function startRegen(opts: {
   };
   RUNS.set(id, state);
 
-  const ondata = (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
-    state.log.push(text);
-    const csv = text.match(/regen: csv=(.+?)\n/);
+  // Marker detection runs on COMPLETE lines (see makeLineSplitter).
+  // The raw chunk is still what gets logged + streamed, so live SSE
+  // output is byte-identical to before.
+  const lines = makeLineSplitter((line: string) => {
+    const csv = /regen: csv=(.+)$/.exec(line);
     if (csv && csv[1]) state.csvPath = csv[1].trim();
-    const html = text.match(/regen: html=(.+?)\n/);
+    const html = /regen: html=(.+)$/.exec(line);
     if (html && html[1]) state.htmlPath = html[1].trim();
-    // E003 detector — replicate.ts logs a "E003 rate-limit (attempt …)"
-    // line the moment it hits the rate-limit backoff schedule. Feed
-    // that to the global cooldown so new spawns defer.
-    if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
-    // Forward a NARROW allowlist of subprocess diagnostics to the
-    // parent's stderr so they reach Railway. Without this, everything
-    // the child logs (flex outcomes, E003, webhook fallback, the
-    // per-run timing summary) is consumed by the SSE fan-out and never
-    // leaves the container — which is exactly why the prompt-build vs
-    // image-model split was unmeasurable. Per-image "[N/M] cluster=..."
-    // lines are deliberately NOT forwarded: a 346-image run would
-    // flood the platform log.
-    for (const line of text.split("\n")) {
-      if (/^(regen: timing|upload-generate: timing|replicate: (E003|webhook cache empty)|generate: Flex fell through|flex: (undici|observer))/.test(line)) {
-        process.stderr.write(`[run ${state.id}] ${line}\n`);
-      }
+    if (line.includes("replicate: E003 rate-limit")) notifyE003Detected();
+    if (SUBPROCESS_FORWARD_RE.test(line)) {
+      process.stderr.write(`[run ${state.id}] ${line}\n`);
     }
     // Main-done marker — regen.ts emits this AFTER the CSV/HTML are
-    // written but BEFORE it awaits flushFlexObservers(). Users don't
-    // want the run's concurrency slot held for the 15-min observer
-    // window; nor do they want the "streaming…" pill lingering. So we
-    // release the slot + close the SSE stream here, then let the
-    // subprocess quietly drain observers and exit whenever it does.
-    // The child-close handler below is guarded via state.slotReleased
-    // so we don't double-release the slot.
-    if (/^regen: main-done/m.test(text) && !state.slotReleased) {
+    // written but BEFORE it awaits flushFlexObservers(). Release the
+    // slot + close the SSE stream here, then let the subprocess
+    // quietly drain observers and exit whenever it does. The
+    // child-close handler is guarded via state.slotReleased.
+    if (line.startsWith("regen: main-done") && !state.slotReleased) {
       state.slotReleased = true;
       state.done = true;
       for (const l of state.listeners) {
@@ -6619,11 +6663,20 @@ function startRegen(opts: {
       state.listeners.clear();
       releaseSpawnSlot();
     }
+  });
+  const ondata = (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    state.log.push(text);
+    lines.feed(text);
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
+;
   proc.stdout?.on("data", ondata);
   proc.stderr?.on("data", ondata);
   proc.on("close", (code) => {
+    // A child can exit without a trailing newline — flush the buffered
+    // remainder so a marker on that final line is still seen.
+    lines.flush();
     state.done = true;
     state.exitCode = code;
     for (const l of state.listeners) {
@@ -11246,31 +11299,20 @@ function startUploadGenerate(opts: {
   };
   RUNS.set(opts.runId, state);
 
-  const ondata = (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
-    state.log.push(text);
-    const csv = text.match(/upload-generate: csv=(.+?)\n/);
+  // Marker detection on COMPLETE lines — see makeLineSplitter for why
+  // matching raw chunks silently dropped markers.
+  const lines = makeLineSplitter((line: string) => {
+    const csv = /upload-generate: csv=(.+)$/.exec(line);
     if (csv && csv[1]) state.csvPath = csv[1].trim();
-    const html = text.match(/upload-generate: html=(.+?)\n/);
+    const html = /upload-generate: html=(.+)$/.exec(line);
     if (html && html[1]) state.htmlPath = html[1].trim();
-    // Feed E003 markers into the global cooldown — same as regen.
-    if (/replicate: E003 rate-limit/.test(text)) notifyE003Detected();
-    // Forward a NARROW allowlist of subprocess diagnostics to the
-    // parent's stderr so they reach Railway. Without this, everything
-    // the child logs (flex outcomes, E003, webhook fallback, the
-    // per-run timing summary) is consumed by the SSE fan-out and never
-    // leaves the container — which is exactly why the prompt-build vs
-    // image-model split was unmeasurable. Per-image "[N/M] cluster=..."
-    // lines are deliberately NOT forwarded: a 346-image run would
-    // flood the platform log.
-    for (const line of text.split("\n")) {
-      if (/^(regen: timing|upload-generate: timing|replicate: (E003|webhook cache empty)|generate: Flex fell through|flex: (undici|observer))/.test(line)) {
-        process.stderr.write(`[run ${state.id}] ${line}\n`);
-      }
+    if (line.includes("replicate: E003 rate-limit")) notifyE003Detected();
+    if (SUBPROCESS_FORWARD_RE.test(line)) {
+      process.stderr.write(`[run ${state.id}] ${line}\n`);
     }
     // Same early-release semantics as regen: upload-generate spawns
     // Flex too, so its subprocess can also linger on observers.
-    if (/^upload-generate: main-done/m.test(text) && !state.slotReleased) {
+    if (line.startsWith("upload-generate: main-done") && !state.slotReleased) {
       state.slotReleased = true;
       state.done = true;
       for (const l of state.listeners) {
@@ -11280,11 +11322,19 @@ function startUploadGenerate(opts: {
       state.listeners.clear();
       releaseSpawnSlot();
     }
+  });
+  const ondata = (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    state.log.push(text);
+    lines.feed(text);
     for (const l of state.listeners) l.write(`data: ${JSON.stringify({ text })}\n\n`);
   };
   proc.stdout?.on("data", ondata);
   proc.stderr?.on("data", ondata);
   proc.on("close", (code) => {
+    // A child can exit without a trailing newline — flush the buffered
+    // remainder so a marker on that final line is still seen.
+    lines.flush();
     state.done = true;
     state.exitCode = code;
     for (const l of state.listeners) {
