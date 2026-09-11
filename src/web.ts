@@ -12686,9 +12686,10 @@ ${runsSorted.map(r=>`          <tr>
           `for d in products-*/ wireframes-*/; do [ -d "$d" ] || continue; ` +
           `m=$(stat -c %Y "$d" 2>/dev/null || echo $now); k=$(du -sk "$d" | cut -f1); ` +
           `echo "$(( (now - m) / 3600 )) $k"; done`], 60_000);
+        const prodH = loadRetentionConfig().productRetentionHours;
         const buckets = [
-          { bucket: "<72h (inside image retention)", maxH: 72, dirs: 0, mb: 0 },
-          { bucket: "72h-7d", maxH: 168, dirs: 0, mb: 0 },
+          { bucket: `<${prodH}h (inside product retention)`, maxH: prodH, dirs: 0, mb: 0 },
+          { bucket: `${prodH}h-7d`, maxH: 168, dirs: 0, mb: 0 },
           { bucket: "7d-30d", maxH: 720, dirs: 0, mb: 0 },
           { bucket: ">30d", maxH: Infinity, dirs: 0, mb: 0 },
         ];

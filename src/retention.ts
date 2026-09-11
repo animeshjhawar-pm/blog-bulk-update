@@ -50,6 +50,14 @@ export interface RetentionConfig {
    *  previews / downloads are gone (the /preview endpoint 410s). */
   imageRetentionHours: number;
   imageMaxRunsKept: number;
+  /** PRODUCT cap — products-<runId>/ and wireframes-<runId>/ dirs
+   *  (operator-uploaded product photos + custom wireframes for
+   *  upload-generate runs). Age only, no count bound. Separate from the
+   *  image window so product photos can be pruned sooner than generated
+   *  image previews. Past this window, per-image Regenerate on that
+   *  upload-generate run returns the existing 410 "product no longer
+   *  available". */
+  productRetentionHours: number;
   /** How long a Replicate output URL is treated as potentially live.
    * Defaults to 1h — past this point, openImageStream skips the
    * remote fallback to avoid burning a TCP timeout on every miss. */
@@ -62,6 +70,7 @@ export function loadRetentionConfig(): RetentionConfig {
   const imgHours = Number.parseInt(process.env.IMAGE_RETENTION_HOURS ?? "", 10);
   const imgMax = Number.parseInt(process.env.IMAGE_MAX_RUNS_KEPT ?? "", 10);
   const repl = Number.parseFloat(process.env.REPLICATE_URL_TTL_HOURS ?? "");
+  const prodHours = Number.parseInt(process.env.PRODUCT_RETENTION_HOURS ?? "", 10);
   return {
     // RECORD retention — very long. The manifest + csv are tiny, so a
     // run can "stay" (visible, inspectable) for a year / 5000 runs
@@ -76,6 +85,11 @@ export function loadRetentionConfig(): RetentionConfig {
     imageRetentionHours: Number.isFinite(imgHours) && imgHours > 0 ? imgHours : 336, // 14 days
     imageMaxRunsKept: Number.isFinite(imgMax) && imgMax > 0 ? imgMax : 150,
     replicateUrlTtlHours: Number.isFinite(repl) && repl > 0 ? repl : 1,
+    // PRODUCT retention — 48h (set 2026-09-11). Product photos are
+    // 100-350 MB per run and upload-generate adds ~850 MB/day, so they
+    // dominate disk growth; 48h rather than the 72h image window.
+    // PRODUCT_RETENTION_HOURS overrides without a redeploy.
+    productRetentionHours: Number.isFinite(prodHours) && prodHours > 0 ? prodHours : 48,
   };
 }
 
@@ -196,6 +210,7 @@ export async function sweepRunRetention(
   const now = Date.now();
   const recordCutoffMs = now - cfg.retentionHours * 3600 * 1000;
   const imageCutoffMs = now - cfg.imageRetentionHours * 3600 * 1000;
+  const productCutoffMs = now - cfg.productRetentionHours * 3600 * 1000;
 
   // Two-tier classification per run (entries are newest-first):
   //   recordExpired — beyond the long record window → evict EVERYTHING
@@ -331,9 +346,9 @@ export async function sweepRunRetention(
       //
       // AGE ONLY, deliberately. Generated images also honour
       // IMAGE_MAX_RUNS_KEPT, but >50 runs happen inside 72h, so the
-      // count bound would prune product dirs of runs still within 72h
-      // and break per-image Regenerate on them. The approved policy was
-      // "72h", so only the age window applies here.
+      // count bound would prune product dirs of runs still inside the
+      // product window and break per-image Regenerate on them. Only the
+      // age window (cfg.productRetentionHours, 48h) applies here.
       //
       // The tiny products-<runId>.json manifest is NOT pruned here — it
       // stays with the record, which keeps per-image Regenerate working
@@ -341,7 +356,7 @@ export async function sweepRunRetention(
       let imageExpiredDir = false;
       if (remainingRunIds.has(runId)) {
         const started = startedById.get(runId) ?? 0;
-        imageExpiredDir = d.isDirectory() && started > 0 && started < imageCutoffMs;
+        imageExpiredDir = d.isDirectory() && started > 0 && started < productCutoffMs;
         if (!imageExpiredDir) continue;
       }
       const p = path.join(outDir, d.name);
