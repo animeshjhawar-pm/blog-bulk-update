@@ -12679,7 +12679,35 @@ ${runsSorted.map(r=>`          <tr>
           `n=$(find . -maxdepth 1 -name "*.$e" | wc -l); ` +
           `k=$(find . -maxdepth 1 -name "*.$e" -exec du -sk {} + 2>/dev/null | awk '{s+=$1} END{print s+0}'); ` +
           `echo "$e $n $k"; done`]);
+        // Age breakdown so a cleanup decision is made on exact numbers.
+        // Directory mtime = last product drop / sentinel touch.
+        const ageTxt = await run("sh", ["-c",
+          `cd ${runOutDir()} 2>/dev/null && now=$(date +%s) && ` +
+          `for d in products-*/ wireframes-*/; do [ -d "$d" ] || continue; ` +
+          `m=$(stat -c %Y "$d" 2>/dev/null || echo $now); k=$(du -sk "$d" | cut -f1); ` +
+          `echo "$(( (now - m) / 3600 )) $k"; done`], 60_000);
+        const buckets = [
+          { bucket: "<72h (inside image retention)", maxH: 72, dirs: 0, mb: 0 },
+          { bucket: "72h-7d", maxH: 168, dirs: 0, mb: 0 },
+          { bucket: "7d-30d", maxH: 720, dirs: 0, mb: 0 },
+          { bucket: ">30d", maxH: Infinity, dirs: 0, mb: 0 },
+        ];
+        for (const l of ageTxt.trim().split("\n").filter(Boolean)) {
+          const [h, k] = l.split(" ").map(Number);
+          const b = buckets.find((x) => (h as number) < x.maxH)!;
+          b.dirs++; b.mb += Math.round((k as number) / 1024);
+        }
+        const tempTxt = await run("sh", ["-c",
+          `cd ${runOutDir()} 2>/dev/null && for pat in "prompt-override-*.txt" "extra-*.txt" "prompt-per-image-*.json"; do ` +
+          `n=$(find . -maxdepth 1 -name "$pat" | wc -l); ` +
+          `k=$(find . -maxdepth 1 -name "$pat" -exec du -sk {} + 2>/dev/null | awk '{s+=$1} END{print s+0}'); ` +
+          `echo "$pat $n $k"; done`], 60_000);
         return sendJson(res, 200, {
+          products_and_wireframes_by_age: buckets.map(({ maxH: _m, ...r }) => r),
+          leaked_temp_files: tempTxt.trim().split("\n").filter(Boolean).map((l) => {
+            const [pattern, n, k] = l.split(" ");
+            return { pattern, files: Number(n), mb: Math.round(Number(k) / 1024) };
+          }),
           root,
           df: { total_mb: Math.round(Number(total) / 1024), used_mb: Math.round(Number(used) / 1024), avail_mb: Math.round(Number(avail) / 1024), pct },
           top_level: top,
