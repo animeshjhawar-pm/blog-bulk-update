@@ -12633,6 +12633,45 @@ ${runsSorted.map(r=>`          <tr>
       // during in-flight runs SIGTERM the subprocess; reconciliation
       // is automatic but adds 2-10 min of resume delay. Curl this
       // before deploying to know.
+      // Read-only volume diagnostics. Added 2026-09-11 after the 10GB
+      // /data volume hit 100% (ENOSPC) and a half-written JSON file
+      // started crashing workspace pages with "Unexpected end of JSON
+      // input". Never writes — safe to call when the disk is full.
+      if (method === "GET" && p === "/healthz/disk") {
+        const run = (cmd: string, args: string[], ms = 20_000) =>
+          new Promise<string>((resolve) => {
+            const c = spawn(cmd, args);
+            let out = "";
+            const t = setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* */ } }, ms);
+            c.stdout?.on("data", (d) => { out += d.toString("utf8"); });
+            c.on("close", () => { clearTimeout(t); resolve(out); });
+            c.on("error", () => { clearTimeout(t); resolve(out); });
+          });
+        const root = path.dirname(runOutDir()); // /data on Railway
+        const parseDu = (txt: string) => txt.trim().split("\n").filter(Boolean)
+          .map((l) => { const [k, ...rest] = l.split(/\s+/); return { mb: Math.round(Number(k) / 1024), path: rest.join(" ") }; })
+          .sort((a, b) => b.mb - a.mb);
+        const df = (await run("df", ["-k", root])).trim().split("\n").pop() ?? "";
+        const [, total, used, avail, pct] = df.split(/\s+/);
+        const top = parseDu(await run("sh", ["-c", `du -sk ${root}/* 2>/dev/null`]));
+        const runs = parseDu(await run("sh", ["-c", `du -sk ${runOutDir()}/* 2>/dev/null`])).slice(0, 25);
+        const byExt = await run("sh", ["-c",
+          `cd ${runOutDir()} 2>/dev/null && for e in csv html json jsonl txt png jpg jpeg webp; do ` +
+          `n=$(find . -maxdepth 1 -name "*.$e" | wc -l); ` +
+          `k=$(find . -maxdepth 1 -name "*.$e" -exec du -sk {} + 2>/dev/null | awk '{s+=$1} END{print s+0}'); ` +
+          `echo "$e $n $k"; done`]);
+        return sendJson(res, 200, {
+          root,
+          df: { total_mb: Math.round(Number(total) / 1024), used_mb: Math.round(Number(used) / 1024), avail_mb: Math.round(Number(avail) / 1024), pct },
+          top_level: top,
+          largest_in_runs_dir: runs,
+          runs_dir_by_extension: byExt.trim().split("\n").filter(Boolean).map((l) => {
+            const [ext, n, k] = l.split(" ");
+            return { ext, files: Number(n), mb: Math.round(Number(k) / 1024) };
+          }),
+        });
+      }
+
       if (method === "GET" && p === "/healthz/inflight") {
         const inflight: Array<{ run_id: string; client: string; started_at: string; mode: string }> = [];
         for (const [runId, state] of RUNS.entries()) {
