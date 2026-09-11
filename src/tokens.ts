@@ -64,7 +64,23 @@ async function readLayered(filename: string): Promise<string | null> {
 async function writeOperator(filename: string, content: string): Promise<string> {
   await fs.mkdir(OPERATOR_DIR, { recursive: true });
   const target = operatorPath(filename);
-  await fs.writeFile(target, content, "utf8");
+  // ATOMIC: write a sibling temp file, then rename over the target.
+  // fs.writeFile TRUNCATES the target to 0 bytes before writing, so an
+  // ENOSPC (or crash) mid-write used to leave the operator's saved
+  // config as an empty file. Observed 2026-09-11: the /data volume hit
+  // 100%, a save of 28ab8fec-…-overrides.json died mid-write, and the
+  // empty file then crashed that project's workspace page on every
+  // load. rename() on the same filesystem is atomic, so a reader sees
+  // either the complete old file or the complete new one — never a
+  // truncated one. On failure the original file is left untouched.
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await fs.writeFile(tmp, content, "utf8");
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => { /* best effort */ });
+    throw err;
+  }
   return target;
 }
 
@@ -192,7 +208,25 @@ export function overridesPath(slug: string): string {
 export async function loadProjectOverrides(slug: string): Promise<ProjectOverrides> {
   const raw = await readLayered(`${slug}-overrides.json`);
   if (raw == null) return {};
-  return JSON.parse(raw) as ProjectOverrides;
+  // Overrides are OPTIONAL config, so a corrupt file must degrade to
+  // "no override" rather than crash the caller. This was the one
+  // JSON.parse of an operator file left unguarded — loadToken and
+  // loadOperatorToken above already treat corrupt JSON as missing. The
+  // unguarded parse turned a single truncated file into a 500 on the
+  // entire workspace page (2026-09-11, project 28ab8fec). The next
+  // saveProjectOverrides rewrites a clean file, so this self-heals.
+  if (raw.trim() === "") return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as ProjectOverrides)
+      : {};
+  } catch (err) {
+    process.stderr.write(
+      `tokens: ignoring corrupt ${slug}-overrides.json (${(err as Error).message}) — treating as no override\n`,
+    );
+    return {};
+  }
 }
 
 export async function saveProjectOverrides(

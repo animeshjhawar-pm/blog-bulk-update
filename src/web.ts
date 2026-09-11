@@ -5479,10 +5479,24 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
   // Node 20, and a throw anywhere past the spawn (CSV read, parent
   // patch) would otherwise take the whole web process down AND strand
   // the job on "running" so the client polls forever.
-  runRegenJob(jobId, parent, imageId, clusterId, spawnChild).catch((err) => {
+  runRegenJob(jobId, parent, imageId, clusterId, spawnChild, [promptOverrideFile, extraInstructionsFile]).catch((err) => {
     process.stderr.write(`regenOne: job ${jobId} threw: ${(err as Error)?.stack ?? err}\n`);
     failRegenJob(jobId, 500, `regenerate crashed: ${(err as Error)?.message ?? String(err)}`);
   });
+}
+
+/** Delete read-once temp files once the child that consumed them has
+ *  exited. The CLI reads --prompt-override-file / --extra-instructions-
+ *  file / --prompt-per-image-file exactly once, at startup (cli.ts), and
+ *  never again — but nothing ever deleted them. By 2026-09-11 there were
+ *  11,488 leaked .txt files and ~10k stray .json files on the volume.
+ *  Deliberately NOT used for products-<runId>.json: regenOneHandler
+ *  re-reads the PARENT's manifest to recover product entries. */
+function removeTempFiles(paths: Array<string | undefined>): void {
+  for (const p of paths) {
+    if (!p) continue;
+    fs.rm(p, { force: true }).catch(() => { /* best effort */ });
+  }
 }
 
 /** Terminal-failure helper — mirrors the http codes the synchronous
@@ -5512,6 +5526,7 @@ async function runRegenJob(
   imageId: string,
   clusterId: string,
   spawnChild: () => RunState,
+  tempFiles: Array<string | undefined> = [],
 ): Promise<void> {
   let child: RunState;
   try {
@@ -5535,6 +5550,8 @@ async function runRegenJob(
     const onClose = () => resolve();
     child.proc?.once("close", onClose);
   });
+  // The child has read its temp files and exited — they are now garbage.
+  removeTempFiles(tempFiles);
 
   if (child.exitCode !== 0) {
     // Genuine non-zero exit — the subprocess crashed.
@@ -5729,7 +5746,7 @@ async function regenBatchHandler(req: IncomingMessage, res: ServerResponse) {
     promptPerImageFile,
   });
 
-  runRegenBatchJob(jobId, parent, known, spawnChild).catch((err) => {
+  runRegenBatchJob(jobId, parent, known, spawnChild, [promptPerImageFile]).catch((err) => {
     process.stderr.write(`regenBatch: job ${jobId} threw: ${(err as Error)?.stack ?? err}\n`);
     failRegenJob(jobId, 500, `batch regenerate crashed: ${(err as Error)?.message ?? String(err)}`);
   });
@@ -5742,6 +5759,7 @@ async function runRegenBatchJob(
   parent: RunState,
   imageIds: string[],
   spawnChild: () => RunState,
+  tempFiles: Array<string | undefined> = [],
 ): Promise<void> {
   let child: RunState;
   try {
@@ -5758,6 +5776,7 @@ async function runRegenBatchJob(
     if (child.done) return resolve();
     child.proc?.once("close", () => resolve());
   });
+  removeTempFiles(tempFiles);
 
   if (child.exitCode !== 0) {
     return failRegenJob(jobId, 500, `batch regen subprocess crashed (exit ${child.exitCode}). Check the run log.`, child.id);
