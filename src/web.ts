@@ -1550,8 +1550,16 @@ async function loadRecentRuns(limit = 6): Promise<RecentRunSummary[]> {
     return [];
   }
   const manifests = names.filter((n) => n.startsWith("manifest-") && n.endsWith(".json"));
-  // Sort by name (timestamp suffix) descending so newest first.
-  manifests.sort().reverse();
+  // Newest first BY TIMESTAMP, not by raw filename. The three run
+  // modes use different prefixes — manifest-<stamp> (regen),
+  // manifest-upgen-<stamp>, manifest-upload-<stamp> — and a plain
+  // descending name sort puts every "upload-" before every "upgen-"
+  // before every regen manifest ('u' > '2'). With limit=200 and 200+
+  // upload manifests on disk (2026-09-11), the home table showed ONLY
+  // upload runs, all "running" (they never set finished_at), and hid
+  // every regen run. Strip the mode prefix and compare the stamp.
+  const stampOf = (n: string) => n.replace(/^manifest-(?:upload-|upgen-)?/, "");
+  manifests.sort((a, b) => (stampOf(a) < stampOf(b) ? 1 : stampOf(a) > stampOf(b) ? -1 : 0));
   const out: RecentRunSummary[] = [];
   for (const n of manifests.slice(0, limit)) {
     try {
