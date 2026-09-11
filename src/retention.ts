@@ -277,6 +277,8 @@ export async function sweepRunRetention(
   // failure mode where the operator drops files, waits >30 min, then
   // hits Generate).
   for (const runId of protectedRunIds) remainingRunIds.add(runId);
+  const startedById = new Map<string, number>();
+  for (const e of entries) if (e.runId) startedById.set(e.runId, e.startedAtMs);
   const runsRoot = path.join(outDir, "runs");
   try {
     const runDirs = await fs.readdir(runsRoot, { withFileTypes: true });
@@ -317,7 +319,31 @@ export async function sweepRunRetention(
       const match = dirMatchProducts ?? dirMatchWireframes ?? fileMatchManifest;
       if (!match) continue;
       const runId = match[1]!;
-      if (remainingRunIds.has(runId)) continue;
+      // Is this an OWNED run whose product/wireframe DIR has aged out of
+      // the image window?
+      //
+      // These dirs hold image bytes (operator product photos, custom
+      // wireframes) but used to be retained on the RECORD window — so
+      // raising MAX_RUNS_KEPT / DOWNLOAD_RETENTION_HOURS to keep 30 days
+      // of run stats silently kept 30 days of product photos too. The
+      // comment above assumed "a few MB each"; on 2026-09-11 they were
+      // 131-345 MB each, ~6GB total, and filled the 10GB volume.
+      //
+      // AGE ONLY, deliberately. Generated images also honour
+      // IMAGE_MAX_RUNS_KEPT, but >50 runs happen inside 72h, so the
+      // count bound would prune product dirs of runs still within 72h
+      // and break per-image Regenerate on them. The approved policy was
+      // "72h", so only the age window applies here.
+      //
+      // The tiny products-<runId>.json manifest is NOT pruned here — it
+      // stays with the record, which keeps per-image Regenerate working
+      // for URL-mode product entries (regenOneHandler re-reads it).
+      let imageExpiredDir = false;
+      if (remainingRunIds.has(runId)) {
+        const started = startedById.get(runId) ?? 0;
+        imageExpiredDir = d.isDirectory() && started > 0 && started < imageCutoffMs;
+        if (!imageExpiredDir) continue;
+      }
       const p = path.join(outDir, d.name);
       // Disk-backed proof-of-life sentinel: web.ts writes
       // `products-<runId>/.in-progress` at upload-generate session
@@ -346,8 +372,31 @@ export async function sweepRunRetention(
       const sz = d.isDirectory() ? await dirSize(p) : await fs.stat(p).then((s) => s.size).catch(() => 0);
       if (d.isDirectory()) await rmrfIfExists(p);
       else await rmIfExists(p);
-      result.orphanRunsDeleted++;
+      if (imageExpiredDir) result.imagesOnlyPruned++;
+      else result.orphanRunsDeleted++;
       result.bytesFreed += sz;
+    }
+  } catch { /* outDir may not exist yet */ }
+
+  // ── 2b'. Leaked read-once temp files ───────────────────────────────
+  // The CLI reads --prompt-override-file / --extra-instructions-file /
+  // --prompt-per-image-file exactly once, at startup (cli.ts), but for
+  // a long time nothing deleted them: 11,488 had accumulated by
+  // 2026-09-11. The regenerate job runners now remove them when the
+  // child exits; this sweeps the historical backlog and anything a
+  // crash leaves behind. 24h, not minutes: a regenerate can sit in the
+  // spawn queue before its child starts and reads the file.
+  try {
+    const tempCutoffMs = now - 24 * 3600 * 1000;
+    const all = await fs.readdir(outDir, { withFileTypes: true });
+    for (const d of all) {
+      if (!d.isFile()) continue;
+      if (!/^(prompt-override-.+\.txt|extra-.+\.txt|prompt-per-image-.+\.json)$/.test(d.name)) continue;
+      const p = path.join(outDir, d.name);
+      const st = await fs.stat(p).catch(() => null);
+      if (!st || st.mtimeMs >= tempCutoffMs) continue;
+      await rmIfExists(p);
+      result.bytesFreed += st.size;
     }
   } catch { /* outDir may not exist yet */ }
 
