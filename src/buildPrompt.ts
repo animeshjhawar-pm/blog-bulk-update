@@ -263,7 +263,7 @@ export async function buildImagePrompt(params: BuildPromptParams): Promise<Build
   });
 
   const result = await callPortkey({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5.5",
     systemPrompt: system,
     userPrompt,
     maxTokens: 64000,

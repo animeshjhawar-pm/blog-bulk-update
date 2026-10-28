@@ -33,9 +33,9 @@ async function liveExtract(params: {
     branding: JSON.stringify(fc.branding ?? {}, null, 2),
   });
 
-  process.stderr.write(`extract-token: calling portkey (claude-sonnet-4-6)\n`);
+  process.stderr.write(`extract-token: calling portkey (claude-sonnet-5.5)\n`);
   const result = await callPortkey({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5.5",
     systemPrompt: EXTRACT_GRAPHIC_TOKEN_SYSTEM_PROMPT,
     userPrompt,
     maxTokens: 16000,
