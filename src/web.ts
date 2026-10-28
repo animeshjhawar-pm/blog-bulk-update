@@ -72,6 +72,7 @@ import {
 } from "./webhookStore.js";
 import { unitCostUsd, formatUsd } from "./pricing.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 const LOGO_URL = "https://cdn.gushwork.ai/v2/gush_new_logo.svg";
 const APP_TITLE = "Feeds Image Updater";
@@ -215,15 +216,53 @@ interface RegenJob {
   http?: number;
 }
 const REGEN_JOBS = new Map<string, RegenJob>();
-// Bounded so a long-lived process can't accumulate job records. Map
-// preserves insertion order, so the oldest key is the first key.
+// Bounded so a long-lived process can't accumulate job records.
+//
+// This cap used to evict the oldest key outright. Map preserves
+// insertion order, so a job that was still RUNNING got discarded the
+// moment the 201st job was created. Its card polled
+// /api/regen-one/status, got the 404, and painted itself "regenerate
+// failed" while the subprocess was still working and often went on to
+// succeed. The registry is global across every run and every operator,
+// so 200 single-card Regenerates is a busy afternoon, not a month.
+// Observed 2026-10-28 on run 334f260b, with no process restart
+// anywhere in the logs (one "Starting Container", a day earlier).
+//
+// Running jobs are now never evicted. Only terminal ones are, oldest
+// first. If every entry is still running we go over the cap and say so
+// rather than throw away live state.
 const REGEN_JOBS_MAX = 200;
+// A "running" job only leaves that state when its child process closes.
+// If a child wedges (a Replicate poll that never returns) its job would
+// be protected forever, and so would every job queued behind it, since
+// the spawn slot is acquired AFTER the job is registered. Past this age
+// a running job stops being protected, so one wedged child cannot pin
+// the registry open indefinitely.
+const REGEN_JOB_RUNNING_MAX_MS = 6 * 60 * 60 * 1000;
+let regenJobsOverCapWarned = false;
 function putRegenJob(job: RegenJob): void {
   REGEN_JOBS.set(job.id, job);
-  while (REGEN_JOBS.size > REGEN_JOBS_MAX) {
-    const oldest = REGEN_JOBS.keys().next().value;
-    if (oldest === undefined) break;
-    REGEN_JOBS.delete(oldest);
+  if (REGEN_JOBS.size <= REGEN_JOBS_MAX) return;
+  const now = Date.now();
+  for (const [id, j] of REGEN_JOBS) {
+    if (REGEN_JOBS.size <= REGEN_JOBS_MAX) break;
+    // Never discard live state, unless it is old enough to be wedged.
+    // Inverted so a missing/NaN startedAt fails SAFE (protected) rather
+    // than falling back through to the bug this whole block fixes.
+    if (j.status === "running" && !(now - j.startedAt >= REGEN_JOB_RUNNING_MAX_MS)) continue;
+    REGEN_JOBS.delete(id);
+  }
+  if (REGEN_JOBS.size > REGEN_JOBS_MAX) {
+    // Once per episode, not once per Regenerate click.
+    if (!regenJobsOverCapWarned) {
+      regenJobsOverCapWarned = true;
+      process.stderr.write(
+        `regen-jobs: ${REGEN_JOBS.size} tracked and all still running; ` +
+          `cap ${REGEN_JOBS_MAX} exceeded, keeping them so no live job is lost\n`,
+      );
+    }
+  } else {
+    regenJobsOverCapWarned = false;
   }
 }
 
@@ -339,6 +378,23 @@ function shell(title: string, body: string, scripts = "", crumb = ""): string {
 
   main { max-width: 1320px; margin: 0 auto; padding: 20px 24px 100px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 18px; margin-bottom: 14px; }
+
+  /* Sticky in-page search on the run page. Sits directly under the
+     49px app header (header.app is sticky at top:0) so it stays
+     reachable while scrolling 90+ cluster cards. */
+  .run-search { position: sticky; top: 49px; z-index: 20; display: flex; align-items: center; gap: 10px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow); padding: 10px 14px; margin-bottom: 14px; }
+  .run-search .rs-icon { color: var(--ink-muted); font-size: 15px; line-height: 1; }
+  .run-search input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent;
+    font: inherit; font-size: 14px; color: var(--ink); padding: 2px 0; }
+  .run-search input::placeholder { color: var(--ink-muted); }
+  .run-search .sub { white-space: nowrap; }
+  /* The "button, .btn" rule above sets display: inline-flex, and an
+     author rule beats the UA sheet's [hidden] { display: none }, so the
+     attribute alone does nothing here. Same fix as .combo-error[hidden]. */
+  .run-search .btn[hidden] { display: none; }
+  .run-search-empty { text-align: center; }
 
   /* Home hero — gradient frame + larger search prompt + tightened
      typography. Quietly elevated; not a marketing page. */
@@ -4658,7 +4714,7 @@ async function writeRunMeta(
   if (!runId) return;
   try {
     const p = path.join(runOutDir(), `run-meta-${runId}.json`);
-    await fs.writeFile(p, JSON.stringify(meta) + "\n", "utf8");
+    await writeFileAtomic(p, JSON.stringify(meta) + "\n");
   } catch (err) {
     process.stderr.write(`writeRunMeta: ${runId} failed: ${(err as Error).message}\n`);
   }
@@ -4889,7 +4945,7 @@ async function recordAppliedImages(runId: string, imageIds: string[]): Promise<v
   for (const id of imageIds) set.add(id);
   const payload = { image_ids: [...set], updated_at: new Date().toISOString() };
   try {
-    await fs.writeFile(p, JSON.stringify(payload) + "\n", "utf8");
+    await writeFileAtomic(p, JSON.stringify(payload) + "\n");
   } catch (err) {
     process.stderr.write(`recordAppliedImages: ${p} write failed: ${(err as Error).message}\n`);
   }
@@ -5338,7 +5394,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
         const fname = `prompt-override-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
         promptOverrideFile = path.join(tmpDir, fname);
         await fs.mkdir(tmpDir, { recursive: true });
-        await fs.writeFile(promptOverrideFile, row.prompt_used, "utf8");
+        await writeFileAtomic(promptOverrideFile, row.prompt_used);
       }
       // NOTE: we deliberately do NOT carry the parent row's
       // prediction_id forward as a resume id. Resuming makes
@@ -5363,7 +5419,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     const fname = `extra-${imageId.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.txt`;
     extraInstructionsFile = path.join(tmpDir, fname);
     await fs.mkdir(tmpDir, { recursive: true });
-    await fs.writeFile(extraInstructionsFile, customInstructions, "utf8");
+    await writeFileAtomic(extraInstructionsFile, customInstructions);
   }
 
   // Re-run the same CLI pipeline scoped to one image_id + cluster_id.
@@ -5419,7 +5475,7 @@ async function regenOneHandler(req: IncomingMessage, res: ServerResponse) {
     }
     const childRunId = randomUUID().replace(/-/g, "").slice(0, 16);
     const productsManifestPath = path.join(tmpDir, `products-${childRunId}.json`);
-    await fs.writeFile(productsManifestPath, JSON.stringify({ [imageId]: productEntry }, null, 2), "utf8");
+    await writeFileAtomic(productsManifestPath, JSON.stringify({ [imageId]: productEntry }, null, 2));
     spawnChild = () => startUploadGenerate({
       client: parent.client,
       runId: childRunId,
@@ -5727,7 +5783,7 @@ async function regenBatchHandler(req: IncomingMessage, res: ServerResponse) {
   let promptPerImageFile: string | undefined;
   if (Object.keys(promptPerImage).length > 0) {
     promptPerImageFile = path.join(tmpDir, `prompt-per-image-${randomUUID().replace(/-/g, "").slice(0, 12)}.json`);
-    await fs.writeFile(promptPerImageFile, JSON.stringify(promptPerImage, null, 2), "utf8");
+    await writeFileAtomic(promptPerImageFile, JSON.stringify(promptPerImage, null, 2));
   }
 
   const jobId = randomUUID().replace(/-/g, "").slice(0, 16);
@@ -5913,13 +5969,15 @@ async function updateParentCsvRow(
   });
   const body = stringify(normalised, { header: true, columns: [...CSV_HEADER] });
 
-  // Atomic write: tmp file in same dir, then rename. Rename is
-  // atomic on POSIX, so concurrent reads of the parent CSV either
-  // see the old version in full or the new version in full — never
-  // a torn half-write.
-  const tmp = csvPath + ".tmp-" + Date.now();
-  await fs.writeFile(tmp, body, "utf8");
-  await fs.rename(tmp, csvPath);
+  // Atomic write, so concurrent reads of the parent CSV see the old
+  // version in full or the new version in full — never a torn
+  // half-write. This site already did write-then-rename by hand; it now
+  // shares the helper, which additionally puts the pid + random bytes in
+  // the staging name. The old `csvPath + ".tmp-" + Date.now()` was
+  // collision-prone: a per-image Regenerate and an orphan reconcile
+  // updating the same parent CSV in the same millisecond staged through
+  // one path and could interleave.
+  await writeFileAtomic(csvPath, body);
 }
 
 function extractProviderFromArgs(args: string[]): string | undefined {
@@ -6788,7 +6846,7 @@ async function regenPostHandler(req: IncomingMessage, res: ServerResponse) {
         const tmpDir = runOutDir();
         await fs.mkdir(tmpDir, { recursive: true });
         promptOverridesFile = path.join(tmpDir, `prompt-overrides-${Date.now()}.json`);
-        await fs.writeFile(promptOverridesFile, JSON.stringify(cleaned), "utf8");
+        await writeFileAtomic(promptOverridesFile, JSON.stringify(cleaned));
       }
     } catch (err) {
       process.stderr.write(
@@ -7101,6 +7159,40 @@ async function readRunCsv(csvPath: string): Promise<
     const rows = csvParse(raw, { columns: true, skip_empty_lines: true }) as CsvRowParsed[];
     return { rows };
   } catch (err) {
+    // The run CSV is the one file written non-atomically, because the
+    // run page streams it while rows are still being appended (see
+    // openCsv in csv.ts). So it IS possible to read one that was cut
+    // off mid-row — the writing process was killed, or the volume
+    // filled. csv-parse fails the whole document in that case, which
+    // used to throw away every COMPLETE row along with the partial one.
+    //
+    // The file is append-only and line-oriented, so at most one row —
+    // the last — can be partial. Drop it and reparse: a run that lost
+    // its final row still shows every image before it, which beats the
+    // run page rendering nothing at all.
+    // NOTE: prompt_used and description_used are multi-line LLM text, so
+    // csv-stringify emits quoted fields spanning many physical lines.
+    // lastIndexOf("\n") therefore often lands INSIDE the final record's
+    // quoted field, and the reparse fails; recovery is best-effort, not
+    // guaranteed. It must also never hand back a column-shifted row, so
+    // every recovered row has to carry a non-empty image_id (column 1)
+    // before we trust the set.
+    const cut = raw.lastIndexOf("\n");
+    if (cut > 0) {
+      try {
+        const rows = csvParse(raw.slice(0, cut + 1), {
+          columns: true,
+          skip_empty_lines: true,
+        }) as CsvRowParsed[];
+        const sane = rows.length > 0 && rows.every((r) => (r.image_id ?? "").trim() !== "");
+        if (sane) {
+          process.stderr.write(
+            `readRunCsv: ${csvPath} is truncated mid-row, recovered ${rows.length} complete row(s)\n`,
+          );
+          return { rows };
+        }
+      } catch { /* genuinely malformed, not just truncated; fall through */ }
+    }
     return { error: `CSV parse failed at ${csvPath}: ${(err as Error).message}`, code: "EPARSE" };
   }
 }
@@ -7600,6 +7692,16 @@ async function runPage(res: ServerResponse, id: string, requestedStage: "prepare
     ? `Drag-and-drop a replacement file (<strong>PNG · JPEG · WebP · ≤10MB</strong>) into each slot you want to push live. You can skip slots — they stay untouched in the live page. When you're done, click <strong>Continue to Apply</strong> to upload the new images and repoint <code>page_info</code>.`
     : `Click <strong>⤢</strong> on any card to zoom, or <strong>⇄ Compare</strong> for an old-vs-new side-by-side. Use the checkboxes to scope <strong>Apply selected</strong> / <strong>Regenerate selected</strong> — pick by image, by cluster, or all at once.`}</div>
 </section>
+
+<div class="run-search">
+  <span class="rs-icon" aria-hidden="true">&#9906;</span>
+  <input id="run-search-input" type="search" autocomplete="off" spellcheck="false"
+         placeholder="Filter clusters: page title, cluster id or image id"
+         oninput="onRunSearch(this.value)">
+  <span class="sub" id="run-search-count"></span>
+  <button type="button" class="btn" id="run-search-clear" hidden onclick="clearRunSearch()">Clear</button>
+</div>
+<div class="card run-search-empty sub" id="run-search-empty" hidden>No cluster on this run matches that search.</div>
 
 ${clusterSections}
 
@@ -8450,8 +8552,81 @@ function revertRun() {
   return revertScope('/api/revert/run', 'run_id', RUN_ID, 'run ' + RUN_ID);
 }
 
+// Sticky in-page search for the run page.
+//
+// Filters whole CLUSTERS rather than individual cards, because
+// operators search by page title and the title lives on the cluster
+// header. Matching is case-insensitive over the cluster title, the
+// cluster_id, and every image_id the cluster contains.
+//
+// Replaces reaching for the browser's own Ctrl+F, which matches only
+// rendered text and gives no sense of how many clusters survived.
+const SEARCH_HAY = new Map();
+function searchHaystack(sec) {
+  const key = sec.dataset.clusterId || '';
+  const cached = SEARCH_HAY.get(key);
+  if (cached !== undefined) return cached;
+  const parts = [key];
+  const head = sec.querySelector('.cs-head');
+  if (head) parts.push(head.textContent || '');
+  for (const c of sec.querySelectorAll('.result-card[data-image-id]')) {
+    parts.push(c.dataset.imageId || '');
+  }
+  const hay = parts.join(' ').toLowerCase();
+  SEARCH_HAY.set(key, hay);
+  return hay;
+}
+function onRunSearch(q) {
+  const needle = (q || '').trim().toLowerCase();
+  const sections = document.querySelectorAll('.cluster-section[data-cluster-id]');
+  let shown = 0;
+  for (const sec of sections) {
+    if (needle === '' || searchHaystack(sec).includes(needle)) {
+      sec.removeAttribute('data-search-hidden');
+      sec.style.display = '';
+      shown++;
+    } else {
+      sec.dataset.searchHidden = '1';
+      sec.style.display = 'none';
+    }
+  }
+  const countEl = document.getElementById('run-search-count');
+  const clearEl = document.getElementById('run-search-clear');
+  const emptyEl = document.getElementById('run-search-empty');
+  if (clearEl) clearEl.hidden = (needle === '');
+  if (countEl) {
+    // Says the scope out loud: the selection counters still count
+    // hidden cards, but Regenerate/Upload act on what is shown.
+    countEl.textContent = needle === ''
+      ? ''
+      : 'showing ' + shown + ' of ' + sections.length + ' clusters · bulk actions apply to these ' + shown;
+  }
+  if (emptyEl) emptyEl.hidden = !(needle !== '' && shown === 0);
+}
+function clearRunSearch() {
+  const i = document.getElementById('run-search-input');
+  if (i) i.value = '';
+  onRunSearch('');
+  if (i) i.focus();
+}
+// Every bulk button scopes itself to what the operator can actually
+// see. Upload + Repoint writes to live customer pages, so acting on a
+// cluster hidden behind the filter would be a silent production write.
+// With an empty search box nothing is hidden and this returns exactly
+// what document.querySelectorAll returned before.
+function visibleResultCards() {
+  return [...document.querySelectorAll('.result-card[data-image-id]')]
+    .filter((c) => !c.closest('.cluster-section[data-search-hidden="1"]'));
+}
+
 async function applyAll() {
   if (applyBusyGuard()) return;
+  // DELIBERATELY the full card list, not visibleResultCards(). This
+  // posts only { run_id } and applyRunHandler resolves the scope
+  // server-side from the entire run CSV, so scoping this list to the
+  // search filter would make the confirm dialog under-report the blast
+  // radius of a write to live pages. The button says "entire run" and
+  // it means it.
   const cards = [...document.querySelectorAll('.result-card[data-image-id]')];
   const counts = countApplicable(cards);
   if (!(await confirmBulkApply('entire run', counts))) return;
@@ -8657,7 +8832,7 @@ async function runWithConcurrency(items, workerFn, concurrency, onProgress) {
 async function applyAllPicked() {
   if (applyBusyGuard()) return;
   const pickedCards = [];
-  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+  for (const card of visibleResultCards()) {
     const cb = card.querySelector('.rc-pick-cb');
     if (!cb || cb.disabled || !cb.checked) continue;
     pickedCards.push(card);
@@ -8942,7 +9117,7 @@ function setCardsRegenerating(ids, on) {
 
 async function regenAllPicked() {
   const picked = [];
-  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+  for (const card of visibleResultCards()) {
     const cb = card.querySelector('.rc-pick-cb');
     if (!cb || cb.disabled || !cb.checked) continue;
     const id = card.dataset.imageId;
@@ -9018,7 +9193,7 @@ async function batchRegenerate(picked, btn, restoreLabel) {
 // every red checkbox, then click Regenerate; they want ONE click).
 async function regenAllFailed() {
   const failed = [];
-  for (const card of document.querySelectorAll('.result-card[data-image-id]')) {
+  for (const card of visibleResultCards()) {
     if (card.dataset.state !== 'failed') continue;
     const id = card.dataset.imageId;
     if (!id) continue;
@@ -10920,7 +11095,7 @@ async function uploadGenerateProductPost(
   await fs.mkdir(dir, { recursive: true });
 
   const finalPath = path.join(dir, safeProductFilename(imageId, v.ext));
-  await fs.writeFile(finalPath, v.bytes);
+  await writeFileAtomic(finalPath, v.bytes);
   session.products.set(imageId, finalPath);
   await touchSessionSentinel(runId);
 
@@ -11048,7 +11223,7 @@ async function uploadGenerateProductUrlPost(
 
   const safeName = imageId.replace(/[^a-zA-Z0-9._-]+/g, "_") + "." + ext;
   const outPath = path.join(dir, safeName);
-  await fs.writeFile(outPath, bytes);
+  await writeFileAtomic(outPath, bytes);
 
   // Store the LOCAL PATH (not the URL) so the rest of the pipeline
   // treats this slot identically to a drag-dropped file.
@@ -11175,7 +11350,7 @@ async function uploadGenerateWireframePost(
   await fs.mkdir(dir, { recursive: true });
 
   const finalPath = path.join(dir, `${asset}.${v.ext}`);
-  await fs.writeFile(finalPath, v.bytes);
+  await writeFileAtomic(finalPath, v.bytes);
 
   // Compute the public URL the CLI / Replicate will fetch.
   // Falls back to a relative path if no public base can be determined
@@ -11460,12 +11635,12 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
   const manifestPath = path.join(tmpDir, `products-${runId}.json`);
   const productsObj: Record<string, string> = {};
   for (const [id, p] of session.products.entries()) productsObj[id] = p;
-  await fs.writeFile(manifestPath, JSON.stringify(productsObj, null, 2), "utf8");
+  await writeFileAtomic(manifestPath, JSON.stringify(productsObj, null, 2));
 
   let extraInstructionsFile: string | undefined;
   if (typeof body.extra_instructions === "string" && body.extra_instructions.trim().length > 0) {
     extraInstructionsFile = path.join(tmpDir, `extra-upgen-${runId}-${Date.now()}.txt`);
-    await fs.writeFile(extraInstructionsFile, body.extra_instructions.trim(), "utf8");
+    await writeFileAtomic(extraInstructionsFile, body.extra_instructions.trim());
   }
   let promptOverridesFile: string | undefined;
   if (body.prompt_overrides && typeof body.prompt_overrides === "object") {
@@ -11481,7 +11656,7 @@ async function uploadGenerateRunHandler(req: IncomingMessage, res: ServerRespons
     }
     if (Object.keys(cleaned).length > 0) {
       promptOverridesFile = path.join(tmpDir, `prompt-overrides-upgen-${runId}.json`);
-      await fs.writeFile(promptOverridesFile, JSON.stringify(cleaned), "utf8");
+      await writeFileAtomic(promptOverridesFile, JSON.stringify(cleaned));
     }
   }
 
