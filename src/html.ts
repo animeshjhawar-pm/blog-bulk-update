@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { CsvRow } from "./csv.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 function escapeHtml(s: string): string {
   return s
@@ -207,5 +208,5 @@ document.addEventListener('click', (e) => {
 </html>
 `;
 
-  await fs.writeFile(params.htmlPath, html, "utf8");
+  await writeFileAtomic(params.htmlPath, html);
 }

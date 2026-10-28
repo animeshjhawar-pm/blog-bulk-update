@@ -8,6 +8,7 @@ import { openCsv, type CsvRow } from "./csv.js";
 import { listPublishedClusters, lookupProjectById, type ProjectRow } from "./db.js";
 import { collectImageRecords, type ImageRecord, type PageType } from "./pageInfo.js";
 import { findClient } from "./clients.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Upload-run pipeline. Parallel to regen.ts — same on-disk layout
@@ -286,10 +287,7 @@ export async function loadUploadState(runId: string): Promise<UploadState> {
 }
 
 export async function saveUploadState(runId: string, s: UploadState): Promise<void> {
-  const p = uploadStatePath(runId);
-  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
-  await fs.writeFile(tmp, JSON.stringify(s, null, 2), "utf8");
-  await fs.rename(tmp, p);
+  await writeFileAtomic(uploadStatePath(runId), JSON.stringify(s, null, 2));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -335,9 +333,7 @@ export async function writeUploadedImage(
     }
   }
   const finalPath = path.join(dir, `${safeName}.${ext}`);
-  const tmp = `${finalPath}.tmp-${randomBytes(6).toString("hex")}`;
-  await fs.writeFile(tmp, bytes);
-  await fs.rename(tmp, finalPath);
+  await writeFileAtomic(finalPath, bytes);
   return finalPath;
 }
 
@@ -433,7 +429,7 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
 
   // Write an empty HTML report so downstream code that probes for
   // htmlPath doesn't trip — the zip / download routes use this.
-  await fs.writeFile(htmlPath, "<!-- upload run; no HTML report -->\n", "utf8");
+  await writeFileAtomic(htmlPath, "<!-- upload run; no HTML report -->\n");
 
   const manifest = {
     run_id: runId,
@@ -454,7 +450,7 @@ export async function startUploadRun(params: UploadRunStartParams): Promise<Uplo
     total_rows: records.length,
     summary: { ok: 0, failed: 0 },
   };
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  await writeFileAtomic(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 
   // Initialise empty sidecar so loadUploadState during the first
   // drop has a file to rename onto.
@@ -527,7 +523,5 @@ async function updateCsvRowAfterUploadInner(
   if (!found) throw new Error(`image_id ${imageId} not in CSV ${csvPath}`);
   const { CSV_HEADER } = await import("./csv.js");
   const out = csvStringify(rows, { header: true, columns: [...CSV_HEADER] });
-  const tmp = `${csvPath}.tmp-${randomBytes(6).toString("hex")}`;
-  await fs.writeFile(tmp, out, "utf8");
-  await fs.rename(tmp, csvPath);
+  await writeFileAtomic(csvPath, out);
 }

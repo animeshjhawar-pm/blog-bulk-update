@@ -6,6 +6,7 @@ import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
 import { closePool, getClusterForApply } from "./db.js";
 import { makeLimiter } from "./concurrency.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Per-cluster page_info repoint.
@@ -258,8 +259,8 @@ async function repointCluster(args: {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   out.backup_path = path.join(backupDir, `${clusterId}-${stamp}.json`);
   out.preview_path = path.join(previewDir, `${clusterId}-${stamp}.json`);
-  await fs.writeFile(out.backup_path, JSON.stringify(cluster.page_info, null, 2), "utf8");
-  await fs.writeFile(out.preview_path, JSON.stringify(reparsed, null, 2), "utf8");
+  await writeFileAtomic(out.backup_path, JSON.stringify(cluster.page_info, null, 2));
+  await writeFileAtomic(out.preview_path, JSON.stringify(reparsed, null, 2));
 
   const perPair = pairs
     .map((p) => `${p.old.slice(0, 12)}…→${p.neu.slice(0, 12)}…×${counts.get(p.old) ?? 0}`)
@@ -526,10 +527,9 @@ export async function runRepoint(opts: RepointOptions): Promise<void> {
     opts.outPath ??
     opts.csvPath.replace(/\.csv$/i, "") +
       `-repoint-${opts.apply ? "applied" : "dryrun"}-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
-  await fs.writeFile(
+  await writeFileAtomic(
     outPath,
     csvStringify(outcomes, { header: true, columns: [...OUT_HEADER] }),
-    "utf8",
   );
 
   const tally = (s: string) => outcomes.filter((o) => o.status === s).length;

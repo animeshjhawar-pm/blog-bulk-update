@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import axios from "axios";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 const LEGACY_IMAGES_ROOT = path.resolve(process.cwd(), "out", "images");
 const RUNS_ROOT = path.resolve(process.cwd(), "out", "runs");
@@ -66,6 +67,6 @@ export async function downloadImage(params: {
     responseType: "arraybuffer",
     timeout: 60_000,
   });
-  await fs.writeFile(target, Buffer.from(response.data));
+  await writeFileAtomic(target, Buffer.from(response.data));
   return target;
 }

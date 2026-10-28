@@ -32,6 +32,7 @@ import { findClient } from "./clients.js";
 import { pickLogoUrl } from "./regen.js";
 import { compositeProduct, emptyZoneDirective, productReferenceDirective } from "./composite.js";
 import { UPGEN_SERVICE_DEFAULT_PROMPT } from "./prompts/upgen.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Upload-&-Generate pipeline.
@@ -409,7 +410,7 @@ async function processOne(args: {
         summary += " (NOTE: no productBaseUrl available — fell back to composite; service/category prefer AI reference path)";
       }
     }
-    await fs.writeFile(outPath, finalBytes);
+    await writeFileAtomic(outPath, finalBytes);
 
     process.stderr.write(
       `[${rowNum}/${totalRows}] cluster=${shortId(record.cluster.id)} asset=${record.asset} id=${record.imageId} status=completed ${summary}\n`,
@@ -582,7 +583,7 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     // the run.
     custom_wireframes: options.customWireframes ?? null,
   };
-  await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
+  await writeFileAtomic(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n");
 
   const logoUrl = pickLogoUrl(project, overrides.logo_url ?? null, overrides.logo_disabled === true);
   if (!logoUrl) {
@@ -622,14 +623,13 @@ export async function runUploadGenerate(options: UploadGenerateOptions): Promise
     failed: allRows.filter((r) => r.status === "failed").length,
     dry_run: 0,
   };
-  await fs.writeFile(
+  await writeFileAtomic(
     manifestPath,
     JSON.stringify(
       { ...baseManifest, finished_at: new Date().toISOString(), summary },
       null,
       2,
     ) + "\n",
-    "utf8",
   );
 
   await writeHtmlReport({

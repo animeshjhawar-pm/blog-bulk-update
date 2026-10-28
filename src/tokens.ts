@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Two-layer token store.
@@ -62,25 +63,14 @@ async function readLayered(filename: string): Promise<string | null> {
 
 /** All writes go to OPERATOR_DIR — never mutate the bundled layer. */
 async function writeOperator(filename: string, content: string): Promise<string> {
-  await fs.mkdir(OPERATOR_DIR, { recursive: true });
   const target = operatorPath(filename);
-  // ATOMIC: write a sibling temp file, then rename over the target.
-  // fs.writeFile TRUNCATES the target to 0 bytes before writing, so an
-  // ENOSPC (or crash) mid-write used to leave the operator's saved
-  // config as an empty file. Observed 2026-09-11: the /data volume hit
-  // 100%, a save of 28ab8fec-…-overrides.json died mid-write, and the
-  // empty file then crashed that project's workspace page on every
-  // load. rename() on the same filesystem is atomic, so a reader sees
-  // either the complete old file or the complete new one — never a
-  // truncated one. On failure the original file is left untouched.
-  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    await fs.writeFile(tmp, content, "utf8");
-    await fs.rename(tmp, target);
-  } catch (err) {
-    await fs.rm(tmp, { force: true }).catch(() => { /* best effort */ });
-    throw err;
-  }
+  // ATOMIC — this is the write that caused the 2026-09-11 incident: the
+  // /data volume hit 100%, a save of 28ab8fec-…-overrides.json died
+  // mid-write, and the resulting empty file crashed that project's
+  // workspace page on every load. writeFileAtomic is the shared fix;
+  // see src/atomicWrite.ts for why the staging name is shaped the way
+  // it is.
+  await writeFileAtomic(target, content);
   return target;
 }
 

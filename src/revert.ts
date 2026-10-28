@@ -4,6 +4,7 @@ import { stringify as csvStringify } from "csv-stringify/sync";
 import { loadEnv } from "./env.js";
 import { closePool, getClusterForApply } from "./db.js";
 import { makeLimiter } from "./concurrency.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Revert flow — restore a cluster's page_info from a repoint backup.
@@ -172,7 +173,7 @@ async function revertOne(args: {
   const snap = path.join(dir, `${clusterId}-prerevert-${stamp}.json`);
   try {
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(snap, JSON.stringify(cluster.page_info, null, 2), "utf8");
+    await writeFileAtomic(snap, JSON.stringify(cluster.page_info, null, 2));
     out.prerevert_snapshot = snap;
   } catch (e) {
     out.reason = `failed to write pre-revert snapshot, aborting: ${(e as Error).message}`;
@@ -182,7 +183,7 @@ async function revertOne(args: {
   if (!opts.apply) {
     const preview = path.join(previewDir, `${clusterId}-${stamp}.json`);
     await fs.mkdir(previewDir, { recursive: true });
-    await fs.writeFile(preview, JSON.stringify(backupPi, null, 2), "utf8");
+    await writeFileAtomic(preview, JSON.stringify(backupPi, null, 2));
     out.status = "dry-run";
     out.reason = `would restore ${path.basename(backupFile)} (current snapshotted to ${path.basename(snap)})`;
     return out;
@@ -295,7 +296,7 @@ export async function runRevert(opts: RevertCliOptions): Promise<void> {
       "out",
       `revert-${opts.apply ? "applied" : "dryrun"}-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`,
     );
-  await fs.writeFile(outPath, csvStringify(outcomes, { header: true, columns: [...OUT_HEADER] }), "utf8");
+  await writeFileAtomic(outPath, csvStringify(outcomes, { header: true, columns: [...OUT_HEADER] }));
 
   const tally = (s: string) => outcomes.filter((o) => o.status === s).length;
   await closePool();

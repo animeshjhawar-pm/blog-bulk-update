@@ -7,6 +7,7 @@ import { closePool, lookupMediaRegistryForId, type MediaRegistryRow } from "./db
 import { makeLimiter } from "./concurrency.js";
 import { runOutDir } from "./runOutDir.js";
 import type { CsvRowParsed } from "./web-types.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 /**
  * Upload-only integration.
@@ -392,10 +393,12 @@ export async function runUpload(opts: UploadOptions): Promise<void> {
   const outPath =
     opts.outPath ??
     opts.csvPath.replace(/\.csv$/i, "") + `-uploaded-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
-  await fs.writeFile(
+  // Atomic: this mapping CSV is the INPUT to `repoint`. A truncated one
+  // doesn't fail loudly — it repoints the clusters that survived the cut
+  // and silently leaves the rest pointing at the old images.
+  await writeFileAtomic(
     outPath,
     csvStringify(written, { header: true, columns: [...MAPPING_HEADER] }),
-    "utf8",
   );
 
   const ok = written.filter((r) => r.upload_status === "uploaded").length;

@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runOutDir } from "./runOutDir.js";
+import { ATOMIC_TMP_PREFIX } from "./atomicWrite.js";
 
 /**
  * Run-artefact retention.
@@ -148,6 +149,52 @@ export interface SweepResult {
   orphanRunsDeleted: number;
   /** Legacy images (out/images/<slug>/<file>) no manifest's CSV references. */
   legacyImagesDeleted: number;
+}
+
+/**
+ * How long an atomic-write staging file has to sit before it counts as
+ * an orphan. 6h, not minutes: a young staging file may belong to a
+ * write still in flight (a large product photo on a slow volume), and
+ * deleting it would corrupt the very write this machinery protects. No
+ * legitimate write takes hours.
+ */
+const ATOMIC_TMP_TTL_MS = 6 * 3600 * 1000;
+
+/**
+ * Recursively collect `.atomic-tmp-*` files left behind when a process
+ * died between writeFileAtomic's write and its rename. Depth-capped at
+ * the deepest nesting this tree actually has:
+ *   outDir(0) / runs(1) / <runId>(2) / images(3)
+ */
+async function sweepAtomicTmpFiles(
+  dir: string,
+  cutoffMs: number,
+  depth = 0,
+): Promise<{ deleted: number; bytes: number }> {
+  const out = { deleted: 0, bytes: 0 };
+  if (depth > 4) return out;
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return out; // dir missing or unreadable — nothing to do
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const sub = await sweepAtomicTmpFiles(p, cutoffMs, depth + 1);
+      out.deleted += sub.deleted;
+      out.bytes += sub.bytes;
+      continue;
+    }
+    if (!e.name.startsWith(ATOMIC_TMP_PREFIX)) continue;
+    const st = await fs.stat(p).catch(() => null);
+    if (!st || st.mtimeMs >= cutoffMs) continue;
+    await rmIfExists(p);
+    out.deleted++;
+    out.bytes += st.size;
+  }
+  return out;
 }
 
 async function dirSize(p: string): Promise<number> {
@@ -414,6 +461,24 @@ export async function sweepRunRetention(
       result.bytesFreed += st.size;
     }
   } catch { /* outDir may not exist yet */ }
+
+  // ── 2b″. Orphaned atomic-write staging files ──────────────────────
+  // writeFileAtomic stages every write at
+  //   <dir>/.atomic-tmp-<basename>-<pid>-<rand>
+  // and renames it into place. That name is deliberately shaped to be
+  // invisible to every other filter in this repo (see
+  // ATOMIC_TMP_PREFIX) so no reader can ever pick up a half-written
+  // file — which also means no other sweep here will collect one. A
+  // SIGKILL or a power loss between the write and the rename leaves the
+  // staging file behind, and this is the only thing that cleans it up.
+  const tmpSwept = await sweepAtomicTmpFiles(outDir, now - ATOMIC_TMP_TTL_MS);
+  if (tmpSwept.deleted > 0) {
+    result.bytesFreed += tmpSwept.bytes;
+    process.stdout.write(
+      `retention: swept ${tmpSwept.deleted} orphaned atomic-write staging file(s), ` +
+        `${tmpSwept.bytes} bytes\n`,
+    );
+  }
 
   // ── 2c. Repoint backups + previews ────────────────────────────────
   // Every apply writes:

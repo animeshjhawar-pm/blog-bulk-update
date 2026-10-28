@@ -20,6 +20,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runOutDir } from "./runOutDir.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 export const WEBHOOK_CACHE_DIRNAME = "webhook-cache";
 
@@ -72,11 +73,7 @@ export async function writeWebhookResult(
   predictionId: string,
   result: WebhookResult,
 ): Promise<void> {
-  const target = cachePathFor(predictionId);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  const tmp = `${target}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(result), "utf8");
-  await fs.rename(tmp, target);
+  await writeFileAtomic(cachePathFor(predictionId), JSON.stringify(result));
 }
 
 /**

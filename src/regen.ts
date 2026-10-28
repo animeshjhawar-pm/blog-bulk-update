@@ -32,6 +32,7 @@ import {
   type ImageRecord,
 } from "./pageInfo.js";
 import { findClient } from "./clients.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 export interface RegenOptions {
   client: string;
@@ -645,7 +646,7 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     html_basename: path.basename(htmlPath),
     total_rows: records.length,
   };
-  await fs.writeFile(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n", "utf8");
+  await writeFileAtomic(manifestPath, JSON.stringify(baseManifest, null, 2) + "\n");
 
   const logoUrl = pickLogoUrl(project, overrides.logo_url ?? null, overrides.logo_disabled === true);
   if (!logoUrl) {
@@ -686,14 +687,13 @@ export async function runRegen(options: RegenOptions): Promise<void> {
     failed: allRows.filter((r) => r.status === "failed").length,
     dry_run: allRows.filter((r) => r.status === "dry-run").length,
   };
-  await fs.writeFile(
+  await writeFileAtomic(
     manifestPath,
     JSON.stringify(
       { ...baseManifest, finished_at: new Date().toISOString(), summary },
       null,
       2,
     ) + "\n",
-    "utf8",
   );
 
   await writeHtmlReport({

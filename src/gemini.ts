@@ -28,6 +28,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { runOutDir } from "./runOutDir.js";
+import { writeFileAtomic } from "./atomicWrite.js";
 
 // Node 20's global `fetch` is undici, which defaults bodyTimeout and
 // headersTimeout to 300000ms — so any Flex call past 5min was dying
@@ -653,7 +654,7 @@ export async function generateImageViaFlex(params: FlexParams): Promise<FlexResu
   await fs.mkdir(dir, { recursive: true });
   const ext = extFromMime(result.mimeType);
   const target = path.join(dir, `${safeBasename(params.imageId)}.${ext}`);
-  await fs.writeFile(target, result.bytes);
+  await writeFileAtomic(target, result.bytes);
 
   return {
     image_url: `file://${target}`,
